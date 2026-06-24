@@ -1,299 +1,39 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * wilsons_algorithms_maze_showcase.c
- *   — Wilson's algorithm maze generator, animated.
+ * wilsons_algorithms_maze_showcase.c — an animated maze built by Wilson's
+ *   algorithm: a random walker wanders the grid, erases its own loops, and
+ *   slowly stitches a perfectly fair maze together.
  *
- * DEMO: Begins with a single seed cell already in the maze; everything
- *       else is empty. A glowing white '@' walker starts at a random
- *       outside cell and wanders by uniform random walk, leaving a
- *       trail of direction arrows ('^>v<') showing each step. When the
- *       walk crosses itself, the looped portion FLASHES RED and erases
- *       — that's loop-erasure, the trick that makes the result a
- *       UNIFORM random spanning tree. When the walk reaches a cell
- *       already in the maze, the entire trail streams into the maze in
- *       a magenta wave, walls carving cell-by-cell. Repeat from a new
- *       outside cell. After every cell is absorbed, two BFS passes
- *       find the maze's longest path (its diameter) and a gold beam
- *       streams along it. Hold, supernova flash, restart forever.
+ * Sister file: ./maze_backtracker.c builds a maze the faster depth-first
+ *   way. Wilson's is slower but fair — every possible maze is equally
+ *   likely. On screen: backtracker grows from one centre, Wilson's grows
+ *   from many random fingers.
  *
- * Study alongside: ./maze_backtracker.c — the same maze problem solved
- *       by depth-first search. Backtracker is faster and produces
- *       long-corridor-biased trees; Wilson's is slower and produces
- *       UNIFORM spanning trees (every possible maze equally likely).
- *       The visual difference: backtracker grows from one centre,
- *       Wilson's grows from many random fingers.
+ * Why this maze is special: a plain random walk would favour long winding
+ *   corridors. Wilson's trick is to erase any loop the walker makes, which
+ *   (provably) makes every maze equally likely — see Wilson (1996),
+ *   "Generating random spanning trees more quickly than the cover time",
+ *   and Jamis Buck's "Mazes for Programmers" (2015). The loop-erasing idea:
+ *   https://en.wikipedia.org/wiki/Loop-erased_random_walk
  *
- * Section map (layers — see ARCHITECTURE block below):
- *   §1 config       — grid, walk/glow/timing constants, direction utils, palette
- *   §2 performance  — monotonic timer + sleep (frame-cap helpers)
- *   §3 simulation   — Cell/Maze, Wilson walk + loop-erase + absorb, BFS diameter
- *   §4 simulation   — scene & the ONE per-tick combine (glow decay + ops)
- *   §5 render       — HUD, ASCII walls, walk arrows, glow ramps
- *   §6 app          — signals, resize, key events, fixed-timestep main loop
+ * What you watch happen:
+ *   • A white '@' walker starts outside the maze and wanders at random,
+ *     dropping arrow tracks '^>v<' that point the way it stepped.
+ *   • Cross its own track and the loop FLASHES RED and vanishes — that's
+ *     the loop-erasing that keeps the maze fair.
+ *   • Reach the maze and the whole track streams in as a magenta wave,
+ *     carving walls cell by cell. Then a new walker starts somewhere else.
+ *   • Once every cell joins, a gold beam lights the longest path through
+ *     the maze (its "diameter"). Hold, flash, restart forever.
  *
- * Keys:
- *   q / ESC    quit
- *   space      pause / resume
- *   r          reset (immediate restart)
- *   + / =      more walk steps per tick (faster)
- *   -          fewer walk steps per tick (slower)
- *   ] / [      raise / lower tick Hz
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra wilsons_algorithms_maze_showcase.c \
- *       -o wilsons_maze -lncurses -lm
+ * Section map:
+ *   §1 config       — grid size, glow/timing constants, direction helpers
+ *   §2 performance  — clock + sleep (the frame-cap helpers)
+ *   §3 simulation   — Cell/Maze, the walk + loop-erase + absorb, BFS solve
+ *   §4 simulation   — the scene state machine and the one per-tick update
+ *   §5 render       — HUD, ASCII walls, walk arrows, glow colours
+ *   §6 app          — signals, resize, keys, main loop
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Wilson's algorithm (Wilson 1996) generates a UNIFORM
- *                  random spanning tree of a graph by loop-erased random
- *                  walks. Procedure:
- *                    (1) Pick any vertex; mark it as "in the tree".
- *                    (2) Pick any vertex v NOT in the tree; start a
- *                        uniform random walk from v.
- *                    (3) Walk until reaching a tree vertex. Whenever the
- *                        walk revisits a cell already on its own path,
- *                        ERASE the entire loop (loop-erasure).
- *                    (4) Add the loop-erased walk to the tree.
- *                    (5) Repeat from (2) until every vertex is in tree.
- *                  The resulting tree is uniformly distributed over all
- *                  spanning trees of the graph — a property the simpler
- *                  recursive-backtracker DFS does NOT have (DFS produces
- *                  long-corridor-biased trees).
- *
- *                  Solution phase: identical to maze_backtracker.c —
- *                  two BFS passes find the tree diameter, and a gold
- *                  beam streams along the longest path.
- *
- * Data-structure : Per cell: 4-bit wall bitmask (N=1, E=2, S=4, W=8;
- *                  set = wall present), in_maze flag, in_walk flag,
- *                  walk_dir (the direction the walker stepped FROM
- *                  this cell — defines the loop-erased path), and
- *                  six glow floats for the various animation layers.
- *
- *                  Walk state: a flat walk_path[] array recording cells
- *                  in walk order. Loop-erasure = truncate the array to
- *                  the index of the revisited cell + 1, and flag the
- *                  truncated tail with erase_glow for a red flash.
- *
- * Rendering      : ASCII only (per project ASCII-Only rule). Walker = '@'.
- *                  Walk trail cells = direction arrow '^' '>' 'v' '<'
- *                  showing the next step. Maze interiors = dim '.'.
- *                  Walls = '+' for corners and '-' / '|' for segments.
- *                  Glows: walk (cyan), head (white-bold), erase (red
- *                  flash), absorb (magenta wave), solution (gold beam),
- *                  supernova (yellow flash) — all decay exponentially.
- *
- * Performance    : Wilson's expected runtime on a 2-D grid is empirically
- *                  Θ(N · log N) random-walk steps for a tree of N cells —
- *                  slower than DFS's Θ(N) but the property gained is
- *                  uniformity. We throttle to walk_steps_per_tick
- *                  (default 16) so the walker is followable. No
- *                  allocation post-init.
- *
- * References     : Concept —
- *                  • Wilson, D. B. (1996) — "Generating random spanning trees
- *                    more quickly than the cover time" (the original paper):
- *                    https://www.cs.cmu.edu/~15859n/RelatedWork/RandomTrees-Wilson.pdf
- *                  • Buck, Jamis — "Mazes for Programmers" (2015): the
- *                    definitive maze-generation book — covers Wilson's, the
- *                    recursive-backtracker contrast, and solving by tree diameter.
- *                  • Buck, Jamis — "Maze Generation: Wilson's Algorithm" (blog
- *                    walkthrough with animations):
- *                    https://weblog.jamisbuck.org/2011/1/20/maze-generation-wilson-s-algorithm
- *                  • Loop-erased random walk — the core primitive:
- *                    https://en.wikipedia.org/wiki/Loop-erased_random_walk
- *                  • Tree diameter via two BFS (the solve phase):
- *                    https://cp-algorithms.com/graph/tree_painting.html#diameter-of-a-tree
- *                  Rendering —
- *                  • Bourke — "Colour Ramping for Data Visualisation": the
- *                    glow-magnitude → colour gradients (cyan comet trail,
- *                    pale→gold→dark solution beam, pink→magenta absorb front).
- *                  • Padala — "NCURSES Programming HOWTO", TLDP: colour pairs,
- *                    glyph output, non-blocking input, resize handling.
- *                  • xterm 256-colour palette — the ramp + accent indices the
- *                    renderer draws from: https://jonasjacek.github.io/colors/
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * To pick a random spanning tree where every possible tree is equally
- * likely, you can't just walk DFS-style — that biases toward long
- * corridors. Wilson's trick: walk RANDOMLY from outside the tree, and
- * whenever you accidentally cross your own path, ERASE the loop. Once
- * you bump into the existing tree, the loop-erased walk you just made
- * is provably a uniformly-distributed sample of paths, and stitching
- * many such walks together produces a uniform spanning tree.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine a snail on graph paper. One square of the paper is "the
- * museum" (in the tree). The snail starts at any other square and
- * crawls randomly. It leaves a sticky trail behind it. If the snail
- * ever crawls onto its own trail — which happens often when wandering
- * randomly — the loop it just made is REMOVED from the trail (the
- * snail "shrinks" the trail back to the crossing point). The snail
- * keeps going. When it finally reaches the museum, the entire trail
- * (now loop-free) is permanently glued to the museum. A new snail is
- * placed at any remaining outside square, and the process repeats.
- *
- * What you SEE on screen:
- *   • Walker '@' = the snail right now.
- *   • Cyan arrows ^ > v < = the trail, each pointing to the next step.
- *   • Sudden RED FLASH = a loop got erased. The cells that flashed
- *     red were on the trail a moment ago and have been wiped out.
- *   • Magenta WAVE = the trail just hit the museum and is being
- *     absorbed cell-by-cell into the permanent maze.
- *   • Steel-blue dots = cells already in the museum (resting maze).
- *
- * ALGORITHM IN STEPS
- * ──────────────────
- *  1. INIT. All cells have all 4 walls. Pick one random cell, mark it
- *     in_maze. Pick another random cell (not in_maze), start a walk
- *     there: walk_path = [start], walker = start.
- *  2. WALK STEP (one operation):
- *     a. From walker's current cell, pick a random direction d such
- *        that walker + d is in bounds.
- *     b. Set walker_cell.walk_dir = d (record where we stepped).
- *     c. Move walker to next = walker + d.
- *     d. CASE A — next is in_maze: the walk reached the museum.
- *        Switch to ABSORB phase: trace walk_path, carve walls between
- *        consecutive cells, mark each in_maze, clear in_walk.
- *     e. CASE B — next is in_walk: LOOP! Find the index of `next` in
- *        walk_path[]. Mark cells walk_path[index+1 .. walk_len-1] as
- *        in_walk = false, paint erase_glow on them (red flash).
- *        Truncate walk_path to length index+1. Walker is now at next.
- *     f. CASE C — fresh territory: append next to walk_path. Mark
- *        next.in_walk = true, paint walk_glow. Walker at next.
- *  3. When the walk completes (CASE A) and there are still cells with
- *     in_maze == false, pick a new random outside cell and goto 2.
- *  4. When every cell is in_maze, run two BFS passes for the diameter
- *     and animate the gold solution beam. Then HOLD, then reset.
- *
- * KEY FORMULAS
- * ────────────
- *  Wall bit per direction        : N=1, E=2, S=4, W=8     (1 << d)
- *  opposite(d)                   : (d + 2) mod 4
- *  Carve wall (A → B in dir d)   : clear A.walls bit d
- *                                  clear B.walls bit opposite(d)
- *  Cell idx                      : idx = y * w + x
- *  Maze → screen mapping         : interior at (2y+1, 2x+1)
- *                                  N-wall  at (2y,   2x+1)
- *                                  W-wall  at (2y+1, 2x  )
- *                                  NW-corner at (2y, 2x  )
- *  Maze on screen size           : (2w + 1) × (2h + 1)
- *  Loop-erase truncation         : walk_len' = (index of revisit) + 1
- *  Tree diameter (two-BFS)       : same as maze_backtracker.c
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • LOOP-ERASURE OVERWRITE. When walker steps to a cell already on
- *    walk_path[], the SOURCE cell has its walk_dir UPDATED to point at
- *    the destination — this is what re-routes the walk past the loop.
- *    Cells in the loop body (walk_path[index+1 .. walk_len-1]) are
- *    orphaned: they still have walk_dir set in cells[] but they're
- *    no longer reachable by following walk_dirs from walk_start.
- *    Visually we mark them in_walk=false + erase_glow=1.0 so the user
- *    sees them disappear; algorithmically the stale walk_dir bytes do
- *    not hurt because we always overwrite walk_dir when we step.
- *
- *  • RANDOM-WALK CONFINEMENT. The walker may NEVER step onto an
- *    in_maze cell except as the FINAL step. Cells that are already
- *    part of the museum are OFF-LIMITS for normal stepping; only the
- *    "terminate the walk" event reaches them. We enforce this by
- *    picking only directions whose target cell has !in_maze, OR by
- *    treating the in_maze step as "walk done" the moment it happens.
- *    The simpler form is the latter — pick any direction freely; if
- *    the target is in_maze, transition to ABSORB. This is what the
- *    code does.
- *
- *  • UNIFORMITY DEMANDS LOOP-ERASURE. If you skip the loop-erase step
- *    and just walk DFS-like, you get a NON-uniform tree (long-corridor
- *    bias). The whole point of Wilson's is the loop-erase step. If
- *    your output looks identical to recursive-backtracker, you've
- *    bypassed loop-erasure somewhere.
- *
- *  • EARLY-RUN SLOWNESS. Wilson's is slow at the start: there's only
- *    1 cell in the museum, so a random walker takes many steps to
- *    find it. Once the museum is large, walks complete quickly. Total
- *    expected runtime is Θ(N log N) but the constant in the early
- *    phase is much higher than DFS. We compensate by allowing the
- *    user to crank up walk_steps_per_tick.
- *
- *  • OFF-BY-ONE on the (2w+1)×(2h+1) frame — same as
- *    maze_backtracker.c. Use (rows - (2h+1))/2 for vertical centering.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • At startup exactly 1 cell is in_maze (the root). If 0 or >1, the
- *    init logic mis-flagged the seed.
- *  • The walker '@' should NEVER appear inside the museum (steel-blue
- *    region). If it does, the in_maze guard in walk_step is broken.
- *  • Loop-erasure visibility: leave the demo running and watch for
- *    sudden red flashes — they should be common (random walks loop
- *    a lot). If you never see red, loop-erasure isn't firing.
- *  • After full generation: in_maze count == total_cells, walk_len == 0,
- *    every cell has at most 4-1=3 walls (every interior cell has at
- *    least one carved wall connecting it to the rest of the tree).
- *  • Diameter sanity: Wilson's UST has a longer expected diameter than
- *    DFS's biased tree on the same grid — typically 1.5-2× longer. On an
- *    identical maze, expect a noticeably longer gold path than the
- *    backtracker produces; if it is much shorter, BFS exited early.
- *  • Wall symmetry (same as backtracker): for every interior cell with
- *    east wall = 0, the cell to its east must have west wall = 0.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── ARCHITECTURE (layer separation) ──────────────────────────────────── *
- *
- * State is module-global (typed structs arrive in step 5).  Each layer owns
- * one concern; this table says what each mutates:
- *
- *   Layer        Section  Mutates
- *   ─────────────────────────────────────────────────────────────────────
- *   PERFORMANCE  §2       nothing — reads the clock / sleeps
- *   SIMULATION   §3,§4    the Maze — per-cell walls + in_maze/in_walk/walk_dir,
- *                         the walk_path / absorb_path queues, maze_count, the
- *                         BFS scratch + solution path — and the Scene run state.
- *   RENDER       §5       the terminal only — reads the Maze, never writes it;
- *                         screen_resize re-fits Screen dims (USER EVENT).
- *   APP          §6       run knobs (paused / *_steps_per_tick / sim_fps), maze
- *                         size, signal flags.
- *
- *   LOGIC is real but NOT a separate section — the pure decisions are small
- *     helpers kept beside what they serve: dir_dx / dir_dy / opposite /
- *     dir_arrow (§1), maze_idx / maze_in_bounds (§3), and cell_visual (§5, a
- *     pure state→glyph mapping).  None mutate or do I/O; hoisting these
- *     one-liners out would only hurt locality.  (maze_pick_random_outside is a
- *     read-only scan but draws rand() for its reservoir sample, so it sits in §3.)
- *   EFFECTS is real STATE, not functions: the six per-cell glow buffers
- *     (walk / head / erase / absorb / solution / supernova) plus on_path.
- *     Simulation ops WRITE them (a step paints walk_glow, a loop-erase paints
- *     erase_glow, …); scene_tick DECAYS them; render READS them.  They never
- *     feed back into the algorithm — deleting all glow code would change only
- *     how the maze LOOKS, not which maze is produced.
- *   No DELAYS layer — 'space' (paused) freezes scene_tick; the HOLD state
- *     (hold_timer) pauses on the finished maze before reset; the only real
- *     wait is the §2 frame cap.
- *
- * PER-TICK COMBINE — scene_tick (§4) is the ONE place sim state advances,
- * in fixed order:
- *     1. EFFECTS decay  — multiply every glow buffer by its exp(-rate·dt).
- *     2. SIMULATION     — by phase: WALKING runs walk steps (→ ABSORBING on a
- *                         maze hit); ABSORBING runs absorb steps (→ a new walk,
- *                         or SOLVING when the maze is full); SOLVING streams the
- *                         diameter beam (→ HOLD); HOLD counts down (→ reset).
- *   RENDER (scene_draw + HUD) then PERFORMANCE (frame cap) run once per frame in
- *   main, OUTSIDE the tick.
- *
- * USER EVENTS are NOT the tick: keys (pause / reset / speed / Hz) and resize
- * mutate state directly in §6 — reset and resize call scene_reset / maze_reset
- * — but only scene_tick advances the simulation.
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -307,14 +47,11 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config ── */
 
 enum {
-    /* Wilson's is slow on big mazes AND visually chaotic when the
-     * walker covers a lot of ground per second. Cap to ~1200 cells
-     * so each individual walk is followable by eye. */
+    /* Cap the maze size. Wilson's gets slow and visually busy on big
+     * grids, so ~1200 cells keeps each walk easy to follow by eye. */
     MAZE_W_MAX        =  60,
     MAZE_H_MAX        =  20,
 
@@ -323,29 +60,29 @@ enum {
     SIM_FPS_MAX       = 240,
     SIM_FPS_STEP      =  10,
 
-    /* Walk steps per scene_tick. Default 4 ⇒ ~240 walk steps/sec, slow
-     * enough to follow each random move with the eye. Press '+' for
-     * faster runs once the algorithm is understood. */
+    /* How many walk moves to make each tick. The default is slow enough
+     * to follow each random move by eye; press '+' to speed it up once
+     * you've seen how it works. */
     WALK_STEPS_MIN    =   1,
     WALK_STEPS_DEF    =   4,
     WALK_STEPS_MAX    = 2048,
 
-    /* Absorb cells per tick — animates the magenta wave running along
-     * the just-completed walk path. Higher = snappier, lower = wavier. */
+    /* How many cells the magenta wave eats per tick as the finished walk
+     * streams into the maze. Higher = snappier, lower = more wavy. */
     ABSORB_STEPS_DEF  =   3,
 
-    /* Solution beam pace, same as maze_backtracker.c. */
+    /* How many cells the gold solution beam lights per tick. */
     SOLVE_STEPS_DEF   =   1,
 
     HUD_COLS          =  72,
     FPS_UPDATE_MS     = 500,
 
-    /* HUD reserves rows top + bottom; the maze is centred in between.
-     * Top: row 0 = title + stats, row 1 = glyph legend.  Bottom: actions. */
+    /* The HUD eats rows at the top and bottom; the maze sits centred in
+     * between. Top: row 0 = title + stats, row 1 = legend. Bottom: keys. */
     HUD_TOP_ROWS      =   2,
     HUD_BOT_ROWS      =   1,
 
-    /* Color pair indices — PAIR_HUD/PAIR_HINT reserved per CLAUDE.md. */
+    /* Colour pair slots. PAIR_HUD/PAIR_HINT are reserved by the project. */
     PAIR_HUD          =   1,
     PAIR_HINT         =   2,
     PAIR_WALL         =   3,        /* dim grey wall lines     */
@@ -364,29 +101,30 @@ enum {
     PAIR_ABSORB_HI    =  16,        /* absorb wave front — bright pink    */
 };
 
-/* Glow decay rates. Erase is fast (it's a flash); absorb is slow so the
- * wave is readable; walk persists for ~1 s so the walker leaves a
- * visible trail. */
-#define WALK_GLOW_DECAY     1.5f    /* arrow trail fade        */
-#define HEAD_GLOW_DECAY     8.0f    /* walker halo (1-cell)    */
-#define ERASE_GLOW_DECAY    3.0f    /* loop-erase red flash    */
-#define ABSORB_GLOW_DECAY   2.0f    /* absorb wave magenta     */
-#define SOLUTION_GLOW_DECAY 1.5f
-#define SUPERNOVA_DECAY     4.0f    /* fast reset fade so seed visible quickly */
-#define GLOW_THRESHOLD      0.05f
+/* How fast each glow fades. Bigger number = quicker fade. The flashes
+ * (erase, supernova) fade fast; the trail and wave linger so you can read
+ * them. */
+#define WALK_GLOW_DECAY     1.5f    /* arrow trail             */
+#define HEAD_GLOW_DECAY     8.0f    /* the walker cell itself  */
+#define ERASE_GLOW_DECAY    3.0f    /* red loop-erase flash    */
+#define ABSORB_GLOW_DECAY   2.0f    /* magenta absorb wave     */
+#define SOLUTION_GLOW_DECAY 1.5f    /* gold solution beam      */
+#define SUPERNOVA_DECAY     4.0f    /* reset flash (clears fast so the seed shows) */
+#define GLOW_THRESHOLD      0.05f   /* below this a glow counts as gone */
 
 #define HOLD_SECONDS        2.0f
 
-/* Direction encoding — same N=0, E=1, S=2, W=3 as other procedural files. */
+/* The four directions, numbered the same way across the procedural files. */
 enum { DIR_N = 0, DIR_E = 1, DIR_S = 2, DIR_W = 3, N_DIRS = 4 };
 static inline int dir_dx(int d) { return (d == DIR_E) ? 1 : (d == DIR_W) ? -1 : 0; }
 static inline int dir_dy(int d) { return (d == DIR_S) ? 1 : (d == DIR_N) ? -1 : 0; }
 static inline int opposite(int d) { return (d + 2) & 3; }
 
+/* One bit per wall. Each cell starts with all four. */
 #define WALL_BIT(d)   (1u << (d))
 #define ALL_WALLS     0x0Fu
 
-/* Direction arrow glyphs for walk trail — ASCII per CLAUDE.md. */
+/* The arrow shown for a trail cell, pointing the way the walker stepped. */
 static inline char dir_arrow(int d)
 {
     switch (d) {
@@ -402,18 +140,16 @@ static inline char dir_arrow(int d)
 #define NS_PER_MS      1000000LL
 #define TICK_NS(f)  (NS_PER_SEC / (f))
 
-/* Render frame cap: the wall-clock loop never spins faster than this,
- * independent of the (possibly higher) simulation tick rate. */
+/* Don't redraw the screen faster than this, even if the simulation ticks
+ * faster. Keeps the frame rate steady. */
 #define RENDER_CAP_FPS  60
-/* Spiral-of-death guard: clamp a stalled frame's elapsed time so the
- * fixed-timestep accumulator never tries to catch up forever. */
+/* If one frame stalls (laptop slept, terminal hung), cap how much time we
+ * believe passed — otherwise the sim tries to catch up forever and freezes. */
 #define MAX_FRAME_NS  (100 * NS_PER_MS)
 
 #define CELLS_MAX  (MAZE_W_MAX * MAZE_H_MAX)
 
-/* ===================================================================== */
-/* §2  performance — monotonic clock + sleep (the frame-cap helpers)      */
-/* ===================================================================== */
+/* ── §2 performance — clock + sleep (the frame-cap helpers) ── */
 
 static int64_t clock_ns(void)
 {
@@ -432,39 +168,38 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  simulation — Cell/Maze, Wilson walk + loop-erase + absorb, BFS     */
-/* ===================================================================== */
+/* ── §3 simulation — Cell/Maze, the walk + loop-erase + absorb, BFS solve ── */
 
 /*
- * Cell — one grid cell's persistent state.  In Wilson's algorithm a cell is
- * either already in the spanning tree, on the active loop-erased walk, or
- * untouched; this struct carries that status, the wall bitmask that IS the
- * maze, and the cosmetic glow layers.
+ * Cell — everything one grid square remembers. At any moment a square is
+ * already in the finished maze, on the walker's current trail, or untouched.
+ * It holds that status, the walls that make up the maze, and a set of glow
+ * values that drive the on-screen colour effects.
  *
- * THE MAZE (the actual spanning tree the algorithm builds)
- *   walls    : 4-bit bitmask N=1 E=2 S=4 W=8; set = wall present.  Carving a
- *              passage clears the bit on BOTH adjacent cells (see maze_carve),
- *              so the wall graph stays symmetric for the BFS solver.
- *   in_maze  : true once permanently part of the tree ("the museum").
+ * THE MAZE (the finished part the algorithm is building)
+ *   walls    : which of the four walls are still standing (one bit each).
+ *              Knocking down a wall clears the matching bit on BOTH squares
+ *              that share it (see maze_carve), so the two always agree — the
+ *              solver later trusts that.
+ *   in_maze  : true once this square is permanently part of the maze.
  *
- * THE WALK (Wilson's loop-erased random walk currently in progress)
- *   in_walk  : true while this cell is on the active walk_path.
- *   walk_dir : the direction the walker stepped FROM this cell to the next.
- *              This is HOW the loop-erased path is stored — following walk_dir
- *              from the walk start traces the (re-routed) path, and loop-erasure
- *              just overwrites walk_dir at the crossing cell.  Meaningful only
- *              while in_walk.
+ * THE WALK (the walker's current trail, before loop-erasing)
+ *   in_walk  : true while this square is on the live trail.
+ *   walk_dir : which way the walker stepped FROM this square to the next one.
+ *              This is how the trail is stored: follow walk_dir from the start
+ *              and you trace the path. When the walker erases a loop it just
+ *              overwrites walk_dir at the crossing square, re-routing the path.
+ *              Only meaningful while in_walk.
  *
- * EFFECTS (cosmetic only — never read by the algorithm; see ARCHITECTURE)
- *   walk_glow      : recency of the trail (cyan comet, fades over ~1 s).
- *   head_glow      : the live walker cell '@' (fast decay → one bright cell).
- *   erase_glow     : a cell just dropped by loop-erasure (red flash).
- *   absorb_glow    : a cell streaming into the museum (magenta wave).
- *   solution_glow  : the diameter beam passing through (gold gradient).
- *   supernova_glow : whole-grid yellow flash right after a reset.
- *   on_path        : stays true after the beam so the finished longest path
- *                    remains lit during HOLD (the resting-diameter payoff).
+ * THE GLOWS (looks only — the algorithm never reads these)
+ *   walk_glow      : how fresh this trail square is (cyan, fades over ~1 s).
+ *   head_glow      : the walker square right now '@' (fades fast → one bright dot).
+ *   erase_glow     : a square just dropped by a loop-erase (red flash).
+ *   absorb_glow    : a square streaming into the maze (magenta wave).
+ *   solution_glow  : the gold beam passing through this square.
+ *   supernova_glow : the brief whole-grid yellow flash after a reset.
+ *   on_path        : true once the gold beam has claimed this square; stays
+ *                    on so the longest path is still lit during the HOLD pause.
  */
 typedef struct {
     uint8_t walls;
@@ -477,60 +212,56 @@ typedef struct {
     float   absorb_glow;
     float   solution_glow;
     float   supernova_glow;
-    bool    on_path;        /* true once the diameter beam has claimed this
-                             * cell — keeps the longest path lit after the
-                             * bright beam glow fades (the HOLD payoff). */
+    bool    on_path;        /* keeps the longest path lit during HOLD, after
+                             * the bright beam glow has faded */
 } Cell;
 
 /*
- * Maze — the whole generation-then-solve state for one run.  Two algorithms
- * share it: Wilson's uniform-spanning-tree generation (Wilson 1996) followed by
- * the two-BFS tree-diameter solve.  The active phase is implicit in the counts
- * (the explicit state machine lives on Scene, §4):
- *   maze_count < total_cells, walk_len > 0  → walking
- *   absorb_len  > 0                         → absorbing
- *   maze_count == total_cells               → ready to solve
+ * Maze — everything one full run needs: first to build the maze (Wilson's
+ * walk), then to find and light its longest path. Which phase we're in is
+ * tracked explicitly on Scene (§4), but you can also read it off the counts:
+ *   building, walker out wandering  → maze_count < total_cells, walk_len > 0
+ *   streaming a finished walk in     → absorb_len > 0
+ *   maze done, ready to solve        → maze_count == total_cells
  *
  * Field groups:
- *   THE GRID       — w, h, total_cells, cells[]: the maze itself.
- *   THE WALK       — walk_path[] is the loop-erased walk as cell indices in
- *                    order; walk_len is its length (0 = no walk); walk_pos is
- *                    the walker, == walk_path[walk_len-1].  Loop-erasure
- *                    truncates walk_len back to (revisit index + 1).
- *   ABSORB (anim)  — absorb_path[]/_len/_progress: the just-finished walk queued
- *                    to stream into the museum one cell per tick (the magenta
- *                    wave).  Algorithmically this could be a single step; it is
- *                    paced cell-by-cell only for the visual.
- *   DIAMETER (BFS) — bfs_queue/dist/parent[]: scratch for the two BFS passes
- *                    that find the tree's longest path (cp-algorithms two-BFS).
- *   SOLUTION       — path[]/path_len: the diameter cells; solve_progress is the
- *                    beam's position streaming along them.
+ *   THE GRID    — w, h, total_cells, cells[]: the maze itself.
+ *   THE WALK    — walk_path[] lists the trail squares in order; walk_len is
+ *                 how many (0 = no walk); walk_pos is where the walker is now
+ *                 (the last entry). A loop-erase chops walk_len back to just
+ *                 past the square the walker bumped into.
+ *   THE WAVE    — absorb_path[]/_len/_progress: a finished trail waiting to
+ *                 stream into the maze one square per tick. It could be added
+ *                 all at once; we pace it just for the magenta wave look.
+ *   SOLVE SCRATCH — bfs_queue/dist/parent[]: working room for the two
+ *                 breadth-first passes that find the longest path through the
+ *                 maze (the standard two-BFS diameter trick).
+ *   THE BEAM    — path[]/path_len: the longest-path squares; solve_progress is
+ *                 how far the gold beam has streamed along them.
  */
 typedef struct {
     int   w, h;
     int   total_cells;
     Cell  cells[CELLS_MAX];
 
-    /* Wilson walk state. */
-    int   walk_path[CELLS_MAX];   /* cell indices in walk order */
-    int   walk_len;               /* 0 means no active walk */
-    int   walk_pos;               /* walk_path[walk_len-1] when walk_len>0 */
+    /* the walker's current trail */
+    int   walk_path[CELLS_MAX];   /* trail squares, in the order walked */
+    int   walk_len;               /* 0 = no walk in progress */
+    int   walk_pos;               /* where the walker is now (last trail square) */
 
-    int   maze_count;
+    int   maze_count;             /* how many squares have joined the maze */
 
-    /* Absorb-phase state — animation only; algorithm-wise the absorb
-     * could be done in one step, but we walk it cell-by-cell for the
-     * magenta wave effect. */
+    /* the finished trail streaming in as the magenta wave */
     int   absorb_path[CELLS_MAX];
     int   absorb_len;
-    int   absorb_progress;        /* index of next cell to absorb */
+    int   absorb_progress;        /* next square to stream in */
 
-    /* BFS scratch — same as maze_backtracker.c. */
+    /* working room for the two breadth-first solve passes */
     int   bfs_queue [CELLS_MAX];
     int   bfs_dist  [CELLS_MAX];
     int   bfs_parent[CELLS_MAX];
 
-    /* Solution path. */
+    /* the longest path, and how far the beam has lit it */
     int   path[CELLS_MAX];
     int   path_len;
     int   solve_progress;
@@ -542,11 +273,9 @@ static inline bool maze_in_bounds(const Maze *m, int x, int y)
     return x >= 0 && x < m->w && y >= 0 && y < m->h;
 }
 
-/*
- * maze_carve — knock down the wall between cell at (x,y) and its
- * neighbour in direction d. Both sides updated for symmetry — the
- * BFS solver later relies on consistent wall bits on both cells.
- */
+/* Knock down the wall between (x,y) and its neighbour in direction d. Both
+ * squares must agree, so we clear the matching bit on each — the solver
+ * trusts that later. */
 static void maze_carve(Maze *m, int x, int y, int d)
 {
     int idx  = maze_idx(m, x, y);
@@ -558,12 +287,9 @@ static void maze_carve(Maze *m, int x, int y, int d)
     m->cells[nidx].walls &= (uint8_t)~WALL_BIT(opposite(d));
 }
 
-/*
- * maze_pick_random_outside — pick a random cell where in_maze == false.
- *
- * Reservoir sampling among non-maze cells — single pass, no allocation.
- * Returns -1 if every cell is already in_maze.
- */
+/* Pick a random square that isn't in the maze yet — the next walk's start.
+ * One pass, no extra memory (reservoir sampling). Returns -1 if the maze is
+ * already full. */
 static int maze_pick_random_outside(const Maze *m)
 {
     int chosen = -1;
@@ -578,18 +304,12 @@ static int maze_pick_random_outside(const Maze *m)
     return chosen;
 }
 
-/*
- * maze_start_walk — begin a new random walk at cell `start`.
- *
- * Pre: cell `start` is in bounds and !in_maze.
- * Post: walk_path = [start], walk_len = 1, walk_pos = start,
- *       cell.in_walk = true, walk_glow + head_glow flashed.
- */
+/* Drop a fresh walker at `start` (a square not yet in the maze) and begin a
+ * new trail there. */
 static void maze_start_walk(Maze *m, int start)
 {
-    /* Clear previous walk's in_walk flags (defensive — they should
-     * already be false because absorb sets them false, and loop-erase
-     * sets them false on orphans). */
+    /* Belt-and-braces: clear any leftover trail flags. They should already be
+     * clear (the wave and loop-erase clear them), but make sure. */
     for (int i = 0; i < m->walk_len; i++) {
         m->cells[m->walk_path[i]].in_walk = false;
     }
@@ -601,10 +321,8 @@ static void maze_start_walk(Maze *m, int start)
     m->cells[start].head_glow  = 1.0f;
 }
 
-/*
- * maze_reset — full re-init of the maze with one seed cell already
- * "in the museum", and a fresh walk started at another random cell.
- */
+/* Start a brand-new run: all walls up, then plant one random seed square as
+ * the maze's first member and send out the first walker. */
 static void maze_reset(Maze *m, int w, int h)
 {
     m->w = w;
@@ -633,7 +351,7 @@ static void maze_reset(Maze *m, int w, int h)
         m->cells[i].on_path        = false;
     }
 
-    /* Seed the museum with one random cell. */
+    /* Plant one random square as the maze's first member. */
     int seed_x = rand() % w;
     int seed_y = rand() % h;
     int seed   = maze_idx(m, seed_x, seed_y);
@@ -641,16 +359,14 @@ static void maze_reset(Maze *m, int w, int h)
     m->cells[seed].absorb_glow = 1.0f;
     m->maze_count = 1;
 
-    /* Begin the first walk somewhere else. */
+    /* Send the first walker out from somewhere else. */
     int start = maze_pick_random_outside(m);
     if (start >= 0) maze_start_walk(m, start);
 }
 
-/*
- * random_inbounds_dir — pick a uniform random direction whose target cell is
- * in bounds.  Rejection retry; every cell has ≥2 in-bounds neighbours so this
- * terminates quickly.  Pure read (consults only bounds; draws rand()).
- */
+/* Pick a random direction that stays on the grid. Just retries until one
+ * lands in bounds — every square has at least two valid neighbours, so this
+ * finishes fast. */
 static int random_inbounds_dir(const Maze *m, int x, int y)
 {
     int d;
@@ -660,12 +376,9 @@ static int random_inbounds_dir(const Maze *m, int x, int y)
     return d;
 }
 
-/*
- * walk_queue_absorb — CASE A: the walk reached the museum at `dest`.  Copy the
- * loop-erased walk + dest into absorb_path[] and end the walk; absorb_step then
- * streams it in.  (in_walk stays set so the trail keeps showing until the
- * magenta wave eats it cell-by-cell.)
- */
+/* The walk reached the maze at `dest`. Copy the finished trail (plus dest)
+ * into the wave queue and end the walk; the wave streams it in afterward. We
+ * leave the trail showing so the magenta wave can eat it square by square. */
 static void walk_queue_absorb(Maze *m, int dest)
 {
     m->absorb_len = 0;
@@ -673,15 +386,13 @@ static void walk_queue_absorb(Maze *m, int dest)
         m->absorb_path[m->absorb_len++] = m->walk_path[i];
     m->absorb_path[m->absorb_len++] = dest;
     m->absorb_progress = 0;
-    m->walk_len = 0;        /* walking is over */
+    m->walk_len = 0;        /* the walk is finished */
 }
 
-/*
- * walk_erase_loop — CASE B: the walker stepped back onto its own trail at
- * `nidx`.  Find nidx in walk_path[], orphan the cells after it (clear in_walk +
- * red erase flash) and truncate the path back to it — loop-erasure, the trick
- * that makes the result a UNIFORM spanning tree.
- */
+/* The walker stepped back onto its own trail at `nidx` — a loop. Find that
+ * square in the trail, drop everything after it (flash red, clear the flags),
+ * and cut the trail back to it. Erasing loops like this is the whole trick
+ * that keeps every maze equally likely. */
 static void walk_erase_loop(Maze *m, int nidx)
 {
     int hit = -1;
@@ -692,12 +403,12 @@ static void walk_erase_loop(Maze *m, int nidx)
         int c = m->walk_path[i];
         m->cells[c].in_walk     = false;
         m->cells[c].erase_glow  = 1.0f;
-        m->cells[c].walk_glow  *= 0.3f;   /* dim cyan immediately */
+        m->cells[c].walk_glow  *= 0.3f;   /* fade the cyan out right away */
     }
     m->walk_len = hit + 1;
 }
 
-/* walk_extend — CASE C: step into fresh territory; append nidx to the walk. */
+/* The walker stepped onto fresh ground; add the new square to the trail. */
 static void walk_extend(Maze *m, int nidx)
 {
     m->walk_path[m->walk_len++] = nidx;
@@ -707,59 +418,46 @@ static void walk_extend(Maze *m, int nidx)
     m->cells[nidx].head_glow    = 1.0f;
 }
 
-/*
- * maze_walk_step — perform one walk operation.  Returns 1 (stepped), 2 (walk
- * hit the maze → absorb queued, walk ended), or 0 (no active walk).
- */
+/* Take one random step. Returns 2 if the walker reached the maze (walk done,
+ * wave queued), 1 if it just moved, 0 if there's no walk going on. */
 static int maze_walk_step(Maze *m)
 {
     if (m->walk_len == 0) return 0;
 
-    int x = m->walk_pos % m->w;          /* unpack walker cell index */
+    int x = m->walk_pos % m->w;
     int y = m->walk_pos / m->w;
 
     int d    = random_inbounds_dir(m, x, y);
     int nidx = maze_idx(m, x + dir_dx(d), y + dir_dy(d));
 
-    /* Record the step at the source — this is what re-routes the path past a
-     * loop on the erase case — and damp its halo so only the new head is bright. */
+    /* Remember which way we left this square (this is what re-routes the trail
+     * past a loop) and dim its glow so only the new position stays bright. */
     m->cells[m->walk_pos].walk_dir   = d;
     m->cells[m->walk_pos].head_glow *= 0.4f;
 
-    if (m->cells[nidx].in_maze) {        /* CASE A — reached the museum */
+    if (m->cells[nidx].in_maze) {        /* reached the maze */
         walk_queue_absorb(m, nidx);
         return 2;
     }
-    if (m->cells[nidx].in_walk) {        /* CASE B — stepped on own trail */
+    if (m->cells[nidx].in_walk) {        /* stepped on our own trail — a loop */
         walk_erase_loop(m, nidx);
         m->walk_pos = nidx;
         m->cells[nidx].head_glow = 1.0f;
         m->cells[nidx].walk_glow = 1.0f;
         return 1;
     }
-    walk_extend(m, nidx);                /* CASE C — fresh territory */
+    walk_extend(m, nidx);                /* fresh ground */
     return 1;
 }
 
-/*
- * maze_absorb_step — absorb ONE cell from the queued absorb_path
- * into the permanent maze. Carves the wall between consecutive cells
- * along the way.
+/* Stream one square of the finished trail into the maze, knocking down the
+ * wall to the next square as we go. Returns true while there's more to add,
+ * false once the wave is done.
  *
- * Returns true if a cell was absorbed; false if the absorb is complete.
- *
- * Layout of absorb_path:
- *   absorb_path[0]                 = walk start (was outside)
- *   ...
- *   absorb_path[walk_len-1]        = last walk cell (was outside)
- *   absorb_path[absorb_len-1]      = the maze cell we hit (destination)
- *
- * Each cell C in the FRONT of absorb_path carves the wall between C
- * and the next cell (using C.walk_dir from the walk). The LAST cell
- * (the destination, already in_maze) gets a magenta absorb_glow flash
- * so the user sees the wave terminate inside the museum — but no wall
- * is carved through it (it's already part of the tree).
- */
+ * The queue runs trail-start ... last-trail-square, then the maze square the
+ * walker hit. Each square except the last carves the wall toward the one
+ * after it (using walk_dir). The last square is already in the maze, so it
+ * just gets a magenta flash — no wall carved. */
 static bool maze_absorb_step(Maze *m)
 {
     if (m->absorb_progress >= m->absorb_len) {
@@ -790,11 +488,10 @@ static bool maze_absorb_step(Maze *m)
     return true;
 }
 
-/*
- * BFS for tree diameter — same code shape as maze_backtracker.c §5.
- * See that file for the why; reproduced inline so this file stays
- * self-contained per the project's Self-Contained File Rule.
- */
+/* Breadth-first search from `src`, returning the square farthest from it.
+ * Run twice in a row and you get the two ends of the maze's longest path —
+ * the classic two-BFS trick. (Same as maze_backtracker.c; copied in to keep
+ * this file standalone.) */
 static int maze_bfs_farthest(Maze *m, int src)
 {
     int n = m->total_cells;
@@ -844,20 +541,15 @@ static void maze_compute_diameter(Maze *m)
     m->solve_progress = 0;
 }
 
-/* ===================================================================== */
-/* §4  simulation — scene & the ONE per-tick combine (glow decay + ops)   */
-/* ===================================================================== */
+/* ── §4 simulation — the scene state machine and the one per-tick update ── */
 
 /*
- * Scene state machine:
- *
- *   WALKING     — perform walk_steps_per_tick walk steps. Transitions
- *                 to ABSORBING when a step returns 2 (walk hit maze).
- *   ABSORBING   — perform absorb_steps_per_tick absorb steps. When the
- *                 absorb queue empties, either start a new walk
- *                 (maze_count < total_cells) or transition to SOLVING.
- *   SOLVING     — diameter beam animation (1 cell per tick).
- *   HOLD        — wait HOLD_SECONDS, then maze_reset.
+ * The four phases the showcase cycles through:
+ *   WALKING   — the walker wanders; switches to ABSORBING when it hits the maze.
+ *   ABSORBING — the magenta wave streams the trail in; then either starts a new
+ *               walk (maze not full) or moves to SOLVING (maze full).
+ *   SOLVING   — the gold beam lights the longest path, a few squares per tick.
+ *   HOLD      — pause to admire it, then start over.
  */
 typedef enum {
     SCENE_WALKING   = 0,
@@ -867,24 +559,19 @@ typedef enum {
 } SceneState;
 
 /*
- * Scene — the running showcase, read top-to-bottom as a table of contents.
- * Grouped by concept, not by which key changes them:
- *   WHAT  — m: the Maze being generated then solved (the simulation proper).
- *   PHASE — state + hold_timer: where we are in WALKING→ABSORBING→SOLVING→HOLD
- *           and the HOLD countdown; paused freezes the whole tick.
- *   HOW   — the three per-tick pacing knobs: walk_steps (the '+'/'-' speed),
- *           absorb_steps (magenta-wave pace), solve_steps (beam pace).
- * No render fields live here — colour/theme is fixed, so RENDER owns no Scene
- * state (a theme knob would belong here, grouped apart from the sim knobs).
+ * Scene — the whole running showcase in one place:
+ *   the maze itself, which phase we're in plus the HOLD countdown and the
+ *   pause flag, and three speed knobs for how many walk / wave / beam steps
+ *   to do each tick.
  */
 typedef struct {
-    Maze        m;                       /* WHAT:  maze + in-progress walk     */
-    SceneState  state;                   /* PHASE: WALKING/ABSORBING/SOLVING/HOLD */
-    float       hold_timer;              /* PHASE: seconds left in HOLD        */
-    bool        paused;                  /* PHASE: freeze the tick             */
-    int         walk_steps_per_tick;     /* HOW:   walk steps per tick (+/-)   */
-    int         absorb_steps_per_tick;   /* HOW:   absorb-wave pace            */
-    int         solve_steps_per_tick;    /* HOW:   solution-beam pace          */
+    Maze        m;                       /* the maze, and the walk in progress */
+    SceneState  state;                   /* which phase we're in               */
+    float       hold_timer;              /* seconds left in the HOLD pause      */
+    bool        paused;                  /* freeze everything                   */
+    int         walk_steps_per_tick;     /* walk speed (the +/- keys)           */
+    int         absorb_steps_per_tick;   /* magenta-wave speed                  */
+    int         solve_steps_per_tick;    /* gold-beam speed                     */
 } Scene;
 
 static void scene_reset(Scene *s, int mw, int mh)
@@ -904,8 +591,8 @@ static void scene_init(Scene *s, int mw, int mh)
     scene_reset(s, mw, mh);
 }
 
-/* EFFECTS: fade every per-cell glow buffer toward 0 this tick.  expf(-rate*dt)
- * is the textbook RC-decay; computed inline since dt is small, the loop O(N). */
+/* Fade every glow a little this tick. Each step multiplies by a number just
+ * under 1, so glows ease smoothly toward zero rather than snapping off. */
 static void decay_glows(Maze *m, float dt)
 {
     float walk_d   = expf(-WALK_GLOW_DECAY     * dt);
@@ -925,7 +612,8 @@ static void decay_glows(Maze *m, float dt)
     }
 }
 
-/* WALKING: run up to walk_steps_per_tick walk steps; a maze hit → ABSORBING. */
+/* Take several walk steps this tick. If the walker reaches the maze, hand off
+ * to the wave phase. */
 static void advance_walking(Scene *s)
 {
     for (int i = 0; i < s->walk_steps_per_tick; i++) {
@@ -935,12 +623,12 @@ static void advance_walking(Scene *s)
     }
 }
 
-/* ABSORBING: stream the walk into the maze; when the queue empties, start a
- * new walk (cells remain) or compute the diameter and switch to SOLVING. */
+/* Stream the trail into the maze this tick. When the wave finishes, either
+ * send out a new walker (cells left) or solve the finished maze. */
 static void advance_absorbing(Scene *s)
 {
     for (int i = 0; i < s->absorb_steps_per_tick; i++) {
-        if (maze_absorb_step(&s->m)) continue;   /* still absorbing */
+        if (maze_absorb_step(&s->m)) continue;   /* wave still running */
 
         if (s->m.maze_count >= s->m.total_cells) {
             maze_compute_diameter(&s->m);
@@ -951,8 +639,8 @@ static void advance_absorbing(Scene *s)
                 maze_start_walk(&s->m, start);
                 s->state = SCENE_WALKING;
             } else {
-                /* Shouldn't happen — maze_count < total but no outside cell.
-                 * Be defensive: solve. */
+                /* Shouldn't be reachable, but if no outside square is left,
+                 * just go solve. */
                 maze_compute_diameter(&s->m);
                 s->state = SCENE_SOLVING;
             }
@@ -961,15 +649,15 @@ static void advance_absorbing(Scene *s)
     }
 }
 
-/* SOLVING: stream the gold diameter beam (claims cells for on_path); when the
- * whole path is lit → HOLD. */
+/* Light a few more squares of the gold beam along the longest path. Once the
+ * whole path is lit, pause on it. */
 static void advance_solving(Scene *s)
 {
     for (int i = 0; i < s->solve_steps_per_tick; i++) {
         if (s->m.solve_progress >= s->m.path_len) break;
         int idx = s->m.path[s->m.solve_progress++];
         s->m.cells[idx].solution_glow = 1.0f;
-        s->m.cells[idx].on_path       = true;   /* stays lit after the beam */
+        s->m.cells[idx].on_path       = true;   /* stays lit once the beam passes */
     }
     if (s->m.solve_progress >= s->m.path_len) {
         s->state      = SCENE_HOLD;
@@ -977,7 +665,7 @@ static void advance_solving(Scene *s)
     }
 }
 
-/* HOLD: admire the finished maze + highlighted diameter, then reset. */
+/* Count down the pause on the finished maze, then start a new one. */
 static void advance_hold(Scene *s, float dt)
 {
     s->hold_timer -= dt;
@@ -989,9 +677,9 @@ static void scene_tick(Scene *s, float dt)
 {
     if (s->paused) return;
 
-    decay_glows(&s->m, dt);              /* EFFECTS: fade all glows */
+    decay_glows(&s->m, dt);              /* fade every glow a bit */
 
-    switch (s->state) {                  /* advance the current phase */
+    switch (s->state) {                  /* then advance whatever phase we're in */
     case SCENE_WALKING:   advance_walking(s);    break;
     case SCENE_ABSORBING: advance_absorbing(s);  break;
     case SCENE_SOLVING:   advance_solving(s);    break;
@@ -999,9 +687,7 @@ static void scene_tick(Scene *s, float dt)
     }
 }
 
-/* ===================================================================== */
-/* §5  render — HUD, ASCII walls, walk arrows, glow ramps                 */
-/* ===================================================================== */
+/* ── §5 render — HUD, ASCII walls, walk arrows, glow colours ── */
 
 static void color_init(void)
 {
@@ -1045,17 +731,9 @@ static void color_init(void)
 }
 
 /*
- * Screen — the terminal viewport: its current size in cells.  A render-target
- * concept kept as its own narrow type so the §5 functions take Screen* alone
- * and never reach for the whole App (keeps render decoupled from app/sim).
- *
- * Per-frame pattern (maze_backtracker.c §7 / framework.c §7):
- *   erase → scene_draw → HUD → wnoutrefresh(stdscr) → doupdate.
- * ASCII glyphs only: '+' wall corner, '-'/'|' wall segments, '@' walker,
- * '^>v<' walk arrows, '!' loop-erase, '*' wave / beam / supernova, '.' resting
- * maze cell.
- *
- *   cols, rows : terminal dimensions, refreshed on resize.
+ * Screen — just the terminal's current size in characters. Kept as its own
+ * tiny type so the drawing functions only need this, not the whole program.
+ *   cols, rows : terminal width and height, re-read whenever it resizes.
  */
 typedef struct { int cols, rows; } Screen;
 
@@ -1080,24 +758,23 @@ static void screen_resize(Screen *s)
 }
 
 /*
- * cell_visual — pick (pair, attr, glyph) for an interior cell.
+ * Decide what one interior square looks like: its colour, style, and
+ * character. Many things can be true at once, so we check them in priority
+ * order and the first match wins:
+ *   reset flash     → yellow '*'
+ *   the walker      → white '@'
+ *   loop-erase      → red '!'
+ *   magenta wave    → pink/magenta '*'
+ *   gold beam       → pale→gold→dark '*'
+ *   this walk's start → orange 'S'
+ *   on the trail    → cyan arrow '^>v<'
+ *   finished longest path → steady dark-gold '*'
+ *   plain maze cell → dim steel-blue '.'
+ *   nothing         → blank
  *
- * Priority (highest wins):
- *   supernova_glow   → bright yellow '*'
- *   head_glow        → near-white '@' (the walker, only one cell)
- *   erase_glow       → red '!' (loop-erase flash)
- *   absorb_glow      → pink→magenta '*' (absorb wave, gradient by glow)
- *   solution_glow    → gold beam '*' (gradient: pale→gold→dark by glow)
- *   is_source        → orange-gold 'S' (where THIS walk started)
- *   in_walk          → cyan walk arrow '^>v<' (comet gradient by walk_glow)
- *   on_path          → steady dark-gold '*' (the resting longest path)
- *   in_maze          → dim steel-blue '.'
- *   else             → blank (skip)
- *
- * `is_source` is computed by the caller from the maze's walk_path[0]
- * — only one cell is the source at any time. We render it AFTER the
- * dynamic glows (so a walker returning to source briefly shows '@'
- * before reverting to 'S') but BEFORE the regular walk arrow.
+ * The caller tells us if this is the start square (only one ever is). We check
+ * it after the live glows, so a walker passing back over its start briefly
+ * shows '@', but before the plain trail arrow.
  */
 static bool cell_visual(const Cell *c, bool is_source,
                         int *pair, int *attr, char *glyph)
@@ -1115,15 +792,14 @@ static bool cell_visual(const Cell *c, bool is_source,
         *pair = PAIR_ERASE; *attr = A_BOLD; *glyph = '!'; return true;
     }
     if (c->absorb_glow > GLOW_THRESHOLD) {
-        /* Magenta wave front (bright pink) fading to magenta as it absorbs. */
+        /* Bright pink at the wave's front, fading to magenta behind it. */
         *pair  = (c->absorb_glow > 0.6f) ? PAIR_ABSORB_HI : PAIR_ABSORB;
         *attr  = A_BOLD;
         *glyph = '*';
         return true;
     }
     if (c->solution_glow > GLOW_THRESHOLD) {
-        /* Gold beam streams along the diameter as a colour gradient: a pale-
-         * gold white-hot head, gold body, dark-gold tail behind it. */
+        /* The gold beam: a pale-gold bright head, gold body, dark-gold tail. */
         *pair  = (c->solution_glow > 0.6f)  ? PAIR_SOL_HI
                : (c->solution_glow > 0.25f) ? PAIR_SOLUTION : PAIR_SOL_LO;
         *attr  = (c->solution_glow > 0.25f) ? A_BOLD : A_NORMAL;
@@ -1134,8 +810,8 @@ static bool cell_visual(const Cell *c, bool is_source,
         *pair = PAIR_SOURCE; *attr = A_BOLD; *glyph = 'S'; return true;
     }
     if (c->in_walk) {
-        /* Comet tail as a cyan gradient: bright-cyan head, mid-cyan body,
-         * dim-cyan tail — the walk reads as a moving head with a fading wake. */
+        /* Trail in three shades of cyan — brightest at the head, dimmer behind
+         * — so it reads like a moving comet with a fading tail. */
         if (c->walk_glow > 0.55f)      { *pair = PAIR_WALK;     *attr = A_BOLD; }
         else if (c->walk_glow > 0.20f) { *pair = PAIR_WALK_MID; *attr = A_BOLD; }
         else                           { *pair = PAIR_WALK_LO;  *attr = A_NORMAL; }
@@ -1143,8 +819,8 @@ static bool cell_visual(const Cell *c, bool is_source,
         return true;
     }
     if (c->on_path) {
-        /* The finished longest path stays lit in steady dark-gold beneath the
-         * bright streaming beam — so the HOLD frame shows the maze's diameter. */
+        /* The longest path stays lit in steady dark-gold under the bright beam,
+         * so it's still visible during the HOLD pause. */
         *pair = PAIR_SOL_LO; *attr = A_NORMAL; *glyph = '*'; return true;
     }
     if (c->in_maze) {
@@ -1153,8 +829,9 @@ static bool cell_visual(const Cell *c, bool is_source,
     return false;
 }
 
-/* maze_screen_origin — top-left screen cell of the (2w+1)×(2h+1) maze frame,
- * centred in the terminal between the HUD rows. */
+/* Where the maze's top-left corner goes on screen. The maze is drawn at
+ * double size (walls take their own rows and columns), centred between the
+ * HUD rows. */
 static void maze_screen_origin(const Maze *m, int cols, int rows, int *gx0, int *gy0)
 {
     int frame_w = 2 * m->w + 1;
@@ -1167,9 +844,8 @@ static void maze_screen_origin(const Maze *m, int cols, int rows, int *gx0, int 
     *gy0 = y0;
 }
 
-/* corner_has_wall — is any wall segment incident to corner (mx,my)?  A '+' is
- * drawn there iff so.  (The OR over the eight neighbour edges — see
- * maze_backtracker.c for the LUT derivation; collapsed to '+' for ASCII.) */
+/* Does any wall touch this corner? If so we draw a '+' there. We just check
+ * all eight wall edges that could meet at the corner. */
 static bool corner_has_wall(const Maze *m, int mx, int my)
 {
     if (maze_in_bounds(m, mx,   my-1) && (m->cells[maze_idx(m, mx,   my-1)].walls & WALL_BIT(DIR_W))) return true;
@@ -1183,8 +859,8 @@ static bool corner_has_wall(const Maze *m, int mx, int my)
     return false;
 }
 
-/* h_wall_at — horizontal wall on the north edge of cell-column mx at maze-row
- * my?  Top/bottom borders read the outermost cell's N/S wall. */
+/* Is there a horizontal wall (a '-') here? For the very top and bottom edges
+ * we read the outer cells' top/bottom wall instead. */
 static bool h_wall_at(const Maze *m, int mx, int my)
 {
     if (my == 0)    return (m->cells[maze_idx(m, mx, 0)].walls      & WALL_BIT(DIR_N)) != 0;
@@ -1192,8 +868,8 @@ static bool h_wall_at(const Maze *m, int mx, int my)
     return (m->cells[maze_idx(m, mx, my)].walls & WALL_BIT(DIR_N)) != 0;
 }
 
-/* v_wall_at — vertical wall on the west edge of cell-row my at maze-column mx?
- * Left/right borders read the outermost cell's W/E wall. */
+/* Is there a vertical wall (a '|') here? For the left and right edges we read
+ * the outer cells' left/right wall instead. */
 static bool v_wall_at(const Maze *m, int mx, int my)
 {
     if (mx == 0)    return (m->cells[maze_idx(m, 0, my)].walls      & WALL_BIT(DIR_W)) != 0;
@@ -1201,8 +877,8 @@ static bool v_wall_at(const Maze *m, int mx, int my)
     return (m->cells[maze_idx(m, mx, my)].walls & WALL_BIT(DIR_W)) != 0;
 }
 
-/* scene_draw_walls — the maze frame: a '+' at each walled corner, '-' / '|'
- * along the existing wall segments, all clipped to the screen. */
+/* Draw the maze walls: '+' at every corner that has a wall, '-' and '|' along
+ * the standing wall segments, all kept inside the screen. */
 static void scene_draw_walls(const Maze *m, int gx0, int gy0, int cols, int rows)
 {
     for (int my = 0; my <= m->h; my++) {
@@ -1240,8 +916,8 @@ static void scene_draw_walls(const Maze *m, int gx0, int gy0, int cols, int rows
     }
 }
 
-/* scene_draw_interiors — the cell glyphs (glows / walk arrows / maze dots) via
- * cell_visual; the single source cell ('S') is flagged from walk_path[0]. */
+/* Draw what sits inside each cell — glows, trail arrows, maze dots — using
+ * cell_visual. The walk's start square (drawn as 'S') is the first trail entry. */
 static void scene_draw_interiors(const Scene *s, int gx0, int gy0, int cols, int rows)
 {
     const Maze *m = &s->m;
@@ -1290,7 +966,7 @@ static void screen_draw(const Screen *sc, const Scene *s,
         (s->state == SCENE_SOLVING)   ? "SOLVING" :
                                         "HOLD   ";
 
-    /* Row 0 — title (left) + stats (right): the data line. */
+    /* Row 0 — title on the left, live stats on the right. */
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
     mvprintw(0, 1, " WILSON'S MAZE ");
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
@@ -1306,7 +982,7 @@ static void screen_draw(const Screen *sc, const Scene *s,
     mvprintw(0, hx, "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    /* Row 1 — glyph legend: secondary data (no bold, row 0 stays dominant). */
+    /* Row 1 — what the symbols mean (not bold, so row 0 stands out). */
     snprintf(buf, sizeof buf,
              " S:source  @:walker  ^>v<:trail  !:loop-erase  *:wave/beam ");
     if ((int)strlen(buf) > cols) buf[cols] = '\0';
@@ -1314,7 +990,7 @@ static void screen_draw(const Screen *sc, const Scene *s,
     mvprintw(1, 0, "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD));
 
-    /* Bottom row — actions: every interactive key. */
+    /* Bottom row — the keys you can press. */
     snprintf(buf, sizeof buf,
              " q:quit  spc:pause  r:reset  +/-:speed  [/]:Hz ");
     if ((int)strlen(buf) > cols) buf[cols] = '\0';
@@ -1325,28 +1001,25 @@ static void screen_draw(const Screen *sc, const Scene *s,
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
-/* ===================================================================== */
-/* §6  app — signals, key/resize events, fixed-timestep main loop         */
-/* ===================================================================== */
+/* ── §6 app — signals, key/resize events, the main loop ── */
 
 /*
- * App — the running program: the Scene being animated, the terminal it draws
- * to, and the loop/lifecycle state that is neither simulation nor render.
- * Kept distinct from Scene so the render layer can take Screen* alone, and so
- * the signal handler can reach the run flags via the single g_app instance.
- *   DOMAIN    — scene + screen: the simulation and its draw target.
- *   PACING    — sim_fps: fixed-timestep rate (the [ / ] knob).
- *   GEOMETRY  — maze_w/maze_h: chosen maze size, re-fit to the terminal on
- *               resize (clamped to MAZE_*_MAX so the cell arrays can't overflow).
- *   LIFECYCLE — running/need_resize: signal-written flags (sig_atomic_t).
+ * App — the whole running program: the scene being animated, the terminal it
+ * draws to, the chosen maze size, and the few flags the main loop and signal
+ * handlers need. Kept apart from Scene so the drawing code only needs Screen,
+ * and so the signal handler can reach the run flags through the one g_app.
+ *   maze_w/maze_h are re-fit to the terminal on resize, and capped at the MAX
+ *   sizes so the cell arrays can never overflow.
+ *   running and need_resize are written from signal handlers, hence the
+ *   volatile sig_atomic_t type.
  */
 typedef struct {
-    Scene                 scene;        /* DOMAIN:    the simulation       */
-    Screen                screen;       /* DOMAIN:    its draw target      */
-    int                   sim_fps;      /* PACING:    fixed-timestep rate  */
-    int                   maze_w, maze_h; /* GEOMETRY: chosen maze size    */
-    volatile sig_atomic_t running;      /* LIFECYCLE: clear to exit        */
-    volatile sig_atomic_t need_resize;  /* LIFECYCLE: set by SIGWINCH      */
+    Scene                 scene;        /* the simulation                  */
+    Screen                screen;       /* where it's drawn                */
+    int                   sim_fps;      /* tick rate (the [ / ] keys)      */
+    int                   maze_w, maze_h; /* chosen maze size              */
+    volatile sig_atomic_t running;      /* clear this to quit              */
+    volatile sig_atomic_t need_resize;  /* set when the window resizes     */
 } App;
 
 static App g_app;
@@ -1440,7 +1113,7 @@ int main(void)
         int64_t now = clock_ns();
         int64_t dt  = now - frame_time;
         frame_time  = now;
-        if (dt > MAX_FRAME_NS) dt = MAX_FRAME_NS;   /* spiral-of-death guard */
+        if (dt > MAX_FRAME_NS) dt = MAX_FRAME_NS;   /* don't try to catch up forever */
 
         int64_t tick_ns = TICK_NS(app->sim_fps);
         float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;

@@ -1,354 +1,19 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * tectonic.c
- *   — Procedural tectonic worldmap. Place N plate seeds; Voronoi-
- *     assign every cell to a plate; give each plate a velocity and
- *     a type (oceanic / continental); classify each plate boundary
- *     from the relative velocity (convergent → mountains, divergent
- *     → rifts, transform → faults); modulate elevation by distance
- *     to the nearest boundary; add Perlin fBm for organic detail;
- *     bin elevation into eight biomes from deep ocean to snowy peak.
- *     The result is a continent + ocean map that feels geological,
- *     not random.
+ * tectonic.c — a fake-but-believable world map.
  *
- * DEMO: A world appears: blue oceans, green plains, brown mountains,
- *       white peaks. The shape isn't accidental — mountain chains run
- *       along convergent plate boundaries (where two plates push into
- *       each other), trenches and rift seas trace divergent
- *       boundaries (where plates pull apart), and the coastlines
- *       follow the underlying Voronoi geometry. Cycle FIFTEEN map views
- *       of the same generated world with n / p:
+ * Instead of drawing mountains and oceans by hand, we scatter a handful of
+ * drifting "plates", see where they push together or pull apart, and let the
+ * terrain fall out of that. Convergent edges get mountains, divergent edges get
+ * trenches, everything else is plains or sea. The same world can be viewed
+ * fifteen different ways (n/p to cycle); it rebuilds itself every ~15 seconds.
  *
- *         WORLD      biome map — the finished world
- *         PLATES     coloured Voronoi cells, one tint per plate, seeds 'O'
- *         STRESS     boundary-type heatmap (convergent/divergent/transform)
- *         ELEVATION  pure height ramp — eight glyphs from '`' to '@'
- *         RELIEF     shaded relief — terrain lit from the north-west
- *         CONTOUR    topographic contour lines + coastline
- *         BATHYMETRY ocean-depth ramp — deep trenches darkest
- *         TEMP       climate by latitude + altitude (hot red, cold blue)
- *         MOISTURE   rainfall — a value-noise field with a rain shadow
- *         RUGGED     slope magnitude — mountain ranges & cliffs glow
- *         ASPECT     downhill-direction flow field (8 tinted headings)
- *         HEATFLOW   geothermal glow around plate boundaries
- *         NATIONS    plates as nations — borders + capital markers
- *         CONTINENT  land vs sea, continental vs oceanic crust
- *         DAY/NIGHT  an animated terminator sweeping the globe
- *
- *       After ~15 seconds the world is discarded and a new one
- *       builds from a fresh seed —
- *       different plate count, different layout, completely
- *       different geography but governed by the same physics.
- *
- * Study alongside:
- *   ../generational/voronoi_region_map.c
- *      — the same Voronoi machinery, used as a clean teaching
- *        example without the velocity / boundary / biome layer.
- *   ../worldgen/procedural_galaxy.c
- *      — also "world from a function", but in continuous polar
- *        coordinates instead of discrete tectonics.
- *
- * Section map (re-cut by CONCERN — see ARCHITECTURE block below):
- *   §1 CONFIG       — constants, enums, data tables, core world types
- *   §2 PERFORMANCE  — timing primitives (throttle policy lives in main)
- *   §3 LOGIC        — pure: hash, perlin/fbm, classify, cartographic math
- *   §4 SIMULATION   — world-gen pipeline + scene_tick (clock + regen timer)
- *   §5 EFFECTS      — cosmetic-only state (one-line note: none stored)
- *   §6 DELAYS       — pauses, holds, timers (one-line note: regen timer)
- *   §7 RENDER       — the 15 per-cell view renderers + dispatch + HUD
- *   §8 APP          — user events + per-tick combine + main loop
- *
- * Keys:
- *   q / ESC    quit
- *   space      pause / resume
- *   r          regenerate world with a new seed
- *   n / N      next / prev pattern  (cycles all 15 map views)
- *   p / P      previous pattern
- *   t / T      next / previous theme
- *   + / =      shorter regen interval (faster cycling)
- *   -          longer
- *   ] / [      raise / lower tick Hz
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra \
- *     procedural/worldgen/tectonic.c \
- *     -o tectonic -lncurses -lm
+ * Cousin files worth a look:
+ *   ../generational/voronoi_region_map.c — the plain Voronoi idea on its own.
+ *   ../worldgen/procedural_galaxy.c       — "world from a function", polar style.
+ * References for the geology and the map styles live next to the types and
+ * helpers that use them.
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Five stages, run in order whenever the world is
- *                  regenerated.
- *
- *                  (1) PLATE PLACEMENT — pick N ∈ [6, 14] plate seeds
- *                      via a jittered grid (same scheme as the
- *                      constellation file). One seed per grid cell at a
- *                      hash-driven offset; the result is organically
- *                      scattered without clusters. Each plate gets:
- *                        - position (x, y)
- *                        - random velocity (vx, vy), magnitude ~0.3-1
- *                        - random type ∈ {oceanic, continental}
- *                        - base elevation (oceanic = -0.5, continental
- *                          = +0.3) — the mean height that plate would
- *                          have with no boundary stress applied
- *
- *                  (2) VORONOI ASSIGNMENT — for each map cell, assign
- *                      it to the nearest plate (squared Euclidean,
- *                      with y multiplied by 2 to correct the cell-
- *                      aspect ratio so Voronoi cells look round).
- *                      The map is now partitioned into N regions,
- *                      each owned by exactly one plate.
- *
- *                  (3) BOUNDARY DETECTION & CLASSIFICATION — for
- *                      each cell, look at 4 neighbours; if any has
- *                      a different plate id, this cell is on a
- *                      plate boundary. Classify the boundary by
- *                      the RELATIVE VELOCITY of the two plates,
- *                      decomposed along their seed-to-seed normal:
- *                        approach = (v_a − v_b) · n_ab
- *                          where n_ab points from plate a to plate b
- *                          (and is aspect-corrected like the Voronoi)
- *                        - approach > +T  → CONVERGENT (plates close)
- *                        - approach < −T  → DIVERGENT  (plates pull apart)
- *                        - |approach| ≤ |perp|/k → TRANSFORM (parallel)
- *
- *                  (4) ELEVATION FIELD — for every cell, scan a small
- *                      aspect-corrected neighbourhood for the closest
- *                      boundary cell. The boundary type AND distance
- *                      drive a modifier:
- *                        CONVERGENT : +0.5 · (1 − d/R)   (mountains)
- *                        DIVERGENT  : −0.4 · (1 − d/R)   (rifts/trenches)
- *                        TRANSFORM  : 0                   (no vert. motion)
- *                      Final elevation = base_elev + modifier + Perlin
- *                      fBm noise (4 octaves), clamped to [-1, +1].
- *
- *                  (5) BIOME BINNING — eight elevation buckets:
- *                      DEEP_OCEAN < −0.55 < OCEAN < −0.20 < COAST < 0
- *                      < PLAINS < 0.15 < HILLS < 0.35 < MOUNTAINS
- *                      < 0.55 < HIGHLANDS < 0.75 < PEAKS.
- *
- *                  Once the world is built, fifteen PATTERNS render the
- *                  same data fifteen ways — the natural biome map, Voronoi
- *                  plate tinting, boundary heatmap, elevation ramp, plus
- *                  derived cartographic views (shaded relief, contours,
- *                  bathymetry, latitude climate, rainfall, slope, aspect,
- *                  geothermal heat, nations, continents, day/night).
- *
- * Data-structure : Cell { plate_id:1, boundary:1, elev:1, biome:1 } =
- *                  4 bytes. For a 240×80 map that's 76 KB. Plus a
- *                  small Plate[16] array. No allocation in steady
- *                  state — regen reuses the same buffer.
- *
- * Rendering      : ASCII only. Each pattern dispatches per cell:
- *                    WORLD     biome glyph (chosen by biome+hash) in
- *                              biome-ramp colour. Water shimmer cycles
- *                              the glyph by time; peaks twinkle; and
- *                              convergent mountain cells occasionally
- *                              flash '*' for volcanic activity.
- *                    PLATES    glyph by plate type ('~' / '#') in a
- *                              plate-id-cycled tint, plus 'O' markers
- *                              at each plate seed.
- *                    STRESS    boundary cells light up in their type's
- *                              accent (red / blue / accent); non-edge
- *                              cells render dimly as background.
- *                    ELEVATION 8-step density ramp ' .,:-^#@' coloured
- *                              by ramp index — pure height map.
- *
- * Performance    : Build is O(W·H · N_plates) for the Voronoi (the
- *                  dominant cost) — ~230 K ops for 240×80 × 12.
- *                  Boundary detection and elevation are O(W·H) and
- *                  O(W·H · R²) where R ≈ 6; under 2 M ops total.
- *                  Whole world builds in <10 ms on a current CPU.
- *                  Per-frame render is O(W·H) cell visits.
- *
- * References     :
- *
- *   World generation (the simulation) —
- *   • Wikipedia — "Plate tectonics"
- *     https://en.wikipedia.org/wiki/Plate_tectonics
- *   • Wikipedia — Convergent / Divergent / Transform boundaries
- *     https://en.wikipedia.org/wiki/Plate_boundaries
- *   • Wikipedia — "Voronoi diagram" (the plate-assignment partition)
- *     https://en.wikipedia.org/wiki/Voronoi_diagram
- *   • Lague, S. — "Tectonic Plate Simulation for Procedural Terrain"
- *     https://www.youtube.com/watch?v=x_Tn66PvTn4
- *   • Andy Gainey — "Procedural Worlds from Simple Tiles"
- *     https://experilous.com/1/blog/post/procedural-planet-generation
- *   • Perlin, K. (2002) — "Improving Noise" (the fBm scaffold + value_noise)
- *     https://mrl.cs.nyu.edu/~perlin/paper445.pdf
- *
- *   Cartographic rendering (the 15 map views) —
- *   • Horn, B.K.P. (1981) — "Hill Shading and the Reflectance Map", Proc. IEEE
- *     69(1):14-47. The 3×3 neighbour-gradient that powers RELIEF (NW hillshade),
- *     RUGGED (slope magnitude) and ASPECT (downhill heading) from a height grid.
- *   • Imhof, E. (1982) — "Cartographic Relief Presentation". The classic on
- *     depicting terrain: shaded relief, contour lines, and hypsometric /
- *     bathymetric tinting (RELIEF, CONTOUR, BATHYMETRY).
- *   • Whittaker, R.H. (1975) — biome classification by temperature × moisture;
- *     the idea behind the TEMP and MOISTURE views (here keyed to latitude +
- *     altitude + noise rather than measured climate).
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * To make a world look geological — not random — you don't draw the
- * mountains. You draw the FORCES that would make the mountains. Tile
- * the plane with plates, give each plate a velocity, look at where
- * the plates push or pull on each other, and let the elevation fall
- * out of those interactions. Add some noise for grit. The mountain
- * chains, ocean ridges, and coastlines emerge for free because you
- * drew the same physics nature uses.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Picture a jigsaw puzzle floating on water. Each piece is a tectonic
- * plate. The pieces drift in different directions at different
- * speeds. Where two pieces are pushing INTO each other, the edges
- * crumple upward → mountains. Where two pieces are pulling APART,
- * a gap opens between them and water rushes in → rift / ocean ridge.
- * Where pieces SLIDE PAST each other, neither gap nor pile-up → a
- * fault zone. The interior of each piece is just whatever colour the
- * piece was — flat plains for continental plates, deep water for
- * oceanic plates. All the geography is in the EDGE INTERACTIONS.
- *
- * Now: for "jigsaw piece" read "Voronoi cell of a random seed", for
- * "drifting" read "random velocity vector", for "edges crumple" read
- * "+0.5 added to elevation within distance R of a convergent
- * boundary", and you have the algorithm. The whole world is just
- * Voronoi + per-plate constants + a 5-line classifier on the relative
- * velocity at every shared edge.
- *
- * ALGORITHM IN STEPS
- * ──────────────────
- *  1. PLACE N plate seeds in a jittered grid. For each:
- *       - position (x, y) in world cells
- *       - velocity (vx, vy), random direction, speed in [0.3, 1.0]
- *       - type ∈ {oceanic, continental}, 50/50
- *       - base_elev = oceanic ? −0.5 : +0.3
- *  2. ASSIGN each cell to its nearest plate seed (Voronoi). Use
- *     squared Euclidean distance with y · 2 for cell aspect.
- *  3. DETECT boundaries: for each cell, if any of its 4 neighbours
- *     belongs to a different plate, this is an edge cell.
- *  4. CLASSIFY each edge by the velocity of the two plates:
- *       n_ab    = (b.pos − a.pos) / |...|       boundary normal
- *       approach = (a.v − b.v) · n_ab
- *       if approach > +T     → CONVERGENT
- *       if approach < −T     → DIVERGENT
- *       else                 → TRANSFORM
- *  5. ELEVATION at each cell:
- *       for every cell within R of an edge, find its closest edge
- *       and apply the type-specific modifier (decayed by 1−d/R):
- *         CONVERGENT  : +0.5 · (1 − d/R)
- *         DIVERGENT   : −0.4 · (1 − d/R)
- *         TRANSFORM   : 0
- *       elev = plate.base_elev + modifier + 0.4 · (fbm − 0.5)
- *       clamp to [−1, +1].
- *  6. BIOME = bucket of elev. 8 buckets DEEP_OCEAN..PEAKS.
- *  7. RENDER per the active pattern. Repeat from step 1 every
- *     ~REGEN_SECONDS to bulldoze the world and rebuild from a new seed.
- *
- * KEY FORMULAS
- * ────────────
- *  Voronoi (per cell — choose closest plate):
- *      d²(plate_i)  = (x − pi.x)² + 4·(y − pi.y)²
- *      cell.plate   = argmin_i d²(plate_i)
- *
- *  Boundary classification:
- *      n  = ((b.x − a.x), 2·(b.y − a.y)) / |...|       // aspect normal
- *      approach = (a.vx − b.vx)·n.x + (a.vy − b.vy)·n.y
- *      perp     = √(|Δv|² − approach²)
- *      kind     = approach >  T   → CONVERGENT
- *               | approach < −T   → DIVERGENT
- *               | otherwise        → TRANSFORM
- *
- *  Elevation:
- *      d, t  = (distance, type) of nearest boundary cell within R
- *      mod   = match t with
- *                CONVERGENT → +0.5 · (1 − d/R)
- *                DIVERGENT  → −0.4 · (1 − d/R)
- *                TRANSFORM  →  0
- *      elev  = clamp(plate.base + mod + 0.4·(fbm(x·s, y·s)−0.5), −1, 1)
- *
- *  Biome buckets:
- *      e < −0.55 DEEP_OCEAN | < −0.20 OCEAN  | < 0    COAST
- *      | < +0.15 PLAINS     | < +0.35 HILLS  | < +0.55 MOUNTAINS
- *      | < +0.75 HIGHLANDS  | else PEAKS
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • DEGENERATE NORMALS. If two plate seeds end up at identical (x, y)
- *    the boundary normal is undefined. Jittered-grid placement makes
- *    this practically impossible, but classify_boundary still guards
- *    against zero-length normals and falls back to TRANSFORM.
- *
- *  • ASPECT EVERYWHERE. Voronoi distance, boundary-normal direction,
- *    AND the elevation-modifier scan radius all need the y·2 aspect
- *    correction — otherwise plates look flat (squashed) and mountain
- *    chains form too easily in the y direction. Use it consistently.
- *
- *  • TRANSFORM MUST DOMINATE WHEN PERPENDICULAR. With the simple test
- *    "approach > T or approach < −T", every boundary becomes either
- *    convergent or divergent if T is tiny. We compare |approach| to
- *    the perpendicular magnitude — a boundary is only transform when
- *    the relative motion is mostly TANGENT to the boundary, not
- *    NORMAL to it. Otherwise small perpendicular velocities would
- *    make lots of lines look like faults.
- *
- *  • BOUNDARY-EFFECT RADIUS. Too small → mountains form only on the
- *    exact boundary cells, looking like a line drawing. Too large →
- *    mountains everywhere; the plate interior disappears. R ≈ 6 cells
- *    (with aspect) leaves a clear "coast plus inland" gradient.
- *
- *  • ELEVATION CLAMPING. Without clamp, divergent boundaries on top
- *    of an already-oceanic plate (base −0.5) plus the −0.2 noise
- *    floor can produce elev = −1.1, which falls outside the biome
- *    table. Always clamp post-modifier.
- *
- *  • PLATE COUNT VS MAP SIZE. Too many plates on a small map and the
- *    Voronoi cells become smaller than the boundary radius — every
- *    cell is "near a boundary", elevation washes out. Cap plates at
- *    14 and require ≥ 6 cells of plate radius on the smallest map.
- *
- *  • REGEN PERFORMANCE. The plate-classification loop's inner Voronoi
- *    is O(W·H · N). For 240·80·14 ≈ 270 K ops; fine. If you raise N
- *    past ~30 a spatial index becomes worth it.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • PAUSE during HOLD: the world freezes. Resume: animation
- *    continues exactly where it stopped (water shimmer, peak
- *    twinkle). Verifies the fixed-step accumulator.
- *
- *  • Press 'r': regenerate. The new world has a different
- *    plate count and layout but the SAME biome distribution
- *    statistics (e.g. roughly half ocean, half land for the default
- *    50/50 oceanic-continental split).
- *
- *  • PLATES pattern: every cell of the same plate has the same tint
- *    AND glyph; cells on the boundary are highlighted. Plate seeds
- *    are visible as bright 'O' markers — you should be able to find
- *    one inside every Voronoi cell.
- *
- *  • STRESS pattern: the boundary cells form a network of lines
- *    crossing the map. Convergent edges (red) should dominate where
- *    plates head into each other; divergent (blue) where they pull
- *    apart. Transform (yellow) is rarer but appears between plates
- *    moving roughly parallel.
- *
- *  • WORLD pattern: walk the eye along an EXTENDED CONVERGENT
- *    boundary in STRESS — the same line in WORLD should host a
- *    chain of MOUNTAINS / PEAKS. Walk a DIVERGENT line — same
- *    location should be DEEP_OCEAN / OCEAN. This is the visual
- *    proof the elevation modifier is wired up correctly.
- *
- *  • ELEVATION pattern: a smooth gradient with no plate-tint
- *    structure — just heights. Compare against WORLD: the same
- *    high-elevation cells should map to MOUNTAINS / PEAKS biomes.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -366,78 +31,22 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ── ARCHITECTURE ─────────────────────────────────────────────────────── *
- *
- * Re-cut from first principles into separated concern-layers (a SEPARATION
- * pass: RELOCATE + LABEL only — every function body is byte-identical, nothing
- * renamed). The world is GENERATED once per reset and then only viewed, so §4
- * SIMULATION is a one-shot pipeline plus a tiny per-tick timer, while §7 RENDER
- * is large (15 map views). Layer → section → what it mutates:
- *
- *   LAYER        §   MUTATES
- *   ─────────────────────────────────────────────────────────────────────
- *   CONFIG       §1  nothing — compile-time constants, the Biome / Boundary /
- *                    Plate / Pattern enums, const data tables (glyphs, ramp,
- *                    themes) and the core world types (Plate, Cell, World),
- *                    relocated up so §3/§4 can see them.
- *   PERFORMANCE  §2  nothing — clock_ns / clock_sleep_ns are pure timers; the
- *                    frame cap + fixed-timestep accumulator are POLICY in main.
- *   LOGIC        §3  nothing — the spatial hash + Perlin/fBm samplers, widx, the
- *                    boundary classifier, elev→biome, the pure generation
- *                    helpers (jitter_offset, nearest_boundary, boundary_uplift),
- *                    the cartographic math (clampi / elev_at / value_noise), the
- *                    biome census and pattern_name. All pure; perm[] reseeded
- *                    only from §4.
- *   SIMULATION   §4  World.{plates,cells,n_plates,seed} + the global perm[], and
- *                    Scene.{world,paused,speed,current_theme,current_pattern,
- *                    time_secs,regen_t}. world_build runs the generation pipeline
- *                    (plates→Voronoi→boundaries→elevation) on reset; scene_tick
- *                    advances the clock + regen countdown. The ONLY writers.
- *   EFFECTS      §5  (none) — no stored cosmetic buffer; shimmer / twinkle /
- *                    volcanic spark / city lights are render-derived from
- *                    time_secs. One-line section, not a real layer.
- *   DELAYS       §6  (none) — the auto-regen countdown (regen_t) + pause live in
- *                    scene_tick (§4); no standalone delay state.
- *   RENDER       §7  ncurses back buffer + colour-pair table only (theme_apply,
- *                    color_init, the 15 render_* views, scene_draw, screen_draw +
- *                    the HUD draw_* helpers). Reads §4 world state via the §3
- *                    deciders; never writes it.
- *   APP          §8  App.{running,need_resize,sim_fps}; drives Scene via the
- *                    combine + user events.
- *
- * PER-TICK COMBINE (the one place state advances — main(), §8):
- *
- *     while (sim_accum >= tick_ns)        // PERFORMANCE: fixed timestep
- *         scene_tick()                    //   SIMULATION + the regen timer
- *     screen_draw() ; screen_present()    // RENDER (reads only; views re-derived)
- *     getch() → app_handle_key()          // USER EVENTS — see below
- *
- * Nothing other than scene_tick() advances simulation state — and the only state
- * it advances per tick is the clock + regen countdown (a generation runs only
- * when that countdown expires, or on a user event). User events (app_handle_key
- * / app_do_resize) rebuild or mutate the world on a keypress or SIGWINCH, but
- * run once per frame OUTSIDE the accumulator loop, not as part of the tick.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ===================================================================== */
-/* §1  CONFIG  -- constants, enums, data tables, core world types        */
-/* ===================================================================== */
+/* §1  CONFIG  -- constants, enums, data tables, core world types */
 
 enum {
-    /* Map cap. Anything larger is clipped. */
+    /* Biggest map we'll draw; bigger terminals get clipped to this. */
     MAP_W_MAX           = 240,
     MAP_H_MAX           =  80,
     CELLS_MAX           = MAP_W_MAX * MAP_H_MAX,
 
-    /* Plate count range. Each regenerate picks N randomly in [MIN, MAX]. */
+    /* Each new world picks a plate count somewhere in [MIN, MAX].
+     * LIMIT is just the size of the plates[] array. */
     N_PLATES_MIN        =   6,
     N_PLATES_MAX        =  14,
-    N_PLATES_LIMIT      =  16,    /* hard upper bound for plates[] array */
+    N_PLATES_LIMIT      =  16,
 
-    /* Boundary-effect neighbourhood radius — how far inland a boundary
-     * pushes its elevation. R_X / R_Y are in CELLS; aspect-corrected
-     * physical distance uses sqrt(dx² + 4·dy²). */
+    /* How far inland a plate edge still bumps the terrain up or down.
+     * Measured in cells; the y reach is smaller because cells are tall. */
     BOUNDARY_RX         =   6,
     BOUNDARY_RY         =   3,
 
@@ -446,8 +55,8 @@ enum {
     SIM_FPS_MAX         = 240,
     SIM_FPS_STEP        =  10,
 
-    /* "speed" controls how often the world regenerates (smaller = faster).
-     * SPEED_DEF is once every ~15 s. */
+    /* The "speed" knob: how quickly a world ages toward its next rebuild.
+     * Bigger = rebuilds sooner. SPEED_DEF lands around every 15 seconds. */
     SPEED_MIN           =   1,
     SPEED_DEF           =   8,
     SPEED_MAX           =  64,
@@ -455,72 +64,72 @@ enum {
     HUD_COLS            =  80,
     FPS_UPDATE_MS       = 500,
 
-    /* Color pair indices.  PAIR_HUD/PAIR_HINT reserved per CLAUDE.md. */
+    /* Colour-pair slots. PAIR_HUD / PAIR_HINT are reserved project-wide. */
     PAIR_HUD            =   1,
     PAIR_HINT           =   2,
-    PAIR_RAMP_BASE      =   3,    /* +0..+7 = 8 elevation/biome tints  */
-    PAIR_HOT            =  11,    /* convergent / volcanic accent      */
-    PAIR_COLD           =  12,    /* divergent / deep-water accent     */
+    PAIR_RAMP_BASE      =   3,    /* +0..+7: the 8 low-to-high terrain tints */
+    PAIR_HOT            =  11,    /* warm accent: mountains, lava, dawn      */
+    PAIR_COLD           =  12,    /* cool accent: trenches, deep sea         */
 };
 
 #define NS_PER_SEC      1000000000LL
 #define NS_PER_MS          1000000LL
 #define TICK_NS(f)      (NS_PER_SEC / (f))
 
-/* Approximate seconds between full regenerations at SPEED_DEF.
- * speed > SPEED_DEF shortens this; speed < lengthens. */
+/* Roughly how long a world lives before it's torn down and rebuilt.
+ * The speed knob scales this up or down. */
 #define REGEN_SECONDS    15.0f
 
-/* Aspect — terminal cells are ~2× taller than wide.  Multiplies y in
- * Voronoi distance, boundary normals, and boundary scan radii. */
+/* Terminal cells are about twice as tall as they are wide. We stretch the
+ * y axis by this everywhere we measure distance, so circles look round and
+ * plates don't come out squashed. */
 #define ASPECT_Y_F      2.0f
 
-/* Boundary classification threshold. Approach magnitudes below this
- * fraction of the perpendicular magnitude become TRANSFORM rather
- * than CONVERGENT/DIVERGENT — see classify_boundary in §5. */
+/* How sideways a plate's motion has to be before we call the edge a "sliding
+ * past" fault instead of a push or a pull (used in classify_boundary). */
 #define APPROACH_FRAC    0.50f
 
-/* fBm scale — controls feature size of the noise added to elevation.
- * Lower = larger, smoother features. */
+/* The wobbly noise mixed into terrain height. Smaller scales = bigger,
+ * smoother features; octaves = how many layers of detail; amplitude = how
+ * much it nudges the height. */
 #define FBM_SCALE_X      0.060f
 #define FBM_SCALE_Y      0.120f
 #define FBM_OCTAVES      4
-#define FBM_AMPLITUDE    0.40f       /* peak-to-peak elev contribution */
+#define FBM_AMPLITUDE    0.40f
 
-/* Plate base elevations and boundary modifiers. */
+/* Resting heights and edge nudges. Ocean plates sit below sea level,
+ * continents above; pushing edges rise, pulling edges sink. */
 #define BASE_ELEV_OCEAN     (-0.50f)
 #define BASE_ELEV_CONTINENT (+0.30f)
 #define MOD_CONVERGENT      (+0.50f)
 #define MOD_DIVERGENT       (-0.40f)
 
-/* Plate velocity magnitude range (arbitrary units; only relative velocity
- * across a border matters). speed ∈ [MIN, MIN+SPAN]. */
+/* How fast each plate drifts. Only the difference between two plates'
+ * speeds matters, so the units are arbitrary. */
 #define PLATE_SPEED_MIN     0.30f
 #define PLATE_SPEED_SPAN    0.70f
 
-/* Elevation quantisation: the real [-1,+1] field stored as int8 [-100,+100]. */
+/* We keep heights as small whole numbers (-100..+100) instead of floats. */
 #define ELEV_INT_SCALE     100.0f
 
-/*
- * View parameters for the extended cartographic catalogue (cell elev is the
- * int8 [-100,+100]; SEA_LEVEL = 0 is the coastline).
- */
-#define SEA_LEVEL            0          /* elev below this is underwater       */
-#define RELIEF_LIGHT        12          /* hillshade slope→brightness divisor  */
-#define CONTOUR_INTERVAL    18          /* elev units between contour lines     */
-#define RUGGED_DIVISOR       8          /* slope magnitude → ruggedness divisor*/
-#define HEAT_RADIUS          3          /* geothermal glow reach (cells)        */
-#define MOISTURE_SCALE       9          /* rainfall value-noise cell size       */
-#define DAYNIGHT_SECONDS    24.0f       /* seconds for one day/night rotation   */
-#define TWILIGHT_WIDTH       0.18f      /* half-width of the dawn/dusk band     */
+/* Knobs for the extra map views. Height is the stored -100..+100; SEA_LEVEL 0
+ * is the waterline. */
+#define SEA_LEVEL            0          /* below this is underwater            */
+#define RELIEF_LIGHT        12          /* steeper slope = brighter shading    */
+#define CONTOUR_INTERVAL    18          /* height gap between contour lines     */
+#define RUGGED_DIVISOR       8          /* how steep counts as "rugged"        */
+#define HEAT_RADIUS          3          /* how far the geothermal glow reaches */
+#define MOISTURE_SCALE       9          /* size of the rainfall noise blobs    */
+#define DAYNIGHT_SECONDS    24.0f       /* seconds for one full day/night turn */
+#define TWILIGHT_WIDTH       0.18f      /* width of the dawn/dusk band         */
 
 /* ── Biome ─────────────────────────────────────────────────────────────── *
- * Eight elevation bands, deepest ocean → highest peak, assigned purely from a
- * cell's elevation (elev_to_biome, §3). They are buckets, not an ecological
- * model — moisture/temperature don't enter (the TEMP/MOISTURE views add those
- * separately). Order IS the elevation order, so a Biome value doubles as a
- * brightness index into a theme's 8-step ramp (ramp[biome]). N_BIOMES = 8 also
- * sizes the ramp and the HUD census. REF: hypsometric tinting (Imhof). */
+ * Eight height bands, deepest sea to highest peak. We pick one purely from a
+ * cell's height (elev_to_biome) — no rainfall or temperature here; those get
+ * their own views. The list is in height order, so a biome number doubles as
+ * "how bright" — it indexes straight into a theme's 8 colours. N_BIOMES = 8
+ * also sizes those colours and the HUD's land/sea tally.
+ * (The "colour terrain by height" idea is hypsometric tinting; Imhof 1982.) */
 typedef enum {
     BIOME_DEEP_OCEAN = 0,
     BIOME_OCEAN      = 1,
@@ -533,11 +142,8 @@ typedef enum {
     N_BIOMES         = 8,
 } Biome;
 
-/*
- * BIOME_GLYPHS[biome][0..1] — two glyphs per biome; per-cell hash
- * picks one for textural variation. Kept ASCII-only so the map
- * renders identically on every terminal locale.
- */
+/* Two characters per biome; a per-cell hash flips between them so the terrain
+ * looks textured instead of flat. ASCII only, so it looks the same everywhere. */
 static const char BIOME_GLYPHS[N_BIOMES][2] = {
     { '~', ',' },     /* DEEP_OCEAN */
     { '~', '_' },     /* OCEAN      */
@@ -549,22 +155,20 @@ static const char BIOME_GLYPHS[N_BIOMES][2] = {
     { '#', '@' },     /* PEAKS      */
 };
 
-/* Elevation density ramp for ELEVATION pattern.
- * 0 = lowest (deepest), 7 = highest (peak). */
+/* Characters for the plain height map, faint dot (lowest) to solid block
+ * (highest). */
 static const char ELEV_RAMP[N_BIOMES] = {
     '`', '.', ',', ':', '-', '^', '#', '@'
 };
 
 /* ── BoundaryKind ──────────────────────────────────────────────────────── *
- * What two plates are doing where they meet — classified from their RELATIVE
- * velocity projected onto the shared-border normal (classify_boundary, §3):
- *   NONE        interior cell, not on any plate border.
- *   CONVERGENT  plates push together → uplift (mountains, volcanic arcs, the
- *               +MOD_CONVERGENT elevation modifier).
- *   DIVERGENT   plates pull apart → rifts, trenches, new sea floor (the
- *               -MOD_DIVERGENT modifier).
- *   TRANSFORM   plates slide past (motion mostly tangent) → faults, no vertical
- *               effect. REF: plate boundaries — see the file-header References. */
+ * What two plates are doing where they touch, worked out from how they're
+ * moving relative to each other (classify_boundary):
+ *   NONE        inside a plate, nowhere near an edge.
+ *   CONVERGENT  pushing together  -> land piles up: mountains, volcanoes.
+ *   DIVERGENT   pulling apart     -> ground drops: rifts, trenches, new sea.
+ *   TRANSFORM   sliding past      -> faults, no up or down.
+ * (Real plate-boundary types; see Wikipedia "Plate boundaries".) */
 typedef enum {
     BOUNDARY_NONE       = 0,
     BOUNDARY_CONVERGENT = 1,
@@ -573,22 +177,17 @@ typedef enum {
 } BoundaryKind;
 
 /* ── PlateType ─────────────────────────────────────────────────────────── *
- * A plate's crust, ~50/50 by a hash bit (gen_plates, §4). It sets the plate's
- * resting elevation (base_elev): OCEANIC sits low (basins, BASE_ELEV_OCEAN),
- * CONTINENTAL high (landmasses, BASE_ELEV_CONTINENT) — so most land rides
- * continental plates and ocean rides oceanic ones, before boundary uplift. */
+ * What a plate is made of, picked by a coin-flip when it's created. This sets
+ * how high it rests: OCEANIC plates sit low (they become sea basins),
+ * CONTINENTAL ones sit high (they become land) — before any edge pushing. */
 typedef enum {
     PLATE_OCEANIC     = 0,
     PLATE_CONTINENTAL = 1,
 } PlateType;
 
-/*
- * Pattern — fifteen ways to render the SAME simulated world. Each is a distinct
- * cartographic view of the per-cell data (elevation, plate id, boundary, biome)
- * or a quantity derived from it (slope, latitude-climate, geothermal heat). The
- * first four keep their original indices; the rest add standard map types
- * (hillshade relief, contour lines, bathymetry, …) plus an animated day/night.
- */
+/* Fifteen ways to look at the SAME world. Each one reads the per-cell data
+ * (height, which plate, edge type, biome) or something computed from it (slope,
+ * climate, geothermal heat) and paints it differently. */
 typedef enum {
     PATTERN_WORLD     = 0,    /* biome map (the default)                  */
     PATTERN_PLATES,           /* Voronoi plate tinting + seeds            */
@@ -608,37 +207,25 @@ typedef enum {
     N_PATTERNS,
 } Pattern;
 
-/*
- * Themes — same 10-name menu as the rest of the procedural showcases.
- * Each theme provides an 8-step ramp from "deepest / dimmest" to
- * "highest / brightest" plus two accent colours for hot (convergent /
- * volcanic) and cold (divergent / deep water) emphases. The ramp is
- * read by:
- *   - WORLD     — biome[i] uses ramp[i]
- *   - PLATES    — plate id i uses ramp[1 + (i mod 6)]
- *   - STRESS    — convergent uses HOT, divergent uses COLD,
- *                 transform uses ramp[6]
- *   - ELEVATION — index i in the 8-step ramp uses ramp[i]
- *
- * All entries chosen from the brighter half of the 256-colour cube so even
- * A_DIM cells stay legible against a default-black terminal. theme_apply()
- * loads these into the PAIR_RAMP_BASE+i / PAIR_HOT / PAIR_COLD pairs.
- * REF: hypsometric / relief colour schemes — see documentation/COLOR.md.
- */
+/* ── Theme ─────────────────────────────────────────────────────────────── *
+ * One colour scheme the user can cycle with t/T. Each gives 8 terrain colours
+ * (dim+deep to bright+high) plus a warm and a cool accent for the dramatic bits
+ * (mountains/lava and trenches/deep sea). All colours sit in the bright half of
+ * the palette so even dimmed cells stay readable on a black terminal.
+ *   name   what shows in the HUD.
+ *   ramp   the 8 low-to-high terrain colours.
+ *   hot    warm accent (convergent edges, volcanoes, dawn).
+ *   cold   cool accent (divergent edges, deep water).
+ * (Palette ideas: see documentation/COLOR.md.) */
 typedef struct {
-    const char *name;          /* HUD label (t/T cycles)                    */
-    short       ramp[N_BIOMES];/* 8 tints, deep/dim → high/bright (by elev) */
-    short       hot;           /* convergent / volcanic accent              */
-    short       cold;          /* divergent / deep-water accent             */
+    const char *name;
+    short       ramp[N_BIOMES];
+    short       hot;
+    short       cold;
 } Theme;
 
 #define N_THEMES 10
 
-/*
- * All ramp entries sit in the bright half of the 256-colour space so
- * even A_DIM cells stay legible against a default-black terminal.
- * See "Theme Palette Brightness" in /CLAUDE.md.
- */
 static const Theme themes[N_THEMES] = {
     /* name       deep   ----- land -----                peak  hot cold */
     /*            0    1    2    3    4    5    6    7                  */
@@ -654,24 +241,16 @@ static const Theme themes[N_THEMES] = {
     { "ARCTIC", { 24,  31,  67, 110, 117, 153, 195, 231 }, 196,  39 },
 };
 
-/* ----------------------------------------------------------------------- *
- * Core world types — the data the whole simulation reads and writes.       *
- * ----------------------------------------------------------------------- */
-
 /* ── Plate ─────────────────────────────────────────────────────────────── *
- * One rigid tectonic plate — the moving unit of the simulation. A plate is a
- * Voronoi SEED (a point + a region of cells nearest it) carrying a constant
- * velocity; geology happens where neighbouring plates' velocities disagree at
- * their shared border (classify_boundary, §3). REF: plate tectonics — see the
- * file-header References block.
- *   x, y       seed position in map cells (the Voronoi site).
- *   vx, vy     velocity, magnitude ∈ [0.3,1.0]; only the RELATIVE velocity of
- *              two plates across their border matters, projected onto the border
- *              normal → convergent / divergent / transform.
- *   type       OCEANIC (low, dense) or CONTINENTAL (high) — sets base_elev and
- *              the land/ocean character of the plate's interior.
- *   base_elev  the plate's resting elevation in [-1,+1] before boundary uplift
- *              and fBm noise are added (compute_elevation, §4). */
+ * One drifting slab of crust — the moving piece of the puzzle. It's a single
+ * point that owns all the map cells nearest to it, and it carries a steady
+ * drift. The interesting geology happens where two neighbouring plates' drifts
+ * disagree at the seam between them (classify_boundary).
+ *   x, y       where the plate's centre point sits, in map cells.
+ *   vx, vy     how it's drifting. Only the difference between two plates'
+ *              drifts matters — that's what decides push / pull / slide.
+ *   type       oceanic (low, makes sea) or continental (high, makes land).
+ *   base_elev  the height it rests at before edges and noise tweak it. */
 typedef struct {
     int       x, y;
     float     vx, vy;
@@ -680,36 +259,33 @@ typedef struct {
 } Plate;
 
 /* ── Cell ──────────────────────────────────────────────────────────────── *
- * One map cell — the per-pixel result of the generation pipeline, packed to 4
- * bytes (a 240×80 map is ~76 KB). Every render view (§7) reads this; the §4
- * compute_* stages are its only writers. Stored compactly (uint8/int8) because
- * the field is large and the values are small, bounded enums/ranges.
- *   plate_id  which plate owns this cell (Voronoi nearest-seed). Index into
- *             World.plates[].
- *   boundary  BoundaryKind of the plate border this cell sits on (NONE for
- *             interior cells) — drives uplift and the STRESS / HEATFLOW views.
- *   elev      final elevation, the real-valued [-1,+1] field quantised to the
- *             int8 [-100,+100]. SEA_LEVEL is 0. The substrate for ELEVATION,
- *             RELIEF, CONTOUR, BATHYMETRY, RUGGED, ASPECT, …
- *   biome     Biome bucket derived from elev (elev_to_biome, §3) — the WORLD
- *             map's glyph + colour. */
+ * One spot on the map, holding everything we figured out about it. Packed into
+ * 4 bytes so a whole 240x80 map is only ~76 KB. Every view reads this; only the
+ * world-build stages write it. Small types because the values are small.
+ *   plate_id  which plate this spot belongs to (an index into plates[]).
+ *   boundary  if it's on a plate seam, what kind (NONE if not). A BoundaryKind.
+ *   elev      its height as a small int, -100 (deepest) to +100 (highest),
+ *             0 = waterline. Most views are built from this.
+ *   biome     which height band it landed in (a Biome) — picks the WORLD map's
+ *             character and colour. */
 typedef struct {
     uint8_t plate_id;
-    uint8_t boundary;        /* BoundaryKind */
-    int8_t  elev;            /* [-100, +100] */
-    uint8_t biome;           /* Biome */
+    uint8_t boundary;        /* a BoundaryKind */
+    int8_t  elev;            /* -100..+100, 0 = sea level */
+    uint8_t biome;           /* a Biome */
 } Cell;
 
 /* ── World ─────────────────────────────────────────────────────────────── *
- * The entire generated world: the plate set plus the dense per-cell grid, both
- * grown from one integer seed. Rebuilt wholesale by world_build (§4) on reset;
- * read-only to every render view. Fixed-capacity arrays (no malloc): a rebuild
- * overwrites in place. cells[] is row-major — index via widx(w,x,y) = y*w + x.
- *   w, h       active map dimensions (≤ MAP_W_MAX × MAP_H_MAX).
- *   plates[]   the plate seeds; n_plates of N_PLATES_LIMIT slots are live.
- *   cells[]    w·h cells, row-major; CELLS_MAX slots back the largest map.
- *   seed       what this world was generated from (also salts the per-cell
- *              hash so a given world always twinkles/textures the same way). */
+ * One whole generated world: its plates plus a grid of every cell, all grown
+ * from a single seed number. world_build rebuilds it from scratch on reset; the
+ * views only read it. The arrays are fixed-size (no malloc) — a rebuild just
+ * overwrites them. cells[] is one long row-major array; widx(w,x,y) finds an
+ * (x,y) in it.
+ *   w, h       the map's actual size (never bigger than MAP_W/H_MAX).
+ *   plates[]   the plates; only the first n_plates of them are in use.
+ *   cells[]    w*h cells; the array is sized for the largest possible map.
+ *   seed       the number this world grew from. Also flavours the per-cell
+ *              hashing, so the same world always twinkles and textures alike. */
 typedef struct {
     int    w, h;
     Plate  plates[N_PLATES_LIMIT];
@@ -718,12 +294,7 @@ typedef struct {
     int    seed;
 } World;
 
-/* ===================================================================== */
-/* §2  PERFORMANCE  -- timing primitives (throttle policy in main, §8)   */
-/* ===================================================================== */
-
-/* Timing primitives only. The frame cap and the fixed-timestep accumulator
- * that decide how many scene_tick()s run per frame are POLICY, in main (§8). */
+/* §2  PERFORMANCE  -- timing helpers (the frame pacing itself lives in main) */
 
 static int64_t clock_ns(void)
 {
@@ -742,20 +313,11 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  LOGIC  -- pure decisions: hash, noise, classify, cartographic math*/
-/* ===================================================================== */
+/* §3  LOGIC  -- pure helpers: hashing, noise, classifying, map math */
 
-/* Pure functions — given their arguments (and read-only world/noise data) each
- * returns a value with NO mutation and NO I/O: the spatial hash + Perlin/fBm
- * samplers, widx, the plate-pair boundary classifier, elev→biome, the pure
- * generation helpers (jitter_offset, nearest_boundary, boundary_uplift), the
- * cartographic math the views build on (clampi, elev_at, value_noise), the
- * biome census, and pattern_name. perm[] is a stable table reseeded ONLY from
- * §4 (on world build), never by RENDER/EFFECTS, so no frame ordering can
- * change a LOGIC result. These are decisions, not state. */
-
-/* 9-char padded names so the HUD field width stays fixed. */
+/* Everything here just takes inputs and returns a value — no surprises, no
+ * drawing, no changing the world. Names are padded to a fixed width so the HUD
+ * column doesn't jiggle. */
 static const char *pattern_name(Pattern p)
 {
     static const char *names[N_PATTERNS] = {
@@ -766,7 +328,8 @@ static const char *pattern_name(Pattern p)
     return ((int)p >= 0 && (int)p < N_PATTERNS) ? names[p] : "?        ";
 }
 
-/* hash3 — same as other showcases. */
+/* Turns three numbers into one well-scrambled number — our cheap, repeatable
+ * stand-in for randomness. Same (x,y,z) always gives the same result. */
 static inline uint32_t hash3(int wx, int wy, int wz)
 {
     uint32_t h = (uint32_t)wx * 73856093u
@@ -780,8 +343,9 @@ static inline uint32_t hash3(int wx, int wy, int wz)
     return h;
 }
 
-/* Perlin scaffold — copied inline per the self-contained-file rule.
- * See ../fields/perin_noise_flow_showcase.c for derivation. */
+/* Perlin noise — smooth, natural-looking wobble, used to rough up the terrain.
+ * Copied in whole so this file stands alone; full write-up is in
+ * ../fields/perin_noise_flow_showcase.c. perm[] is its shuffled lookup table. */
 static uint8_t perm[512];
 
 static inline float fade_q(float t)
@@ -812,6 +376,8 @@ static float perlin2d(float x, float y)
     return lerp_f(lerp_f(n00, n10, u), lerp_f(n01, n11, u), v);
 }
 
+/* Stacks several sizes of noise on top of each other — broad shapes plus finer
+ * crinkle — for terrain that looks natural at every zoom. */
 static float fbm2(float x, float y)
 {
     float total = 0.0f, amp = 1.0f, freq = 1.0f, max_amp = 0.0f;
@@ -821,29 +387,33 @@ static float fbm2(float x, float y)
         amp     *= 0.5f;
         freq    *= 2.0f;
     }
-    return (total / max_amp) * 0.5f + 0.5f;     /* → [0, 1] */
+    return (total / max_amp) * 0.5f + 0.5f;     /* rescale to land in [0, 1] */
 }
 
 static inline int widx(const World *w, int x, int y) { return y * w->w + x; }
 
+/* Decides what kind of seam two plates make: are they heading into each other,
+ * away from each other, or just sliding past? */
 static uint8_t classify_boundary(const Plate *a, const Plate *b)
 {
-    /* Aspect-corrected normal from a to b. */
+    /* The straight line from a to b — the direction "toward each other". */
     float nx = (float)(b->x - a->x);
     float ny = (float)(b->y - a->y) * ASPECT_Y_F;
     float n_mag = sqrtf(nx * nx + ny * ny);
-    if (n_mag < 0.001f) return BOUNDARY_TRANSFORM;
+    if (n_mag < 0.001f) return BOUNDARY_TRANSFORM;  /* same spot: can't tell */
     nx /= n_mag; ny /= n_mag;
 
+    /* How a moves relative to b, split into two parts: how much of it is along
+     * that toward/away line, and how much is sideways. */
     float rel_vx = a->vx - b->vx;
     float rel_vy = a->vy - b->vy;
-    float approach = rel_vx * nx + rel_vy * ny;
+    float approach = rel_vx * nx + rel_vy * ny;     /* + toward, - away */
     float perp_x   = rel_vx - approach * nx;
     float perp_y   = rel_vy - approach * ny;
     float perp_mag = sqrtf(perp_x * perp_x + perp_y * perp_y);
 
-    /* Classify TRANSFORM only when motion is mostly tangent — otherwise
-     * any non-zero approach would override the perpendicular slide. */
+    /* If the sideways part dominates, they're sliding past (a fault). Otherwise
+     * the sign tells us pushing together vs pulling apart. */
     if (fabsf(approach) < perp_mag * APPROACH_FRAC) return BOUNDARY_TRANSFORM;
     return (approach > 0) ? BOUNDARY_CONVERGENT : BOUNDARY_DIVERGENT;
 }
@@ -865,7 +435,8 @@ static inline int clampi(int v, int lo, int hi)
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-/* Elevation at (x,y), clamped to the map edge — for neighbour gradients. */
+/* Height at (x,y), but snapping anything off the map back to the edge — so the
+ * slope views can peek at neighbours without falling off the grid. */
 static inline int elev_at(const World *w, int x, int y)
 {
     if (x < 0) x = 0; else if (x >= w->w) x = w->w - 1;
@@ -873,8 +444,9 @@ static inline int elev_at(const World *w, int x, int y)
     return w->cells[widx(w, x, y)].elev;
 }
 
-/* value_noise — smooth [0,1] noise: bilinear blend of hashed lattice corners
- * spaced `scale` cells apart. Backs the rainfall map. */
+/* A second, simpler kind of smooth noise (0..1): drop random values on a coarse
+ * grid `scale` cells apart and blend smoothly between them. Drives the rainfall
+ * map. */
 static float value_noise(int x, int y, int seed, int scale)
 {
     int   gx = x / scale, gy = y / scale;
@@ -889,18 +461,16 @@ static float value_noise(int x, int y, int seed, int scale)
     return a + (b - a) * fy;
 }
 
-/* jitter_offset — hash-driven scatter: maps the low 10 bits of `hbits`
- * (recentred to ±512) to an offset of about ±cell_size/4, used to nudge plate
- * seeds off their grid centres so the Voronoi cells look organic. */
+/* A small random nudge (about a quarter of a grid cell either way), so plates
+ * don't sit on a perfect grid and the map looks hand-drawn rather than tiled. */
 static inline int jitter_offset(uint32_t hbits, int cell_size)
 {
     return ((int)(hbits & 0x3FFu) - 512) * cell_size / 2048;
 }
 
-/* nearest_boundary — aspect-corrected distance from (x,y) to the closest
- * plate-boundary cell within the BOUNDARY_RX × BOUNDARY_RY window; *out_kind
- * receives that boundary's kind (NONE if none in range). The falloff input for
- * boundary uplift. Reads cells, mutates nothing. */
+/* Looks around (x,y) for the closest plate seam and reports how far it is and
+ * what kind it was (NONE if there's none nearby). That distance is what makes
+ * mountains taper off as you move inland. */
 static float nearest_boundary(const World *w, int x, int y, uint8_t *out_kind)
 {
     float best = (float)BOUNDARY_RX + 1.0f;
@@ -913,6 +483,7 @@ static float nearest_boundary(const World *w, int x, int y, uint8_t *out_kind)
             if (nx < 0 || nx >= w->w) continue;
             uint8_t b = w->cells[widx(w, nx, ny)].boundary;
             if (b == BOUNDARY_NONE) continue;
+            /* Stretch the y part so distance matches what the eye sees. */
             float d = sqrtf((float)(dx * dx)
                           + (float)(dy * dy) * (ASPECT_Y_F * ASPECT_Y_F));
             if (d < best) { best = d; *out_kind = b; }
@@ -921,23 +492,20 @@ static float nearest_boundary(const World *w, int x, int y, uint8_t *out_kind)
     return best;
 }
 
-/* boundary_uplift — vertical elevation modifier from the nearest boundary:
- * convergent pushes terrain up, divergent pulls it down, both decaying linearly
- * to zero at BOUNDARY_RX. Transform / none contribute nothing. */
+/* How much a nearby seam raises or lowers the land: pushing edges lift it,
+ * pulling edges sink it, and the effect fades to nothing by BOUNDARY_RX cells
+ * away. Sliding faults and open ground do nothing. */
 static float boundary_uplift(uint8_t kind, float dist)
 {
     float r_max = (float)BOUNDARY_RX;
     if (dist >= r_max) return 0.0f;
-    float weight = 1.0f - dist / r_max;             /* 1 on the line → 0 at r_max */
+    float weight = 1.0f - dist / r_max;             /* full on the seam, 0 far off */
     if (kind == BOUNDARY_CONVERGENT) return MOD_CONVERGENT * weight;
     if (kind == BOUNDARY_DIVERGENT)  return MOD_DIVERGENT  * weight;
     return 0.0f;
 }
 
-/*
- * Biome census — count cells per biome for the HUD strip. O(W·H)
- * but only run when drawing the HUD; cost is trivial.
- */
+/* Tallies how many cells fall in each biome, for the HUD's land/sea readout. */
 static void biome_counts(const World *w, int counts[N_BIOMES])
 {
     for (int i = 0; i < N_BIOMES; i++) counts[i] = 0;
@@ -946,27 +514,18 @@ static void biome_counts(const World *w, int counts[N_BIOMES])
         counts[w->cells[i].biome & 7]++;
 }
 
-/* ===================================================================== */
-/* §4  SIMULATION  -- advances state (world generation + the tick)       */
-/* ===================================================================== */
+/* §4  SIMULATION  -- the only code that changes the world */
 
-/* The ONLY writers of simulation state. Two kinds of work:
- *  • WORLD GENERATION (on reset) — world_build runs the pipeline perm_shuffle
- *    → gen_plates → compute_voronoi → compute_boundaries → compute_elevation,
- *    filling every Cell (plate_id, boundary, elev, biome) and the Plate[].
- *  • the per-tick advance — scene_tick steps the wall clock and the regen
- *    countdown, and triggers a rebuild when it expires.
- * Mutates: World.{plates,cells,n_plates,seed} + the global perm[] table, and
- * Scene.{world,paused,speed,current_theme,current_pattern,time_secs,regen_t}.
- * scene_tick() is the single per-tick entry (called only from main, §8); user
- * events (key/resize) also mutate Scene but are NOT part of the tick -- §8. */
+/* Two jobs: build a brand-new world from a seed (world_build runs the five
+ * stages below), and age the current one each tick until it's time to rebuild
+ * (scene_tick). Nothing else writes the world. */
 
+/* Shuffles the noise lookup table for this seed. Same seed always shuffles the
+ * same way, so a world is fully repeatable from its seed alone. */
 static void perm_shuffle(int seed)
 {
     uint8_t base[256];
     for (int i = 0; i < 256; i++) base[i] = (uint8_t)i;
-    /* Fisher-Yates with a hash-derived rng so regen is deterministic
-     * given the same seed. */
     uint32_t st = (uint32_t)seed * 2654435761u;
     for (int i = 255; i > 0; i--) {
         st = st * 1664525u + 1013904223u;
@@ -979,19 +538,16 @@ static void perm_shuffle(int seed)
     }
 }
 
-/* ----------------------------------------------------------------------- *
- * Stage 1 — Plate placement (jittered grid).                              *
- * ----------------------------------------------------------------------- */
-
+/* Stage 1 — scatter the plates. */
 static void gen_plates(World *w, int seed)
 {
-    /* How many plates this world gets. */
+    /* Pick how many plates this world has. */
     int n = N_PLATES_MIN
           + (int)(hash3(seed, 0, 1) % (uint32_t)(N_PLATES_MAX - N_PLATES_MIN + 1));
     if (n > N_PLATES_LIMIT) n = N_PLATES_LIMIT;
 
-    /* Lay an aspect-corrected jittered grid of seed cells: cols ≈ √(n·aspect)
-     * so the cells are roughly square once the 2:1 terminal aspect is undone. */
+    /* Spread them over a rough grid, sized so the cells come out roughly square
+     * once we account for cells being tall. We then jitter each off-centre. */
     float aspect = (float)w->w / ((float)w->h * ASPECT_Y_F);
     int   cols   = (int)ceilf(sqrtf((float)n * aspect));
     if (cols < 1) cols = 1;
@@ -999,8 +555,8 @@ static void gen_plates(World *w, int seed)
     int cell_w = w->w / cols; if (cell_w < 1) cell_w = 1;
     int cell_h = w->h / rows; if (cell_h < 1) cell_h = 1;
 
-    /* One plate per grid cell: a jittered seed position, a hashed crust type,
-     * and a random velocity. */
+    /* One plate per grid cell: a nudged position, a coin-flip crust type, and a
+     * random drift direction and speed. */
     int idx = 0;
     for (int r = 0; r < rows && idx < n; r++) {
         for (int c = 0; c < cols && idx < n; c++) {

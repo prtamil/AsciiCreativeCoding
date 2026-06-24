@@ -1,275 +1,16 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * maze_backtracker.c — Recursive-backtracker DFS maze, animated.
+ * maze_backtracker.c — watch a maze dig itself, then solve itself.
  *
- * DEMO: Begins with a uniform grid of walled cells. A glowing white "dig
- *       head" walks a depth-first random path, carving walls as it goes
- *       and trailing magenta along visited cells. When stuck, it backtracks
- *       (visibly retracing the trail). After every cell is visited, two
- *       BFS passes find the maze's longest path (its tree diameter) and
- *       a gold beam streams along that path from one end to the other.
- *       The whole solution path then stays lit until you press r, which
- *       supernova-flashes and starts a fresh maze.
+ * A glowing head walks a random path, knocking down walls as it goes and
+ * backing up when it hits a dead end. Once every cell has been reached, it
+ * finds the longest possible route through the maze and lights it up in gold.
  *
- * Study alongside: maze.c (same folder) — the same algorithm, plainer.
- *       This file adds glow effects, the diameter solver, colour themes,
- *       size presets, and a generate → solve → hold state machine.
- *
- * Section map:
- *   §1 config+types — sizes, themes, presets, glow rates, all struct types
- *   §2 performance  — monotonic clock + sleep + frame cap
- *   §3 logic        — pure helpers: index/geometry, corner mask, glow→colour
- *   §4 simulation   — maze state: reset, carve, dig-step, BFS, diameter
- *   §5 scene        — the per-tick combine (scene_tick) + reset/init
- *   §6 render       — colour, wall-corner LUT, maze + solution + HUD draw
- *   §7 app          — signals, resize, key events, main loop
- *
- * Keys:
- *   q / ESC    quit
- *   space      pause / resume
- *   r          reset (immediate restart)
- *   1 … 9 , 0  maze-size preset, simple → complex (0 = largest / fill)
- *   t / T      next / previous colour theme
- *   + / =      more dig-steps per tick (faster)
- *   -          fewer dig-steps per tick (slower)
- *   ] / [      raise / lower tick Hz
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra maze_backtracker.c -o maze_backtracker \
- *       -lncurses -lm
+ * Sister file: maze.c (same folder) does the same thing with no glow and a
+ * plain corner-to-corner solve — read it for the bare-bones version.
+ * The "two walks to find a tree's longest path" trick is well known; see
+ * https://cp-algorithms.com/graph/tree_painting.html#diameter-of-a-tree
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Recursive-backtracker (a.k.a. depth-first-search) maze
- *                  generation. Start at any cell, push it on a stack, mark
- *                  it visited. While the stack is non-empty: peek the top
- *                  cell, look at its unvisited neighbours; if any, pick one
- *                  at random, carve the wall between, push the neighbour;
- *                  otherwise pop (backtrack). When the stack empties, every
- *                  cell has been visited and the resulting graph is a
- *                  uniform spanning tree of the grid — a "perfect maze"
- *                  with exactly one path between any two cells.
- *
- *                  Solution phase: the longest path in a tree (its
- *                  "diameter") is found by two BFS passes — pick any
- *                  vertex A, BFS to find the farthest vertex X, then BFS
- *                  from X to find its farthest vertex Y. The path X→Y is
- *                  the diameter and a maximally interesting maze solution.
- *
- * Data-structure : Per cell: 4-bit wall bitmask (N=1, E=2, S=4, W=8;
- *                  set = wall present), visited flag, two glow floats.
- *                  Carving the wall between A and B means clearing the
- *                  d-bit in A AND the opposite-d bit in B — walls are
- *                  doubly stored so each cell knows its own walls without
- *                  consulting neighbours during render.
- *
- *                  DFS stack is a plain int array sized to total_cells
- *                  (each cell can be on the stack at most once at any
- *                  moment). BFS uses a queue + parent[] of the same size.
- *
- * Rendering      : Maze cells render as 1 char of "interior" plus 1 char
- *                  of wall per side, so a W×H maze occupies (2W+1)×(2H+1)
- *                  terminal cells. Wall corners use a 16-entry ASCII
- *                  corner lookup keyed on which of the 4 surrounding wall
- *                  segments exist (NESW bits; any join → '+'). Glows: dig_glow
- *                  (magenta trail), head_glow (white-bold cursor),
- *                  solution_glow (gold beam) — all decay exponentially.
- *
- * Performance    : DIG: O(N) total over the whole run (each cell visited
- *                  once + at most one backtrack pass). SOLVE: 2× O(N) BFS.
- *                  We throttle to dig_steps_per_tick (default 8) so the
- *                  animation reads at human speed. No allocation post-init.
- *
- * References     : Concept —
- *                  [1] Buck, Jamis — "Mazes for Programmers" (Pragmatic
- *                      Bookshelf, 2015).  The book: recursive backtracker
- *                      and a dozen other algorithms, with working code.
- *                  [2] Buck — "Maze Generation: Recursive Backtracking"
- *                      (the canonical tutorial this file follows):
- *                      https://weblog.jamisbuck.org/2010/12/27/maze-generation-recursive-backtracking
- *                  [3] Wikipedia — "Maze generation algorithm":
- *                      https://en.wikipedia.org/wiki/Maze_generation_algorithm
- *                  [4] Cormen, Leiserson, Rivest & Stein — "Introduction to
- *                      Algorithms" (CLRS): BFS/DFS and spanning trees, the
- *                      foundation under the dig and the solver.
- *                  [5] Tree diameter via two BFS passes (proof + code):
- *                      https://cp-algorithms.com/graph/tree_painting.html#diameter-of-a-tree
- *                  Rendering —
- *                  [6] Patel, Amit (Red Blob Games) — interactive graph-search
- *                      and grid visualisations, the model for the glow layers:
- *                      https://www.redblobgames.com/pathfinding/a-star/introduction.html
- *                  [7] Padala — "NCURSES Programming HOWTO", TLDP: colour
- *                      pairs, glyph output, non-blocking input, resize.
- *                  [8] xterm 256-colour palette (the index the themes draw
- *                      from; also the basis for the "bright-half" legibility
- *                      rule on dim/bold glyphs): https://jonasjacek.github.io/colors/
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * A perfect maze on a grid is just a SPANNING TREE: every cell reachable
- * from every other cell, with exactly one route between any pair, no
- * loops. Recursive backtracker builds one by walking randomly until
- * cornered, then unwinding by one step and trying again — exactly the
- * way you'd explore an unfamiliar building. The carved walls aren't
- * "removed walls" so much as "edges of the tree we just built".
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Picture an ant carrying a piece of chalk. The ant marks every floor
- * tile it visits and erases the wall behind it as it crosses. When all
- * four neighbouring tiles are already marked, it walks back along its
- * own marks until it finds an unmarked side-passage, then resumes. The
- * stack in our code is literally that retraced trail.
- *
- * Two visual layers tell the story:
- *   1. The CURRENT HEAD (white) is where the ant is now.
- *   2. The TRAIL (magenta, fading) is where it has been — fresh trail
- *      glows brightly, old trail fades to the maze's resting colour.
- *      When the ant backtracks, the trail momentarily re-brightens
- *      because we touch each retracing cell; that's the visible
- *      signature of "going back to find side-passages".
- *
- * ALGORITHM IN STEPS
- * ──────────────────
- *  1. INIT. Every cell has all 4 walls. Pick a start cell, mark visited,
- *     push on stack.
- *  2. STEP (one operation):
- *     a. Peek the top of the stack — call it A.
- *     b. Find A's unvisited neighbours (those with walls that are still
- *        intact and visited == false on the other side).
- *     c. If any: pick one at random — call it B. Carve the wall between
- *        A and B (clear A's d-bit AND B's opposite-d-bit). Mark B
- *        visited, push B.
- *     d. If none: pop the stack (backtrack one cell).
- *  3. Repeat until the stack is empty. Every cell is now visited; the
- *     wall pattern is a uniform random spanning tree of the grid.
- *  4. SOLVE (maze diameter, optional spectacle):
- *     a. BFS from any cell A → find farthest reachable cell X.
- *     b. BFS from X → find its farthest reachable cell Y, recording
- *        parent[i] for each cell.
- *     c. Walk parent[] from Y back to X — that array is the longest
- *        path in the tree. Stream a gold beam along it.
- *  5. DONE: keep the whole solution path lit and wait — the user presses
- *     r to supernova-reset and go to 1. No automatic restart.
- *
- * KEY FORMULAS
- * ────────────
- *  Wall bit per direction        : N=1, E=2, S=4, W=8     (1 << d)
- *  opposite(d)                   : (d + 2) mod 4          (N↔S, E↔W)
- *  Wall between A and B (d=A→B)  : clear A.walls bit d
- *                                  clear B.walls bit opposite(d)
- *  Cell idx in flat array        : idx = y * w + x
- *  Maze → screen mapping         : interior at (2y+1, 2x+1)
- *                                  N-wall  at (2y,   2x+1)
- *                                  W-wall  at (2y+1, 2x  )
- *                                  NW-corner at (2y, 2x  )
- *  Maze on screen size           : (2w + 1) × (2h + 1)
- *  Screen → maze (inverse)       : x = (sx - 1) / 2,  y = (sy - 1) / 2
- *  Tree diameter (two-BFS)       : X = farthest(A), Y = farthest(X);
- *                                  diameter = path X..Y, length = dist(X,Y)
- *  Glow decay (per frame)        : glow *= exp(-rate · dt)
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • DOUBLE WALL STORAGE. Cell A's east wall and cell B's west wall are
- *    the SAME wall — but each cell stores its own bit. Keep both bits in
- *    sync by always carving via maze_carve(A, dir): it clears A's d and
- *    also clears the neighbour's opposite-d. Forgetting to update the
- *    neighbour leaves a wall visible from one side and gone from the
- *    other — looks fine in render (we use cell A for that wall) but
- *    breaks BFS, because B still thinks the wall is up.
- *
- *  • STACK SIZE. The DFS stack can hold up to total_cells entries (when
- *    the dig is at maximum depth, e.g. on a long corridor). Not less.
- *    Sizing it any smaller silently corrupts state when overflow hits.
- *
- *  • OFF-BY-ONE on the (2w+1)×(2h+1) frame. The bottom-right corner of
- *    the frame is at (2h, 2w). If you center with (rows - h)/2, you'll
- *    crop the bottom row of the maze. Use (rows - (2h+1))/2 instead.
- *
- *  • BACKTRACK REVISIT. Popping the stack does NOT "unmark" the cell —
- *    we only pop the position pointer. The cell stays visited so we
- *    don't dig it again. The visible "trail re-brightening on backtrack"
- *    comes from us touching dig_glow during the backtrack, not from
- *    re-visiting in the algorithmic sense.
- *
- *  • CORNER LUT INDEXING. The 16-entry ASCII wall-corner table is
- *    indexed by a 4-bit NESW mask of which OF THE FOUR INCIDENT WALLS
- *    EXIST, not which neighbouring CELLS exist. Off-grid sides count as
- *    "no wall" — so the maze's outer corners (e.g. top-left '+') come out
- *    correctly without special cases.
- *
- *  • MAZE-DIAMETER vs SHORTEST PATH. We solve for the LONGEST path
- *    (diameter), not the shortest path between fixed endpoints. The
- *    longest path is more visually impressive (fills more of the maze)
- *    and demonstrates a less-obvious BFS trick (two-BFS for tree
- *    diameter). misc/maze.c does the simpler corner-to-corner shortest
- *    path — read it if you want the conventional version.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • Initial wall bitmask of every cell = 0b1111 = 15 (all 4 walls). If
- *    any cell starts with a different value, walls[] init is wrong.
- *  • After the dig completes: visited count == total_cells. If lower,
- *    the DFS terminated early (likely a stack-pop bug).
- *  • Wall symmetry: for every interior cell with east wall = 0, the
- *    cell to its east must have west wall = 0. Walk the grid once after
- *    DIG and assert this if you suspect maze_carve is buggy.
- *  • Diameter sanity: the diameter of a uniform spanning tree of an
- *    N-cell grid is empirically Θ(√N) — for a 99×28 = 2772-cell maze
- *    the path is typically 100–300 cells. If solve produces a path
- *    much shorter, BFS is exiting too early; much longer than total
- *    cells and parent[] has a cycle (impossible in a tree → bug).
- *  • Visual: cell (0,0) should have a `+` corner at terminal (gx0, gy0)
- *    when its N and W walls are intact (always true at startup). The
- *    corner LUT collapses every non-zero mask to '+' for ASCII
- *    portability — if a corner shows ' ' where walls are present, the
- *    corner_walls_at logic is reading the wrong neighbour bits.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── ARCHITECTURE (layer separation) ──────────────────────────────────── *
- *
- * All state lives in the types declared in §1 (Cell, Maze, Scene, Screen,
- * App).  Every other section is functions grouped by the ONE concern it
- * serves, so what each layer touches is visible from its section alone:
- *
- *   Layer        Section  Mutates
- *   ─────────────────────────────────────────────────────────────────────
- *   PERFORMANCE  §2       nothing — reads the clock / sleeps
- *   LOGIC        §3       NOTHING — pure reads (maze_idx, maze_in_bounds,
- *                         dir_*, corner_walls_at, cell_color_for); no I/O
- *   SIMULATION   §4       Maze: walls, visited, stack/sp, BFS scratch, path
- *   SCENE        §5       the per-tick combine (scene_tick) + reset/init
- *   RENDER       §6       the terminal only — reads Scene, never writes it
- *   APP          §7       App fields (sim_fps, theme, preset, sizes, flags)
- *
- *   EFFECTS — the four glow floats per Cell (dig/head/solution/supernova).
- *             Cosmetic-only: read by RENDER, never consulted by a LOGIC or
- *             SIMULATION decision.  Set where the event happens (maze_dig_step,
- *             maze_reset) and decayed once per tick at the top of scene_tick;
- *             too interleaved with the step to be its own function here.
- *   DELAYS  — trivial: `paused` freezes scene_tick; the only wait is the
- *             PERFORMANCE frame cap (§2).  No holds/timers — the finished
- *             maze persists until r, it is not on a countdown.
- *
- * PER-TICK COMBINE — scene_tick (§5) is the ONE place state advances, in order:
- *     1. EFFECTS    : decay_glows() — fade every glow by exp(-rate·dt)
- *     2. SIMULATION : scene_dig()   → dig_steps × maze_dig_step; at sp==0 run
- *                                     maze_compute_diameter and enter SOLVE
- *                     scene_solve() → light solve_steps path cells; at the
- *                                     path end enter DONE
- *                     scene_hold()  → re-light the whole path (hold it lit)
- *
- * USER EVENTS are NOT the tick: keys (app_handle_key) and resize
- * (app_do_resize) mutate App/Scene directly in §7 — reseeding (scene_reset),
- * re-fitting the maze, re-applying the theme — but none call scene_tick().
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -283,14 +24,12 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config + types   (the ONLY place data is declared)                 */
-/* ===================================================================== */
+/* §1  config + types */
 
 enum {
-    /* Maze dimensions in CELLS (not screen chars). The renderer needs
-     * (2w+1)×(2h+1) terminal cells, so a 99×28 maze fills a 199×57
-     * area — fits a 200×60 terminal with HUD margins. */
+    /* Biggest maze we'll ever build, counted in cells. Each cell needs two
+     * screen columns/rows once you add its walls, so 120x40 cells fills a
+     * roughly 241x81 terminal. */
     MAZE_W_MAX        = 120,
     MAZE_H_MAX        =  40,
 
@@ -300,47 +39,45 @@ enum {
     SIM_FPS_STEP      =  10,
 
     DIG_STEPS_MIN     =   1,
-    DIG_STEPS_DEF     =   8,        /* DFS operations per tick */
+    DIG_STEPS_DEF     =   8,        /* dig steps taken per tick */
     DIG_STEPS_MAX     = 256,
 
-    SOLVE_STEPS_DEF   =   1,        /* solution-beam cells per tick → ~60/s */
+    SOLVE_STEPS_DEF   =   1,        /* cells the gold beam lights per tick */
 
-    RENDER_CAP_FPS    =  60,        /* hard cap on rendered frames/sec (sim ticks run at sim_fps) */
-    MAX_FRAME_MS      = 100,        /* clamp one frame's dt — spiral-of-death guard after a stall */
+    RENDER_CAP_FPS    =  60,        /* never draw faster than this, even if the sim runs faster */
+    MAX_FRAME_MS      = 100,        /* if a frame ran long (we were paused/swapped out), pretend
+                                       it was only this long so we don't fast-forward wildly */
     FPS_UPDATE_MS     = 500,
 
-    /* Colour-pair indices — one per semantic layer the renderer draws (HUD,
-     * wall, resting interior, and the four glows).  PAIR_HUD/PAIR_HINT are
-     * fixed per CLAUDE.md; PAIR_WALL..PAIR_SUPERNOVA are recoloured per Theme. */
+    /* One colour slot per thing we draw. The first two (HUD text) stay fixed
+     * bright so they're readable on any theme; the rest get recoloured when
+     * you switch themes. */
     PAIR_HUD          =   1,
     PAIR_HINT         =   2,
-    PAIR_WALL         =   3,        /* dim grey wall lines     */
-    PAIR_VISITED      =   4,        /* maze interior, resting  */
-    PAIR_TRAIL        =   5,        /* fresh dig glow (magenta) */
-    PAIR_HEAD         =   6,        /* current dig head (white-bold) */
-    PAIR_SOLUTION     =   7,        /* diameter beam (gold)    */
-    PAIR_SUPERNOVA    =   8,        /* reset flash (yellow)    */
+    PAIR_WALL         =   3,        /* the wall lines          */
+    PAIR_VISITED      =   4,        /* a cell that's been dug but is just sitting there */
+    PAIR_TRAIL        =   5,        /* the fading trail behind the head */
+    PAIR_HEAD         =   6,        /* the digging head itself */
+    PAIR_SOLUTION     =   7,        /* the gold solution beam  */
+    PAIR_SUPERNOVA    =   8,        /* the flash when you reset */
 };
 
 /*
- * Theme — recolours the maze's six semantic layers (wall, resting interior,
- * and the four glows).  The HUD stays fixed bright yellow/cyan so it is
- * legible against every theme.  Cycled with t/T.
+ * Theme — one colour scheme for the maze. Cycle through them with t / T.
  *
- * WHY every entry is a HIGH 256-colour index (≥30, and ≥244 for greys): the
- * `visited` interior is drawn A_DIM, and the bottom of the colour cube / grey
- * ramp disappears under A_DIM on a black terminal (project palette rule).  The
- * glows are drawn A_BOLD so they can run hotter.  Indices follow the xterm-256
- * palette [8]; each row of THEMES is one coherent gradient warm/cool/mono.
+ * Each field is an xterm-256 colour number for one part of the picture.
+ * They're all chosen from the bright half of the palette on purpose: the
+ * resting interior is drawn dimmed, and dark colours go invisible when dimmed
+ * on a black terminal, so even the "dull" parts here are mid-bright.
  */
 typedef struct {
-    const char *name;     /* HUD label, e.g. "AURORA"                           */
-    short wall;           /* maze wall lines (drawn A_NORMAL, mid-grey)          */
-    short visited;        /* dug-but-resting interior (A_DIM — keep mid-bright)  */
-    short trail;          /* fresh dig-trail glow                               */
-    short head;           /* the dig head / cursor                              */
-    short solution;       /* the diameter solution beam                         */
-    short supernova;      /* whole-grid reset flash                             */
+    const char *name;     /* shown in the HUD, e.g. "AURORA" */
+    short wall;           /* the wall lines */
+    short visited;        /* a dug cell sitting quietly */
+    short trail;          /* the fading trail behind the head */
+    short head;           /* the digging head */
+    short solution;       /* the solution beam */
+    short supernova;      /* the reset flash */
 } Theme;
 
 static const Theme THEMES[] = {
@@ -354,10 +91,10 @@ static const Theme THEMES[] = {
 #define N_THEMES  ((int)(sizeof THEMES / sizeof THEMES[0]))
 
 /*
- * Maze-size presets, simple → complex, selected with digit keys (1..9, 0).
- * Each (w,h) is a *desired* cell count; app_pick_maze_size clamps it to what
- * fits the terminal and to MAZE_*_MAX, so a large preset on a small terminal
- * just fills the screen.  The last preset = the maxima → "fill the terminal".
+ * Maze sizes you can pick with the number keys (1..9, then 0 for the biggest).
+ * Each width/height is just a wish — if it won't fit the terminal it gets
+ * shrunk down to what fits (see app_pick_maze_size). The last one ("Max")
+ * always fills whatever screen you have.
  */
 static const struct { const char *name; int w, h; } MAZE_PRESETS[] = {
     { "Tiny",      8,  5 },
@@ -373,23 +110,24 @@ static const struct { const char *name; int w, h; } MAZE_PRESETS[] = {
 };
 #define N_MAZE_PRESETS  ((int)(sizeof MAZE_PRESETS / sizeof MAZE_PRESETS[0]))
 
-/* Glow decay rates — slower than wfc_showcase because the maze is more
- * sparse visually and we want the trail readable for ~1 s. */
+/* How fast each glow fades. Bigger number = fades quicker. The head fades
+ * fastest since only one cell is ever the head; the trail lingers about a
+ * second so you can follow where the digger has been. */
 #define DIG_GLOW_DECAY      2.5f
-#define HEAD_GLOW_DECAY     8.0f    /* head fades fast — only one cell active */
+#define HEAD_GLOW_DECAY     8.0f
 #define SOLUTION_GLOW_DECAY 1.5f
 #define SUPERNOVA_DECAY     2.0f
-#define GLOW_THRESHOLD      0.05f
+#define GLOW_THRESHOLD      0.05f   /* below this a glow counts as "off" */
 
-/* Direction encoding — same N=0, E=1, S=2, W=3 as wfc files.  dir_dx/dir_dy/
- * opposite are pure (LOGIC) primitives kept beside the enum they decode. */
+/* The four compass directions, numbered 0..3. The little helpers below turn a
+ * direction into a step (dx/dy) or into the way back (opposite). */
 enum { DIR_N = 0, DIR_E = 1, DIR_S = 2, DIR_W = 3, N_DIRS = 4 };
 static inline int dir_dx(int d) { return (d == DIR_E) ? 1 : (d == DIR_W) ? -1 : 0; }
 static inline int dir_dy(int d) { return (d == DIR_S) ? 1 : (d == DIR_N) ? -1 : 0; }
 static inline int opposite(int d) { return (d + 2) & 3; }
 
-#define WALL_BIT(d)   (1u << (d))   /* 1=N, 2=E, 4=S, 8=W */
-#define ALL_WALLS     0x0Fu
+#define WALL_BIT(d)   (1u << (d))   /* one bit per wall: N=1, E=2, S=4, W=8 */
+#define ALL_WALLS     0x0Fu         /* all four walls present */
 
 #define NS_PER_SEC  1000000000LL
 #define NS_PER_MS      1000000LL
@@ -398,71 +136,64 @@ static inline int opposite(int d) { return (d + 2) & 3; }
 #define CELLS_MAX  (MAZE_W_MAX * MAZE_H_MAX)
 
 /*
- * Cell — one square of the maze grid.  Carries both the structural state the
- * algorithm reasons about and the cosmetic "energy" the renderer fades.
+ * Cell — one square of the maze. Holds the real maze state (its walls and
+ * whether it's been dug) plus a few "glow" values that are purely for show.
  *
- * WHY a wall BITMASK (not four bools): the rule only ever asks "is side d
- * open?", which is one bit test, and carving is one AND-NOT.  Each wall is
- * stored on BOTH neighbouring cells (cell A's east bit == cell B's west bit),
- * so the renderer and the BFS can consult a single cell without looking
- * sideways — at the cost of keeping the twin bits in sync, which is why every
- * carve goes through maze_carve.  Standard recursive-backtracker encoding [2].
+ * Walls are stored as one bit per side rather than four separate flags,
+ * because the only questions we ask are "is this side open?" (one bit test)
+ * and "knock this side down" (clear one bit). The catch: a wall between two
+ * cells is recorded on BOTH of them, so when you knock one down you have to
+ * clear it on both — that's what maze_carve is for.
  *
- * The four glows are EFFECTS state: decaying intensities in [0,1], cosmetic
- * only — read by the renderer, never consulted by a rule.  Each is set to 1.0
- * at its event and drained by exp(-rate·dt) every tick (scene_tick).
+ * The glows are just brightness levels from 0 (off) to 1 (full). Each one
+ * gets set to 1 when its moment happens and quietly fades every tick. They
+ * only affect colour; the maze logic never looks at them.
  */
 typedef struct {
-    /* ── SIMULATION state ── */
-    uint8_t walls;          /* 4-bit mask N=1 E=2 S=4 W=8; set = wall present   */
-    bool    visited;        /* dig has reached this cell — never dug again      */
-    /* ── EFFECTS state (cosmetic glow, 0..1, decays each tick) ── */
-    float   dig_glow;       /* magenta trail: 1.0 when dug or retraced          */
-    float   head_glow;      /* white head: 1.0 only on the current DFS top      */
-    float   solution_glow;  /* gold beam: 1.0 as the diameter path lights up    */
-    float   supernova_glow; /* yellow flash: 1.0 across the grid on reset       */
+    uint8_t walls;          /* which walls are still up (N=1 E=2 S=4 W=8) */
+    bool    visited;        /* has the digger reached this cell yet? */
+    float   dig_glow;       /* the trail glow, flares up when dug or retraced */
+    float   head_glow;      /* the head glow, on only at the current dig spot */
+    float   solution_glow;  /* the gold beam, on as the solution lights up */
+    float   supernova_glow; /* the reset flash, on across the whole grid on reset */
 } Cell;
 
 /*
- * Maze — the grid plus all working storage for generating AND solving it.
+ * Maze — the grid itself, plus all the scratch space for building and solving it.
  *
- * A perfect maze is a uniform spanning tree of the grid: every cell reachable,
- * exactly one route between any pair, no loops.  This struct holds that tree
- * (in cells[].walls) and the scratch each phase needs — the recursive
- * backtracker's explicit DFS stack, and the two-BFS diameter solver's queue
- * and parent links.  Refs: Buck [1][2] (backtracker), CLRS [4] (BFS/DFS),
- * two-BFS tree diameter [5].
+ * A finished maze has exactly one route between any two cells and no loops
+ * (in graph terms, it's a tree). We build it by walking randomly with a stack
+ * (dig forward, back up at dead ends), then solve it by finding the two cells
+ * that are farthest apart and the route between them.
  *
- * No separate phase field: the stage is implicit —
- *   sp > 0             → DFS still digging
- *   sp == 0 && !solved → dig done, ready to solve
- *   solved             → diameter found
- * (§5 Scene owns the explicit state machine layered over these.)
+ * There's no "phase" field — you can tell where we are from the numbers:
+ *   stack not empty           → still digging
+ *   stack empty, not solved   → done digging, ready to solve
+ *   solved                    → finished. (§5's Scene tracks this more explicitly.)
  */
 typedef struct {
-    /* grid geometry + the cells themselves */
-    int   w, h;                  /* active size in cells (≤ MAZE_W/H_MAX)        */
-    int   total_cells;           /* w*h, cached — bound for BFS and decay loops  */
-    Cell  cells[CELLS_MAX];      /* row-major; flat index = y*w + x (maze_idx)   */
+    /* the grid */
+    int   w, h;                  /* size in cells */
+    int   total_cells;           /* w*h, kept handy for the loops below */
+    Cell  cells[CELLS_MAX];      /* the cells, row by row; cell (x,y) lives at y*w+x */
 
-    /* DFS dig state — the backtracker frontier as an explicit stack.  Sized
-     * CELLS_MAX because one long snaking corridor can stack every cell at once;
-     * anything smaller silently corrupts state on overflow. */
-    int   stack[CELLS_MAX];      /* cell indices on the current DFS path         */
-    int   sp;                    /* stack depth; sp==0 ⇒ dig finished            */
-    int   visited_count;         /* cells dug; == total_cells when the dig ends  */
+    /* digging: the stack of cells on the path back to the start. Sized for the
+     * whole grid because one long winding corridor can pile up every cell. */
+    int   stack[CELLS_MAX];      /* the current path, as cell numbers */
+    int   sp;                    /* how many cells are on the stack right now */
+    int   visited_count;         /* how many cells have been dug so far */
 
-    /* BFS scratch — reused for BOTH farthest-finds of the two-BFS diameter;
-     * parent[] lets the 2nd pass rebuild the path by walking endpoint→endpoint. */
-    int   bfs_queue [CELLS_MAX]; /* FIFO of cell indices to expand               */
-    int   bfs_dist  [CELLS_MAX]; /* hops from the BFS source; -1 = not yet seen  */
-    int   bfs_parent[CELLS_MAX]; /* predecessor on the BFS tree; -1 = root/none  */
+    /* solving: a queue and a "where did I come from" list, reused for both of
+     * the two breadth-first sweeps. The came-from list lets us retrace the route. */
+    int   bfs_queue [CELLS_MAX]; /* cells waiting to be explored */
+    int   bfs_dist  [CELLS_MAX]; /* steps from the start of the sweep; -1 = not reached */
+    int   bfs_parent[CELLS_MAX]; /* the cell we arrived from; -1 = the start */
 
-    /* Solution path = the tree diameter (the longest of all shortest paths). */
-    int   path[CELLS_MAX];       /* cell indices, path[0]..path[len-1] end→end   */
-    int   path_len;              /* cells in the diameter (~Θ(√N) empirically)   */
-    int   solve_progress;        /* next path index for the beam to light        */
-    bool  solved;                /* diameter computed, path[] valid              */
+    /* the answer: the longest route through the maze */
+    int   path[CELLS_MAX];       /* the route, one end to the other */
+    int   path_len;              /* how many cells long it is */
+    int   solve_progress;        /* how far the gold beam has lit it up */
+    bool  solved;                /* has the route been worked out yet? */
 } Maze;
 
 static inline int maze_idx(const Maze *m, int x, int y) { return y * m->w + x; }
@@ -472,66 +203,44 @@ static inline bool maze_in_bounds(const Maze *m, int x, int y)
 }
 
 /*
- * Scene state machine:
- *
- *   DIG     — DFS in progress; per tick run dig_steps_per_tick steps.
- *             When sp drops to 0, transition to SOLVE.
- *   SOLVE   — diameter computed; animate the solution beam by advancing
- *             solve_progress one cell at a time.
- *             When all cells lit, transition to DONE.
- *   DONE    — the finished maze with the whole diameter path lit; the run
- *             stays here (re-asserting the path glow each tick so it never
- *             fades) until the user presses r, which resets back to DIG.
- *
- * `paused` freezes everything.  There is no auto-reset: a finished maze
- * persists so it can be studied; r starts a fresh one.
+ * Which stage of the show we're in:
+ *   DIG    — still carving the maze.
+ *   SOLVE  — maze is built; lighting up the solution beam cell by cell.
+ *   DONE   — finished. The solution stays lit until you press r for a new maze.
  */
 typedef enum { SCENE_DIG = 0, SCENE_SOLVE = 1, SCENE_DONE = 2 } SceneState;
 
-/* Scene — the animated maze run: the maze itself plus the knobs and run-state
- * that drive its generate → solve → done lifecycle.  Reads as a contents page:
- *   WHAT      : m — the maze being built and solved.
- *   HOW       : dig/solve steps advanced per tick (the fast-forward throttles).
- *   run-state : which phase we are in, and whether the tick is frozen. */
+/* Scene — one run of the animation: the maze, how fast to fast-forward it,
+ * which stage we're in, and whether it's paused. */
 typedef struct {
-    Maze       m;                     /* WHAT: the maze being generated/solved   */
-    int        dig_steps_per_tick;    /* HOW: DFS ops per tick (1..DIG_STEPS_MAX) */
-    int        solve_steps_per_tick;  /* HOW: beam cells lit per tick            */
-    SceneState state;                 /* run-state: DIG / SOLVE / DONE           */
-    bool       paused;                /* run-state: freeze the tick              */
+    Maze       m;
+    int        dig_steps_per_tick;    /* dig this many steps each tick */
+    int        solve_steps_per_tick;  /* light this many beam cells each tick */
+    SceneState state;
+    bool       paused;
 } Scene;
 
-/* Screen — the terminal viewport: its current size in character cells.  The
- * receiver for terminal setup/resize and the renderers, so those take a Screen
- * (not the whole App) and stay decoupled from app-level state. */
+/* Screen — how big the terminal is right now. Passed to the drawing code so it
+ * doesn't need to know about the rest of the program. */
 typedef struct { int cols, rows; } Screen;
 
-/* App — the whole program: the animated Scene plus the terminal and the
- * app-level selections/lifecycle around it.
- *   subsystems : the maze scene + the terminal viewport.
- *   selections : tick rate, colour theme, size preset (all user-driven).
- *   geometry   : maze dimensions derived from preset ∩ terminal fit.
- *   lifecycle  : signal-driven quit / resize flags. */
+/* App — everything the program holds: the running scene, the terminal, the
+ * user's current choices, and two flags the OS sets when it's time to quit or
+ * the window was resized. */
 typedef struct {
-    /* subsystems */
     Scene                 scene;
     Screen                screen;
-    /* user selections (cycled/typed at runtime) */
-    int                   sim_fps;        /* simulation ticks per second   */
-    int                   theme;          /* index into THEMES             */
-    int                   preset;         /* index into MAZE_PRESETS       */
-    /* derived geometry */
-    int                   maze_w, maze_h; /* cells, from preset ∩ terminal */
-    /* lifecycle flags (set by signal handlers) */
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+    int                   sim_fps;        /* how many ticks per second to run */
+    int                   theme;          /* which theme is selected */
+    int                   preset;         /* which size preset is selected */
+    int                   maze_w, maze_h; /* the actual maze size, after fitting to the screen */
+    volatile sig_atomic_t running;        /* set to 0 to quit (signal handler touches this) */
+    volatile sig_atomic_t need_resize;    /* set to 1 when the window changed size */
 } App;
 
 static App g_app;
 
-/* ===================================================================== */
-/* §2  performance   (monotonic clock + sleep; frame cap lives in main)   */
-/* ===================================================================== */
+/* §2  timing — read the clock, sleep a bit */
 
 static int64_t clock_ns(void)
 {
@@ -550,24 +259,17 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  logic   (pure decisions: read-only, no I/O — cannot be corrupted)  */
-/* ===================================================================== */
+/* §3  pure helpers — these only read, never change anything */
 
 /*
- * corner_walls_at — what walls touch the corner at maze grid position
- * (cx, cy)? The corner sits at the intersection of up to 4 cells:
- *   NW = (cx-1, cy-1)        NE = (cx,   cy-1)
- *   SW = (cx-1, cy)          SE = (cx,   cy)
+ * Which wall lines meet at the grid corner (cx, cy)?
  *
- * The 4 incident wall segments are:
- *   N segment  : west edge of NE cell  ↔  east edge of NW cell
- *   S segment  : west edge of SE cell  ↔  east edge of SW cell
- *   E segment  : north edge of SE cell ↔ south edge of NE cell
- *   W segment  : north edge of SW cell ↔ south edge of NW cell
- *
- * Off-grid cells are treated as "no wall on that side" so the maze's
- * outer frame degenerates to the correct corner glyphs.
+ * A corner is where up to four cells touch, and four wall segments can poke
+ * out of it (up, down, left, right). We check each segment by asking the cells
+ * on either side of it whether they still have that wall up, and build a little
+ * 4-bit answer (the same N/E/S/W bits as everywhere else). Cells off the edge
+ * of the grid count as "no wall", which makes the maze's outer border corners
+ * come out right with no special handling.
  */
 static int corner_walls_at(const Maze *m, int cx, int cy)
 {
@@ -578,44 +280,36 @@ static int corner_walls_at(const Maze *m, int cx, int cy)
     bool se = maze_in_bounds(m, cx,     cy    );
     bool sw = maze_in_bounds(m, cx - 1, cy    );
 
-    /* North segment exists iff either NE or NW shows a wall on the
-     * shared vertical line — that's NE.W or NW.E. */
+    /* a wall going up out of the corner? */
     if ((ne && (m->cells[maze_idx(m, cx,     cy-1)].walls & WALL_BIT(DIR_W))) ||
         (nw && (m->cells[maze_idx(m, cx - 1, cy-1)].walls & WALL_BIT(DIR_E))))
-        mask |= 1;   /* N */
+        mask |= 1;
 
-    /* East segment: SE.N or NE.S. */
+    /* a wall going right? */
     if ((se && (m->cells[maze_idx(m, cx, cy    )].walls & WALL_BIT(DIR_N))) ||
         (ne && (m->cells[maze_idx(m, cx, cy - 1)].walls & WALL_BIT(DIR_S))))
-        mask |= 2;   /* E */
+        mask |= 2;
 
-    /* South segment: SE.W or SW.E. */
+    /* a wall going down? */
     if ((se && (m->cells[maze_idx(m, cx,     cy)].walls & WALL_BIT(DIR_W))) ||
         (sw && (m->cells[maze_idx(m, cx - 1, cy)].walls & WALL_BIT(DIR_E))))
-        mask |= 4;   /* S */
+        mask |= 4;
 
-    /* West segment: SW.N or NW.S. */
+    /* a wall going left? */
     if ((sw && (m->cells[maze_idx(m, cx - 1, cy    )].walls & WALL_BIT(DIR_N))) ||
         (nw && (m->cells[maze_idx(m, cx - 1, cy - 1)].walls & WALL_BIT(DIR_S))))
-        mask |= 8;   /* W */
+        mask |= 8;
 
     return mask;
 }
 
 /*
- * cell_color_for — pick the (pair, attr) for the interior of a maze
- * cell based on which glow is dominant.
+ * Decide how a cell's middle should look, based on its brightest glow.
+ * Brightest wins: reset flash, then the head, then the trail, then a plain
+ * dug cell. An untouched cell returns false so the caller leaves it blank.
  *
- * Priority (highest wins):
- *   supernova_glow  → bright yellow flash
- *   head_glow       → near-white bold (only the current dig head)
- *   dig_glow        → magenta trail
- *   visited         → steel blue resting colour
- *   else            → blank
- *
- * NOTE: solution_glow is NOT handled here.  The diameter path is drawn as a
- * connected line by scene_draw_solution (interior nodes + passage connectors)
- * so it reads as one continuous route, not a row of dots.
+ * The gold solution isn't handled here — it's drawn separately as one
+ * connected line so it looks like a route, not a scatter of dots.
  */
 static bool cell_color_for(const Cell *c, int *pair, int *attr, char *glyph_byte)
 {
@@ -646,18 +340,18 @@ static bool cell_color_for(const Cell *c, int *pair, int *attr, char *glyph_byte
         *glyph_byte = '.';
         return true;
     }
-    return false;   /* unvisited — caller skips */
+    return false;   /* nothing here — caller skips it */
 }
 
-/* True if screen cell (sx,sy) is on-screen — the bounds clamp the renderer
- * applies before every mvaddch. */
+/* Is this screen cell actually on screen? Checked before every draw so we
+ * never write off the edge. */
 static bool in_screen(int sx, int sy, int cols, int rows)
 {
     return sx >= 0 && sx < cols && sy >= 0 && sy < rows;
 }
 
-/* Directions from (x,y) into in-bounds, not-yet-visited neighbours.  Fills
- * dirs[0..count) and returns the count — the dig's available branch choices. */
+/* List the directions from (x,y) that lead to a neighbour we haven't dug yet —
+ * those are the digger's choices for where to go next. Returns how many. */
 static int unvisited_dirs(const Maze *m, int x, int y, int dirs[N_DIRS])
 {
     int n = 0;
@@ -670,10 +364,10 @@ static int unvisited_dirs(const Maze *m, int x, int y, int dirs[N_DIRS])
     return n;
 }
 
-/* ===================================================================== */
-/* §4  simulation   (advances state: mutates the Maze)                    */
-/* ===================================================================== */
+/* §4  the maze logic — building and solving */
 
+/* Start a fresh maze: every wall up, nothing dug, then pick a random cell to
+ * begin from. The whole grid flashes (supernova_glow) so a reset is visible. */
 static void maze_reset(Maze *m, int w, int h)
 {
     m->w = w;
@@ -692,10 +386,10 @@ static void maze_reset(Maze *m, int w, int h)
         m->cells[i].dig_glow       = 0.0f;
         m->cells[i].head_glow      = 0.0f;
         m->cells[i].solution_glow  = 0.0f;
-        m->cells[i].supernova_glow = 1.0f;   /* reset flash on the whole grid */
+        m->cells[i].supernova_glow = 1.0f;
     }
 
-    /* Pick a random starting cell, mark it visited, push it. */
+    /* drop the digger on a random cell to start */
     int sx = rand() % w;
     int sy = rand() % h;
     int s  = maze_idx(m, sx, sy);
@@ -706,10 +400,8 @@ static void maze_reset(Maze *m, int w, int h)
     m->stack[m->sp++] = s;
 }
 
-/*
- * maze_carve — knock down the wall between cell at (x,y) and its
- * neighbour in direction d. Both sides updated.
- */
+/* Knock down the wall between (x,y) and the neighbour in direction d. Because
+ * each wall is recorded on both cells, we clear it on both. */
 static void maze_carve(Maze *m, int x, int y, int d)
 {
     int idx  = maze_idx(m, x, y);
@@ -721,11 +413,8 @@ static void maze_carve(Maze *m, int x, int y, int d)
     m->cells[nidx].walls &= (uint8_t)~WALL_BIT(opposite(d));
 }
 
-/*
- * maze_backtrack — pop the DFS stack one cell.  Re-brighten the trail at the
- * new top so the user sees the ant retracing; if the last cell is popped, sp
- * hits 0 and the dig is over.
- */
+/* Hit a dead end — back up one cell. We re-light the cell we land on so you can
+ * see the digger retracing its steps. When the stack empties, the maze is done. */
 static void maze_backtrack(Maze *m)
 {
     m->sp--;
@@ -736,10 +425,8 @@ static void maze_backtrack(Maze *m)
     }
 }
 
-/*
- * maze_advance — carve into neighbour d of (x,y), mark it visited+glowing,
- * and push it: one forward step of the depth-first walk.
- */
+/* Step forward into the neighbour in direction d: knock the wall down, mark the
+ * new cell dug and glowing, and push it so we can find our way back later. */
 static void maze_advance(Maze *m, int x, int y, int d)
 {
     int nidx = maze_idx(m, x + dir_dx(d), y + dir_dy(d));
@@ -752,49 +439,37 @@ static void maze_advance(Maze *m, int x, int y, int d)
 }
 
 /*
- * maze_dig_step — perform one DFS operation.
+ * Take one dig step: either push into a random unvisited neighbour, or, if
+ * boxed in, back up one cell. Returns false once the maze is fully dug.
  *
- * Returns true if a step happened (something to animate), false if
- * the dig is finished (stack empty).
- *
- * One operation is one of:
- *   • Carve forward into a random unvisited neighbour, push it.
- *   • Pop the stack (backtrack) when no unvisited neighbours.
- *
- * Each call is one operation regardless of which kind. This granularity
- * is what lets the renderer SHOW the head moving and the trail
- * brightening on backtrack: a forward step paints dig_glow on the new
- * cell; a backtrack step paints dig_glow on the cell we popped TO,
- * which makes the trail re-brighten visibly.
+ * It's one step per call on purpose — that's what lets the animation show the
+ * head crawling forward and the trail re-flaring as it backs out of dead ends.
  */
 static bool maze_dig_step(Maze *m)
 {
-    if (m->sp <= 0) return false;             /* stack empty → dig finished */
+    if (m->sp <= 0) return false;             /* nothing left to dig */
 
     int top = m->stack[m->sp - 1];
     int x   = top % m->w;
     int y   = top / m->w;
 
-    /* Only the new top should be the bright "ant"; dim the old head (we don't
-     * zero it — the per-frame decay drains it on its own). */
+    /* dim where the head was; the fade finishes the job on later frames */
     m->cells[top].head_glow *= 0.5f;
 
     int dirs[N_DIRS];
     int n = unvisited_dirs(m, x, y, dirs);
-    if (n == 0) { maze_backtrack(m); return true; }   /* boxed in → retrace */
+    if (n == 0) { maze_backtrack(m); return true; }   /* dead end, back up */
 
-    maze_advance(m, x, y, dirs[rand() % n]);          /* carve into a random exit */
+    maze_advance(m, x, y, dirs[rand() % n]);          /* pick an exit at random */
     return true;
 }
 
 /*
- * maze_bfs_farthest — BFS from src; returns the farthest-reachable cell
- * index. Fills bfs_parent[] so the caller can reconstruct the path.
- *
- * Used twice: first from any cell to find one diameter endpoint, then
- * from that endpoint to find the other endpoint AND the path between
- * them. Standard "two-BFS finds tree diameter" trick — works because
- * the dig produces a tree (no cycles).
+ * Spread out from one cell, one step at a time, until the whole maze is
+ * covered, and report the cell that turned out to be farthest away. Along the
+ * way it records each cell's came-from neighbour, so we can retrace the route
+ * afterwards. Running this twice (start anywhere, then start from the farthest
+ * cell it found) lands us on the two ends of the longest route in the maze.
  */
 static int maze_bfs_farthest(Maze *m, int src)
 {
@@ -815,7 +490,7 @@ static int maze_bfs_farthest(Maze *m, int src)
         int x   = idx % m->w;
         int y   = idx / m->w;
         for (int d = 0; d < N_DIRS; d++) {
-            /* A wall on side d blocks the BFS edge. */
+            /* a standing wall means there's no passage this way */
             if (m->cells[idx].walls & WALL_BIT(d)) continue;
             int nx = x + dir_dx(d);
             int ny = y + dir_dy(d);
@@ -834,16 +509,14 @@ static int maze_bfs_farthest(Maze *m, int src)
     return farthest;
 }
 
-/*
- * maze_compute_diameter — two BFS passes, fills m->path[] with the
- * longest path in the spanning tree (the maze "diameter").
- */
+/* Work out the longest route through the maze and store it in path[]. Find one
+ * far end, then the far end from there, then retrace between them. */
 static void maze_compute_diameter(Maze *m)
 {
-    int a = maze_bfs_farthest(m, 0);    /* one endpoint */
-    int b = maze_bfs_farthest(m, a);    /* opposite endpoint, parents from a */
+    int a = maze_bfs_farthest(m, 0);    /* a far corner from cell 0 */
+    int b = maze_bfs_farthest(m, a);    /* the farthest cell from a — the other end */
 
-    /* Walk parent[] from b back to a — that's the path. */
+    /* follow the came-from trail from b back to a to collect the route */
     m->path_len = 0;
     int cur = b;
     while (cur != -1 && m->path_len < m->total_cells) {
@@ -854,10 +527,9 @@ static void maze_compute_diameter(Maze *m)
     m->solved = true;
 }
 
-/* ===================================================================== */
-/* §5  scene   (the per-tick combine; reset/init are user-event helpers)  */
-/* ===================================================================== */
+/* §5  the scene — one tick of the whole show */
 
+/* Throw away the current maze and start a brand-new one at the given size. */
 static void scene_reset(Scene *s, int mw, int mh)
 {
     maze_reset(&s->m, mw, mh);
@@ -873,8 +545,8 @@ static void scene_init(Scene *s, int mw, int mh)
     scene_reset(s, mw, mh);
 }
 
-/* EFFECTS: drain every cell's glow by exp(-rate·dt) — the per-tick fade.
- * exp(-rate·dt) is the standard RC-decay step; the O(N) loop is not hot. */
+/* Dim every glow a little, once per tick. Each frame multiplies a glow by a
+ * number just under 1, so it fades smoothly toward off rather than blinking. */
 static void decay_glows(Maze *m, float dt)
 {
     float dig_d  = expf(-DIG_GLOW_DECAY      * dt);
@@ -889,8 +561,8 @@ static void decay_glows(Maze *m, float dt)
     }
 }
 
-/* DIG: run up to dig_steps_per_tick DFS operations; when the stack empties,
- * compute the diameter and advance to SOLVE. */
+/* While digging: take a batch of dig steps. When the maze is fully dug, work
+ * out the solution and switch to showing it. */
 static void scene_dig(Scene *s)
 {
     for (int i = 0; i < s->dig_steps_per_tick; i++)
@@ -901,8 +573,8 @@ static void scene_dig(Scene *s)
     }
 }
 
-/* SOLVE: light up to solve_steps_per_tick more cells along the path (the
- * streaming gold beam); when the whole path is lit, advance to DONE. */
+/* While solving: light a few more cells of the gold route each tick so it
+ * streams across the maze. Once the whole route is lit, we're done. */
 static void scene_solve(Scene *s)
 {
     for (int i = 0; i < s->solve_steps_per_tick; i++) {
@@ -914,38 +586,36 @@ static void scene_solve(Scene *s)
         s->state = SCENE_DONE;
 }
 
-/* DONE: re-light the whole diameter each tick (the decay would otherwise fade
- * it) so the finished maze holds its solution until the user presses r. */
+/* When finished: re-light the whole route every tick so the fade can't dim it,
+ * keeping the solution on screen until the user starts a new maze. */
 static void scene_hold(Scene *s)
 {
     for (int i = 0; i < s->m.path_len; i++)
         s->m.cells[s->m.path[i]].solution_glow = 1.0f;
 }
 
-/* The per-tick combine: fade the glows, then advance the active phase. */
+/* One tick: fade the glows, then do whatever the current stage needs. */
 static void scene_tick(Scene *s, float dt)
 {
     if (s->paused) return;
-    decay_glows(&s->m, dt);                 /* EFFECTS */
-    switch (s->state) {                      /* SIMULATION */
+    decay_glows(&s->m, dt);
+    switch (s->state) {
     case SCENE_DIG:   scene_dig(s);   break;
     case SCENE_SOLVE: scene_solve(s); break;
     case SCENE_DONE:  scene_hold(s);  break;
     }
 }
 
-/* ===================================================================== */
-/* §6  render   (state → screen: reads Scene, mutates only the terminal)  */
-/* ===================================================================== */
+/* §6  drawing — turn the maze into characters on screen */
 
-/* Apply a theme's palette.  HUD/HINT pairs are fixed (bright yellow/cyan)
- * so the HUD stays legible against every theme; the rest come from `th`. */
+/* Load a theme's colours. The two HUD slots stay fixed bright so the readout is
+ * always legible; everything else takes its colour from the theme. */
 static void color_apply(const Theme *th)
 {
     start_color();
     use_default_colors();
-    init_pair(PAIR_HUD,  (COLORS >= 256) ? 226 : COLOR_YELLOW, -1);  /* reserved */
-    init_pair(PAIR_HINT, (COLORS >= 256) ?  51 : COLOR_CYAN,   -1);  /* reserved */
+    init_pair(PAIR_HUD,  (COLORS >= 256) ? 226 : COLOR_YELLOW, -1);  /* HUD: fixed bright yellow */
+    init_pair(PAIR_HINT, (COLORS >= 256) ?  51 : COLOR_CYAN,   -1);  /* hints: fixed bright cyan */
     if (COLORS >= 256) {
         init_pair(PAIR_WALL,      th->wall,      -1);
         init_pair(PAIR_VISITED,   th->visited,   -1);
@@ -964,15 +634,9 @@ static void color_apply(const Theme *th)
 }
 
 /*
- * wall_corner_glyph[] — ASCII glyph for a corner position keyed by
- * which of the 4 incident wall segments exist.
- *
- * Bits: 1=N, 2=E, 4=S, 8=W. Index 0 = no walls touching → space.
- * Any non-zero mask → '+'.
- *
- * We use ASCII (not Unicode box-drawing) for terminal portability —
- * the classic '+' / '-' / '|' maze look renders correctly on every
- * terminal regardless of locale or font.
+ * What to draw at a corner, looked up by the wall bits from corner_walls_at.
+ * No walls meet there → a space; any walls meet → a '+'. We stick to plain
+ * ASCII ('+', '-', '|') so the maze looks the same on every terminal.
  */
 static const char wall_corner_glyph[16] = {
     /*  0  ----  */ ' ',
@@ -1013,18 +677,12 @@ static void screen_resize(Screen *s)
 }
 
 /*
- * scene_draw_solution — draw the diameter path as ONE connected gold line.
+ * Draw the solution as one connected gold line.
  *
- * Per-cell rendering only lights cell interiors, which sit two screen columns
- * apart, so the solution looked like detached dots.  Here we also fill the
- * carved passage BETWEEN consecutive path cells: a '+' node at each cell and
- * a '-' (horizontal move) or '|' (vertical move) connector across the gap.
- * The two diameter endpoints are marked 'S' (path start) and 'E' (path end).
- * The result is a continuous, easy-to-follow route.
- *
- * Only cells the beam has reached (solution_glow up) are drawn, so SOLVE still
- * streams; in DONE every path cell is re-lit each tick, so the whole path
- * shows solid until the user presses r.
+ * The cells of the route sit two screen columns apart, so on their own they'd
+ * look like loose dots. To join them up we also fill the gap between each pair
+ * of neighbours with a '-' or '|'. The two ends are marked 'S' and 'E'. Only
+ * cells the beam has reached are drawn, so it still streams in while solving.
  */
 static void scene_draw_solution(const Scene *s, int gx0, int gy0,
                                 int cols, int rows)
@@ -1038,19 +696,19 @@ static void scene_draw_solution(const Scene *s, int gx0, int gy0,
 
         int sy = gy0 + 2 * y + 1;
         int sx = gx0 + 2 * x + 1;
-        /* mark the diameter endpoints S / E; interior nodes get '+' */
+        /* 'S' and 'E' for the two ends, '+' for everything in between */
         char node = (i == 0)                 ? 'S'
                   : (i == m->path_len - 1)   ? 'E'
                   :                            '+';
         if (sy >= 0 && sy < rows && sx >= 0 && sx < cols)
             mvaddch(sy, sx, (chtype)(unsigned char)node);
 
-        /* connector across the passage to the previous path cell */
+        /* fill the gap to the previous cell on the route */
         if (i > 0) {
             int pidx = m->path[i - 1];
             if (m->cells[pidx].solution_glow > GLOW_THRESHOLD) {
                 int px = pidx % m->w, py = pidx / m->w;
-                int csy = gy0 + y + py + 1;   /* midpoint of the two interiors */
+                int csy = gy0 + y + py + 1;   /* halfway between the two cells */
                 int csx = gx0 + x + px + 1;
                 char ch = (py == y) ? '-' : '|';
                 if (csy >= 0 && csy < rows && csx >= 0 && csx < cols)
@@ -1062,14 +720,16 @@ static void scene_draw_solution(const Scene *s, int gx0, int gy0,
 }
 
 /*
- * Maze → screen geometry.  A w×h maze renders as a (2w+1)×(2h+1) frame of
- * '+' / '-' / '|' chars; per cell (mx,my): interior at (2my+1, 2mx+1),
- * N-wall at (2my, 2mx+1), W-wall at (2my+1, 2mx), NW-corner at (2my, 2mx),
- * all offset by the frame origin (gy0, gx0).
+ * Where the maze sits on screen.
+ *
+ * Each maze cell takes a 2x2 block once you draw its walls, so a w-by-h maze is
+ * (2w+1) by (2h+1) characters. Within a cell's block: the middle is the floor,
+ * the top and left edges are its walls, the top-left is a corner. The functions
+ * below draw each of those, offset by the frame's top-left corner (gx0, gy0).
  */
 
-/* Top-left terminal cell of the centred maze frame, leaving row 0 for the data
- * HUD and the last row for the hint (hence the rows-2 and the +1). */
+/* Find the top-left corner so the maze is centred, while leaving the top row
+ * for the readout and the bottom row for the key hints. */
 static void maze_screen_origin(const Maze *m, int cols, int rows,
                                int *gx0, int *gy0)
 {
@@ -1081,7 +741,7 @@ static void maze_screen_origin(const Maze *m, int cols, int rows,
     if (*gy0 < 1) *gy0 = 1;
 }
 
-/* Corner glyph at grid point (mx,my): '+' if any wall segment meets there. */
+/* Draw the corner at grid point (mx,my): a '+' if any wall meets there. */
 static void draw_corner_glyph(const Maze *m, int mx, int my,
                               int gx0, int gy0, int cols, int rows)
 {
@@ -1094,8 +754,8 @@ static void draw_corner_glyph(const Maze *m, int mx, int my,
     attroff(COLOR_PAIR(PAIR_WALL));
 }
 
-/* North wall of cell (mx,my) — the '-' east of corner (mx,my).  At the top/
- * bottom frame edge it reads the boundary cell's N / S wall. */
+/* Draw a cell's top wall (the '-'). On the very bottom row it instead draws
+ * the bottom edge of the maze using the last cell's south wall. */
 static void draw_north_wall(const Maze *m, int mx, int my,
                             int gx0, int gy0, int cols, int rows)
 {
@@ -1111,8 +771,8 @@ static void draw_north_wall(const Maze *m, int mx, int my,
     attroff(COLOR_PAIR(PAIR_WALL));
 }
 
-/* West wall of cell (mx,my) — the '|' south of corner (mx,my).  At the left/
- * right frame edge it reads the boundary cell's W / E wall. */
+/* Draw a cell's left wall (the '|'). On the far right column it instead draws
+ * the right edge of the maze using the last cell's east wall. */
 static void draw_west_wall(const Maze *m, int mx, int my,
                            int gx0, int gy0, int cols, int rows)
 {
@@ -1128,9 +788,8 @@ static void draw_west_wall(const Maze *m, int mx, int my,
     attroff(COLOR_PAIR(PAIR_WALL));
 }
 
-/* Draw the wall lattice: at each grid point its corner, the north wall to its
- * east, and the west wall to its south.  The extra row/col (≤ m->h, ≤ m->w)
- * closes the outer frame. */
+/* Draw all the walls. We loop one past the edge in each direction so the maze's
+ * outer border gets drawn too. */
 static void draw_walls(const Maze *m, int gx0, int gy0, int cols, int rows)
 {
     for (int my = 0; my <= m->h; my++)
@@ -1141,7 +800,7 @@ static void draw_walls(const Maze *m, int gx0, int gy0, int cols, int rows)
         }
 }
 
-/* Fill each cell interior with its dominant-glow colour (cell_color_for). */
+/* Colour in the middle of each cell according to its brightest glow. */
 static void draw_interiors(const Maze *m, int gx0, int gy0, int cols, int rows)
 {
     for (int my = 0; my < m->h; my++) {
@@ -1163,8 +822,8 @@ static void draw_interiors(const Maze *m, int gx0, int gy0, int cols, int rows)
     }
 }
 
-/* scene_draw — the maze in three passes: wall lattice, cell interiors, then
- * the connected gold solution line over the carved passages. */
+/* Draw the whole maze: walls first, then the cell colours, then the gold
+ * solution line on top. */
 static void scene_draw(const Scene *s, int cols, int rows)
 {
     const Maze *m = &s->m;
@@ -1175,8 +834,8 @@ static void scene_draw(const Scene *s, int cols, int rows)
     scene_draw_solution(s, gx0, gy0, cols, rows);
 }
 
-/* Draw one HUD row left-aligned at `row`, clipped to the terminal width so it
- * can never overflow onto the maze. */
+/* Print one line of HUD text, trimmed to the window width so it can't spill
+ * over the maze. */
 static void draw_hud_row(const Screen *sc, int row, int pair, const char *text)
 {
     char buf[256];
@@ -1200,7 +859,7 @@ static void screen_draw(const Screen *sc, const Scene *s, double fps, int sim_fp
         (s->state == SCENE_SOLVE)  ? "SOLVING" :
                                      "SOLVED ";
 
-    /* top row: data — title, theme, size preset, state, progress, rates */
+    /* top line: the status readout */
     char data[256];
     snprintf(data, sizeof data,
              " Maze  %s  %s %dx%d  %s  %d/%d cells  steps:%d  %.1f fps  %d Hz ",
@@ -1209,31 +868,28 @@ static void screen_draw(const Screen *sc, const Scene *s, double fps, int sim_fp
              s->dig_steps_per_tick, fps, sim_fps);
     draw_hud_row(sc, 0, PAIR_HUD, data);
 
-    /* bottom row: actions — every interactive key */
+    /* bottom line: the list of keys you can press */
     draw_hud_row(sc, sc->rows - 1, PAIR_HINT,
                  " q:quit  spc:pause  r:reset  1-0:size  t:theme  +/-:steps  [/]:Hz ");
 }
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
-/* ===================================================================== */
-/* §7  app   (signals, user events, and the main loop)                    */
-/* ===================================================================== */
+/* §7  the program — signals, key handling, and the main loop */
 
 static void on_exit_signal  (int sig) { (void)sig; g_app.running     = 0; }
 static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
 static void cleanup(void)             { endwin(); }
 
 /*
- * app_pick_maze_size — set the maze size from the active preset, clamped to
- * what fits a (2w+1)×(2h+1) frame in the terminal (1 HUD row top + 1 hint
- * row bottom) and to MAZE_*_MAX.  A preset bigger than the terminal just
- * fills it; the "Max" preset always fills.
+ * Pick the actual maze size: take the chosen preset, then shrink it to whatever
+ * fits the terminal (each cell needs two characters, and we keep one row top and
+ * bottom for the HUD). A preset too big for the window just fills the window.
  */
 static void app_pick_maze_size(App *app)
 {
-    int fit_w = (app->screen.cols - 1) / 2;   /* widest maze that fits     */
-    int fit_h = (app->screen.rows - 3) / 2;   /* rows minus 2 HUD, then /2 */
+    int fit_w = (app->screen.cols - 1) / 2;   /* widest maze that fits across */
+    int fit_h = (app->screen.rows - 3) / 2;   /* tallest that fits, minus the two HUD rows */
     if (fit_w > MAZE_W_MAX) fit_w = MAZE_W_MAX;
     if (fit_h > MAZE_H_MAX) fit_h = MAZE_H_MAX;
 
@@ -1247,7 +903,7 @@ static void app_pick_maze_size(App *app)
     app->maze_h = mh;
 }
 
-/* USER EVENT: terminal resized — refit the maze and reseed (not a tick). */
+/* The window changed size: re-measure it, refit the maze, and start fresh. */
 static void app_do_resize(App *app)
 {
     screen_resize(&app->screen);
@@ -1256,7 +912,7 @@ static void app_do_resize(App *app)
     app->need_resize = 0;
 }
 
-/* USER EVENT: dispatch one key press — mutates App/Scene, never a tick. */
+/* Handle one key press. Returns false only when it's time to quit. */
 static bool app_handle_key(App *app, int ch)
 {
     Scene *s = &app->scene;
@@ -1291,7 +947,7 @@ static bool app_handle_key(App *app, int ch)
         if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
         break;
     default:
-        /* digit → maze-size preset: 1..9 pick 0..8, 0 picks the 10th */
+        /* number keys pick a size: 1..9 are the first nine, 0 is the biggest */
         if (ch >= '0' && ch <= '9') {
             int idx = (ch == '0') ? 9 : (ch - '1');
             if (idx < N_MAZE_PRESETS) {
@@ -1312,14 +968,14 @@ static void install_signals(void)
     signal(SIGWINCH, on_resize_signal);
 }
 
-/* One-time setup: seed the selections, bring up the terminal + theme, fit the
- * maze to the screen, and build the first maze. */
+/* Get everything ready before the loop starts: defaults, terminal, theme, and
+ * the first maze. */
 static void app_init(App *app)
 {
     app->running = 1;
     app->sim_fps = SIM_FPS_DEFAULT;
     app->theme   = 0;
-    app->preset  = N_MAZE_PRESETS - 1;   /* "Max" → fill the terminal by default */
+    app->preset  = N_MAZE_PRESETS - 1;   /* default to "Max" so it fills the window */
 
     screen_init(&app->screen);
     color_apply(&THEMES[app->theme]);
@@ -1344,7 +1000,7 @@ int main(void)
 
     while (app->running) {
 
-        /* USER EVENT: resize (handled outside the tick) */
+        /* did the window get resized since last time? */
         if (app->need_resize) {
             app_do_resize(app);
             frame_time = clock_ns();
@@ -1359,14 +1015,15 @@ int main(void)
         int64_t tick_ns = TICK_NS(app->sim_fps);
         float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
 
-        /* PER-TICK COMBINE: fixed-timestep accumulator drives scene_tick */
+        /* run as many fixed-size ticks as the elapsed time has earned, so the
+         * maze advances at the same pace no matter the frame rate */
         sim_accum += dt;
         while (sim_accum >= tick_ns) {
             scene_tick(&app->scene, dt_sec);
             sim_accum -= tick_ns;
         }
 
-        /* FPS counter: refresh the displayed rate every FPS_UPDATE_MS */
+        /* refresh the fps number shown in the HUD every so often */
         frame_count++;
         fps_accum += dt;
         if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -1376,16 +1033,16 @@ int main(void)
             fps_accum   = 0;
         }
 
-        /* PERFORMANCE: cap rendered frames to RENDER_CAP_FPS */
+        /* sleep just enough to hold the draw rate at RENDER_CAP_FPS */
         int64_t elapsed = clock_ns() - frame_time + dt;
         clock_sleep_ns(TICK_NS(RENDER_CAP_FPS) - elapsed);
 
-        /* RENDER (reads state only) */
+        /* draw the frame */
         screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps,
                     THEMES[app->theme].name, MAZE_PRESETS[app->preset].name);
         screen_present();
 
-        /* USER EVENT: keys */
+        /* check for a key press */
         int ch = getch();
         if (ch != ERR && !app_handle_key(app, ch))
             app->running = 0;

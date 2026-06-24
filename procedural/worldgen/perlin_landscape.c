@@ -1,81 +1,21 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * perlin_landscape.c — 2-D Parallax Landscape
- *
- * Three independent Perlin noise terrain layers scroll at different
- * speeds (parallax illusion of depth):
- *
- *   Far   — distant mountains  slow  dark blue-grey silhouette
- *   Mid   — rolling hills      medium  olive green
- *   Near  — foreground ground  full speed  bright green
- *
- * Each layer is a 1-D fractal Brownian motion height profile.
- * Painter's algorithm: sky → far → mid → near (each overwrites).
- * Stars are scattered deterministically in the upper sky.
+ * perlin_landscape.c — a scrolling cartoon landscape made of three terrain
+ * layers (far mountains, rolling hills, foreground ground). The layers slide
+ * past at different speeds, which is the old trick for faking depth: nearer
+ * things move faster than far ones. Each layer's silhouette is procedural
+ * terrain from Perlin noise, recomputed every frame — nothing is stored.
  *
  * Keys: q quit  p pause  r reset  <-/-> speed/dir  +/- zoom  t theme
  *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra procedural/worldgen/perlin_landscape.c \
- *       -o perlin_landscape -lncurses -lm
- *
- * Sections (re-cut by CONCERN — see ARCHITECTURE block below):
- *   §1 CONFIG  §2 PERFORMANCE  §3 LOGIC  §4 SIMULATION
- *   §5 EFFECTS (none)  §6 DELAYS (none)  §7 RENDER  §8 APP
+ * References (things the code can't tell you):
+ *   Perlin, "An Image Synthesizer" (1985) and "Improving Noise" (2002) —
+ *     the gradient noise and the smooth-fade curve used below.
+ *   Ebert/Musgrave et al., "Texturing & Modeling" (2003) — the canonical
+ *     treatment of stacking noise octaves into fBm terrain (fbm()).
+ *   Imhof, "Cartographic Relief Presentation" (1982) — colouring height
+ *     bands, and using haze to make distant ranges read as far away.
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Fractal terrain via layered (octave) Perlin noise (fBm).
- *                  Sum FBM_OCTAVES copies of the noise, each octave at double
- *                  the frequency and half the amplitude of the last, then
- *                  divide by the total amplitude to normalise:
- *                      h(x,y) = ( Σ_k Aᵏ·noise(fᵏ·x, fᵏ·y) ) / ( Σ_k Aᵏ )
- *                  with gain A = 0.5 and lacunarity f = 2. The lower-amplitude
- *                  high frequencies give the 1/f-like spectrum real terrain
- *                  height maps exhibit.
- *
- * Math           : Perlin noise (Ken Perlin, 1985):
- *                  - Divide space into integer grid cells
- *                  - Assign a pseudo-random gradient vector to each corner
- *                  - Dot gradient with offset from corner
- *                  - Smoothly interpolate using fade function 6t⁵−15t⁴+10t³
- *                    (C² continuous, 2nd derivative = 0 at t=0 and t=1)
- *                  With FBM_OCTAVES=5, lacunarity f=2, gain A=0.5 the Hurst
- *                  exponent is H = −ln(A)/ln(f) = 1 — smooth, persistent fBm
- *                  (Brownian motion proper is H=0.5; higher H = smoother).
- *
- * Rendering      : Camera scrolls left in time (the noise time parameter
- *                  increases), giving the illusion of flying over landscape.
- *                  Height bins map to terrain types (water/plains/hills/peaks).
- *
- * References     :
- *
- *   Noise & fractal terrain —
- *   • Perlin, K. (1985) — "An Image Synthesizer", SIGGRAPH '85. The
- *     original gradient-noise paper that started procedural noise.
- *   • Perlin, K. (2002) — "Improving Noise", SIGGRAPH '02. The exact
- *     gradient scheme + fade 6t⁵−15t⁴+10t³ implemented in §4 (perlin/fade).
- *     https://mrl.cs.nyu.edu/~perlin/paper445.pdf
- *   • Ebert, Musgrave, Peachey, Perlin & Worley (2003) — "Texturing &
- *     Modeling: A Procedural Approach" (3rd ed.). Musgrave's chapters on
- *     fBm / octave-summed noise terrain — the canonical treatment of fbm().
- *   • Fournier, Fussell & Carpenter (1982) — "Computer rendering of
- *     stochastic models", CACM 25(6). Seminal fractal (1/f) terrain.
- *   • Mandelbrot, B. (1982) — "The Fractal Geometry of Nature". The
- *     power-law / self-similarity the 1/f height spectrum imitates.
- *
- *   Rendering —
- *   • Foley, van Dam, Feiner & Hughes — "Computer Graphics: Principles
- *     and Practice". Painter's algorithm: the back-to-front compositing
- *     (sky → far → mid → near) scene_draw() uses, each layer overwriting.
- *   • Parallax via differential layer speed — the multiplane camera
- *     (Iwerks / Disney, 1937): each plane scrolls at a fraction of camera
- *     speed (SCROLL_FAR/MID/NEAR) to fake depth without 3-D.
- *   • Imhof, E. (1982) — "Cartographic Relief Presentation". Hypsometric
- *     tinting: mapping elevation bands to a colour ramp (the per-layer
- *     terrain colours here).
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
@@ -89,86 +29,47 @@
 #include <string.h>
 #include <time.h>
 
-/* ── ARCHITECTURE ─────────────────────────────────────────────────────── *
+/* How the file is laid out: all the state lives in three named types, defined
+ * in §1 — PerlinNoise (the noise generator), Landscape (the world: that noise
+ * plus the camera and its knobs), and Scene (the Landscape plus what's needed
+ * to draw it: the colour theme and the terminal size). main() owns one Scene
+ * and passes it (or just its Landscape) to each function. The only globals are
+ * the two signal flags, because the signal handler can't be handed anything.
  *
- * Re-cut from first principles into concern-layers. All program state lives in
- * named types — PerlinNoise (the gradient-noise generator), the Landscape that
- * contains it plus the camera/knobs, and the Scene that wraps the Landscape
- * with the RENDER state (theme + terminal geometry). main() owns ONE Scene
- * local and threads it (or its Landscape) by the NARROWEST type each function
- * needs (const for a read, non-const to mutate). The ONLY globals left are the
- * two async signal flags, which a signal handler cannot reach any other way.
- *
- *   LAYER        §   MUTATES
- *   ─────────────────────────────────────────────────────────────────────
- *   CONFIG       §1  nothing — compile-time tunables, the Theme table, and the
- *                    PerlinNoise / Landscape / Scene type definitions.
- *   PERFORMANCE  §2  nothing — clock_ns / clock_sleep_ns are pure timers.
- *                    The 30 fps frame cap is POLICY, applied in main() (§8).
- *   LOGIC        §3  nothing — pure reads: the noise core (lattice_index,
- *                    grad_dot, fade, lerp, perlin, fbm), is_star, and the
- *                    per-column/per-cell helpers (layer_row, column_horizons,
- *                    band_cell), taking const PerlinNoise* / const Landscape*.
- *                    Terrain is recomputed, never stored, so no RENDER/EFFECTS
- *                    ordering can corrupt them.
- *   SIMULATION   §4  Landscape.scroll (the per-tick advance, inline in main);
- *                    PerlinNoise.{perm,gx,gy} via noise_init; and the camera/
- *                    knobs via landscape_init / landscape_reset. Only writers.
- *   EFFECTS      §5  (none) — no stored cosmetic state; stars + shading are
- *                    derived each frame. One-line section, not a real layer.
- *   DELAYS       §6  (none) — only Landscape.paused, a toggle read in the tick.
- *   RENDER       §7  ncurses back buffer + colour-pair table only
- *                    (theme_apply, color_init, hud_draw, scene_draw). Reads the
- *                    Scene (theme, geometry, Landscape) via §3; never writes
- *                    simulation state. Scene.theme is set by the 't' key.
- *   APP          §8  g_quit / g_resize (signal flags); Scene.{rows,cols} on
- *                    resize; owns the Scene local + the per-frame combine, and
- *                    drives the knobs (speed, zoom, paused, theme) from keys.
- *
- * PER-FRAME COMBINE (the one place state advances — main(), §8; ld = &sc.landscape):
- *
- *     getch() → key handler          // USER EVENTS (knobs, reset, quit)
- *     if (!ld->paused) ld->scroll += // SIMULATION: one scroll step
- *     erase(); scene_draw(&sc)       // RENDER (reads only)
- *     wnoutrefresh(); doupdate()
- *     clock_sleep_ns(frame cap)      // PERFORMANCE: 30 fps cap
- *
- * Nothing else advances ld->scroll. Key handling and SIGWINCH resize mutate
- * state (knobs, geometry, noise field on reset) but are USER EVENTS, not part
- * of the scroll advance.
- *
- * ─────────────────────────────────────────────────────────────────────── */
+ * Each frame main() does the same four things in order: read keys, advance the
+ * camera by one step (unless paused), draw, then sleep to hold ~30 fps. The
+ * camera position only ever moves in that one spot. */
 
-/* ===================================================================== */
-/* §1  CONFIG  -- tunables, theme data, core types (+ signal flags)      */
-/* ===================================================================== */
+/* ── §1  config: tunables, theme data, core types, signal flags ── */
 
-#define RENDER_NS  (1000000000LL / 30)
-#define HUD_TOP     2    /* rows 0-1: data  (title/state + parameters) */
-#define HUD_BOTTOM  1    /* last row: actions (key legend)             */
+#define RENDER_NS  (1000000000LL / 30)   /* one frame's worth of time, ~30 fps */
+#define HUD_TOP     2    /* top two rows reserved for the HUD text */
+#define HUD_BOTTOM  1    /* bottom row reserved for the key legend */
 
-/* Parallax: fraction of camera speed each layer scrolls at */
+/* How fast each layer scrolls, as a fraction of the camera's speed. The far
+ * layer barely moves; the near layer keeps pace. That speed difference is what
+ * sells the depth — near things slide by faster than distant ones. */
 #define SCROLL_FAR    0.12f
 #define SCROLL_MID    0.38f
 #define SCROLL_NEAR   1.00f
 
-/* Noise frequency: horizontal "stretch" of each landscape layer.
- * Smaller = wider features (smoother). */
+/* How stretched-out each layer's hills are. Smaller = broader, gentler humps;
+ * the far range is the smoothest, the near ground the most jagged. */
 #define BASE_FREQ_FAR   0.009f
 #define BASE_FREQ_MID   0.018f
 #define BASE_FREQ_NEAR  0.040f
 
-/* fBm shape — how fbm() sums octaves of Perlin noise. Each octave runs at
- * frequency ×FBM_LACUNARITY and amplitude ×FBM_GAIN of the previous one; the
- * gain/lacunarity pair fixes the fractal roughness:
- *   Hurst exponent H = −ln(FBM_GAIN)/ln(FBM_LACUNARITY) = −ln(0.5)/ln(2) = 1
- * (smooth, persistent terrain). More octaves = finer detail, diminishing. */
+/* The shape of the terrain. fbm() builds it by adding up several layers of
+ * noise: each next layer is twice as wiggly (LACUNARITY) but half as tall
+ * (GAIN), so you get big shapes with finer detail riding on top. More octaves
+ * means finer detail, with rapidly diminishing returns. */
 #define FBM_OCTAVES     5
 #define FBM_LACUNARITY  2.0f
 #define FBM_GAIN        0.5f
 
-/* Terrain vertical bands (fraction of draw_rows from top).
- * Peak floats up from BASE by up to AMP * noise. */
+/* Where each layer sits and how tall it gets, measured as fractions of the
+ * drawing height from the top. BASE is the layer's resting line; ridges rise
+ * up to AMP above it. */
 #define BASE_FAR   0.60f
 #define AMP_FAR    0.28f
 #define BASE_MID   0.70f
@@ -176,73 +77,63 @@
 #define BASE_NEAR  0.80f
 #define AMP_NEAR   0.16f
 
-/* Each layer samples a different y-slice of the noise field so the three
- * profiles are uncorrelated (otherwise the ranges would echo each other). */
+/* Each layer reads a different slice of the noise so their outlines don't end
+ * up looking like copies of each other. */
 #define NOISE_YOFF_FAR   0.0f
 #define NOISE_YOFF_MID   8.3f
 #define NOISE_YOFF_NEAR  16.7f
 
-/* Sky shading, as a fraction of the distance from the top down to the far
- * ridge: stars only twinkle in the upper part; the gradient darkens at the
- * halfway line. */
-#define SKY_STAR_MAX     0.55f   /* above this fraction → no stars   */
-#define SKY_SPLIT        0.50f   /* below → bright sky, above → dim  */
+/* Sky shading, measured down from the top toward the far ridge. Stars only
+ * appear in the top stretch, and the sky switches from bright to dim halfway. */
+#define SKY_STAR_MAX     0.55f   /* below this height fraction: no stars */
+#define SKY_SPLIT        0.50f   /* above it bright sky, below it dim    */
 
-/* Rows of bright near-ground fill before it fades to the dark base tier. */
+/* How many rows of bright foreground ground before it darkens into the base. */
 #define NEAR_FILL_ROWS   3
 
-#define SPEED_MAX  4.f
+#define SPEED_MAX  4.f   /* fastest the camera can scroll, either direction */
 
-#define PERM 256
+#define PERM 256   /* size of the noise lookup table (must be a power of two) */
 
-/* ── Colour-pair indices ───────────────────────────────────────────────── *
- * One ncurses pair per painter's-algorithm layer, ordered FAR → NEAR exactly
- * as scene_draw() composites them (sky behind, near ground in front). The
- * order is the lesson: the 10 terrain slots double as indices into a Theme's
- * c[]/c8[] arrays (CP_SKY_HI−1 .. CP_NEAR_B−1 = slots 0..9), so a theme just
- * lists ten colours in this same depth order. Pairs start at 1 because ncurses
- * reserves pair 0 for the default fg/bg. */
+/* One colour slot per piece of the scene, listed from the back of the picture
+ * (sky) to the front (near ground) — the same order they get painted in. The
+ * first ten line up one-for-one with a theme's ten colours below, so a theme
+ * is just "here are my ten colours, back to front". Slot 0 is off-limits in
+ * ncurses (it's the terminal default), so these start at 1. */
 enum {
-    CP_SKY_HI = 1,   /* top sky        */
-    CP_SKY_LO,       /* horizon sky    */
-    CP_STAR,          /* stars          */
-    CP_FAR_E,         /* far edge       */
-    CP_FAR_F,         /* far fill       */
-    CP_MID_E,         /* mid edge       */
-    CP_MID_F,         /* mid fill       */
-    CP_NEAR_E,        /* near edge      */
-    CP_NEAR_F,        /* near fill      */
-    CP_NEAR_B,        /* near base       */
-    CP_HUD,           /* top data line   */
-    CP_HINT           /* bottom actions  */
+    CP_SKY_HI = 1,   /* top of the sky      */
+    CP_SKY_LO,       /* sky near the horizon */
+    CP_STAR,          /* stars               */
+    CP_FAR_E,         /* far ridge line      */
+    CP_FAR_F,         /* far slope fill      */
+    CP_MID_E,         /* mid ridge line      */
+    CP_MID_F,         /* mid slope fill      */
+    CP_NEAR_E,        /* near ground edge    */
+    CP_NEAR_F,        /* near ground fill    */
+    CP_NEAR_B,        /* near ground base    */
+    CP_HUD,           /* HUD text            */
+    CP_HINT           /* bottom key legend   */
 };
 
 #define N_THEMES 10
 
-/* ── Theme ─────────────────────────────────────────────────────────────── *
- * WHAT  One named colour palette (10 ship; t cycles). A theme supplies a
- *       foreground colour for each of the ten depth slots (the CP_* layers, in
- *       FAR→NEAR order) plus the HUD; theme_apply() loads them into the ncurses
- *       pairs. Background is ALWAYS -1 (the terminal default) so unpainted sky
- *       cells show through — the parallax illusion needs a single flat sky.
+/* One named colour scheme (the 't' key cycles through them). A theme is just a
+ * list of ten colours — one for each scene slot above, in back-to-front order —
+ * plus a HUD colour. The background is always the terminal default so the sky
+ * shows through; the parallax look needs one flat, uniform sky.
  *
- * VALUE LOGIC  c[0..9] runs sky_hi, sky_lo, star, far_e, far_f, mid_e, mid_f,
- *       near_e, near_f, near_b — i.e. distance-ordered. A good theme fades the
- *       far slots toward the sky colour (low contrast) and saturates the near
- *       ones, so depth reads as ATMOSPHERIC PERSPECTIVE: distant ranges look
- *       hazy, the foreground crisp. c8[] mirrors the same ten slots with the
- *       8 base COLOR_* constants for terminals without 256-colour support;
- *       hud / hud8 are the matching HUD foregrounds.
- *
- * REFS  Aerial / atmospheric perspective as a depth cue — Imhof,
- *       "Cartographic Relief Presentation" (1982). Project palette notes —
- *       documentation/COLOR.md. */
+ * The depth trick lives in how you pick the colours: a good theme makes the
+ * far slots pale and low-contrast (like a hazy mountain you can barely make
+ * out) and the near ones bold and vivid. That's the same thing painters do to
+ * fake distance. c8[] is the same ten slots again in the basic 8 colours, used
+ * when the terminal can't do 256. (Idea: Imhof, "Cartographic Relief
+ * Presentation", 1982. Palette notes: documentation/COLOR.md.) */
 typedef struct {
-    const char *name;   /* HUD label (t cycles)                              */
-    int c[10];          /* 256-colour fg, one per CP_* slot, FAR→NEAR        */
-    int c8[10];         /* 8-colour fallback for the same ten slots          */
-    int hud;            /* 256-colour HUD foreground                         */
-    int hud8;           /* 8-colour HUD foreground                           */
+    const char *name;   /* label shown in the HUD                  */
+    int c[10];          /* the ten slot colours (256-colour mode)  */
+    int c8[10];         /* same ten slots, basic 8-colour fallback */
+    int hud;            /* HUD text colour, 256-colour mode        */
+    int hud8;           /* HUD text colour, 8-colour fallback      */
 } Theme;
 
 static const Theme k_themes[N_THEMES] = {
@@ -307,104 +198,74 @@ static const Theme k_themes[N_THEMES] = {
       214, COLOR_YELLOW },
 };
 
-/* ── data types ──────────────────────────────────────────────────────── */
+/* ── data types ── */
 
-/* ── PerlinNoise ───────────────────────────────────────────────────────── *
- * WHAT  A gradient-noise generator. Perlin noise assigns every integer lattice
- *       point a pseudo-random gradient vector, then for a sample (x,y) takes
- *       the dot product of each surrounding corner's gradient with the offset
- *       to that corner and smoothly blends the four — giving a continuous field
- *       that is 0 at the lattice and varies coherently between (no white-noise
- *       hash, no visible grid). fbm() stacks octaves of it into terrain.
+/* The Perlin noise generator: it turns any point (x,y) into a smoothly-varying
+ * number, so the landscape looks natural instead of random static. The idea:
+ * lay down a grid, give every grid corner a random "which way is downhill"
+ * arrow, and for any point blend the four arrows around it. Points right on a
+ * corner come out 0, and the value drifts gently between corners — no jagged
+ * jumps, no visible grid lines. fbm() then stacks several of these to build
+ * terrain. (Perlin, 1985 & 2002 — see the file-header references.)
  *
- * WHY THIS LAYOUT
- *   perm[]  A permutation of 0..255 (a hash): perm[perm[xi]+yi] turns a 2-D
- *           lattice coordinate into a stable index 0..255 with no multiply.
- *           It is built 0..255, Fisher–Yates shuffled, then the SAME 256 values
- *           are copied into [256..511]. That duplication is the trick that lets
- *           perlin() write perm[perm[xi]+yi] for neighbours xi, xi+1 (indices
- *           up to 255+255=510) without a modulo or bounds test — the upper half
- *           mirrors the lower, so a wrapped index reads the same gradient.
- *   gx,gy   The unit gradient at each entry, gx=cos θ, gy=sin θ for a random
- *           angle θ — kept parallel to perm[] (shuffled and doubled in lockstep)
- *           so a permuted index selects both a hash slot and its gradient.
- *           (Perlin's "Improving Noise" uses a fixed set of 12 gradients to
- *           avoid directional clustering; this file takes the simpler route of
- *           a continuous random direction per entry.)
- *
- * REFS  Perlin, "An Image Synthesizer" (1985) and "Improving Noise" (2002,
- *       the quintic fade 6t⁵−15t⁴+10t³ used in fade()). See the file-header
- *       References block. */
+ * The three arrays below are kept in lockstep — shuffling or copying one means
+ * doing the same to all three — so that one table lookup picks both a slot and
+ * its matching arrow.
+ *   perm  A shuffled list of 0..255, used as a hash to turn grid coordinates
+ *         into a slot number. The whole list is stored twice, back to back.
+ *         That doubling is a deliberate trick: when perlin() looks up a corner
+ *         and its neighbour, the index can run off the end of the first copy
+ *         and just land in the second one, which holds the same values — so no
+ *         wrap-around math or bounds check is needed in the hot path.
+ *   gx,gy The actual arrow for each slot: a random direction, length 1.
+ *         (Perlin's later version uses a fixed handful of directions to avoid
+ *         clumping; this file keeps it simple with a fresh random angle each.) */
 typedef struct {
-    unsigned char perm[PERM * 2];   /* shuffled 0..255 hash, mirrored into the
-                                       upper half so lookups wrap modulo-free */
-    float         gx[PERM * 2];     /* gradient x = cos θ (unit), per entry   */
-    float         gy[PERM * 2];     /* gradient y = sin θ (unit), per entry   */
+    unsigned char perm[PERM * 2];   /* shuffled 0..255 hash, stored twice so
+                                       lookups never need to wrap by hand */
+    float         gx[PERM * 2];     /* arrow x-component for each slot */
+    float         gy[PERM * 2];     /* arrow y-component for each slot */
 } PerlinNoise;
 
-/* ── Landscape ─────────────────────────────────────────────────────────── *
- * WHAT  The simulated world — a moving camera over a procedural terrain — as a
- *       table of contents (WHAT / WHERE / HOW + run-state). Only SIMULATION (§4)
- *       writes it; LOGIC/RENDER read it const. It is a sub-object of the Scene
- *       that main() owns, threaded down as &scene.landscape — no hidden global
- *       terrain.
- *
- * WHY NO STORED TERRAIN  The heightfield is never materialised: scene_draw()
- *       calls layer_row() per column, which samples fbm(&noise, scroll·frac +
- *       col·freq·zoom, …) on demand. So "advancing the world" is just moving
- *       the camera — incrementing one float — and the parallax depth comes from
- *       each layer reading the noise at a different fraction of `scroll`.
- *
- * VALUE LOGIC
- *   noise   the gradient field (above); fixed until 'r' regenerates it.
- *   scroll  camera x in terminal columns, a free-running accumulator (+= speed
- *           each unpaused frame); large values are fine — perlin() wraps.
- *   speed   columns/frame, in [−SPEED_MAX .. SPEED_MAX] (±4); sign is travel
- *           direction, magnitude is pace; ±0.1 per arrow-key press.
- *   zoom    horizontal stretch multiplying every layer's base frequency,
- *           in [0.125 .. 8] (×1.25 / ×0.8 per +/−); <1 = wider, smoother hills.
- *   paused  freezes the scroll advance only; rendering (and the clock) go on.
- *
- *   The colour theme is deliberately NOT a field here: it is a RENDER choice,
- *   not a property of the landscape (it lives in the Scene that wraps this).
- *
- * REFS  fBm terrain — Ebert/Musgrave et al., "Texturing & Modeling" (2003);
- *       parallax-by-differential-scroll — the multiplane camera (Disney, 1937).
- *       See the file-header References block. */
+/* The world: a camera gliding over procedural terrain, plus the few knobs the
+ * user can turn. There is no stored heightmap — the terrain is recomputed from
+ * the noise every frame, so "moving the world" just means nudging one number,
+ * `scroll`. The depth illusion falls out of each layer reading the noise at a
+ * different fraction of that one number.
+ *   noise   the noise generator above; stays fixed until 'r' makes a new one.
+ *   scroll  how far the camera has travelled, in columns. Just keeps counting
+ *           up; huge values are fine because the noise repeats.
+ *   speed   columns moved per frame, from -4 to +4. Sign is the direction,
+ *           size is the pace. Arrow keys nudge it by 0.1.
+ *   zoom    stretches all the hills horizontally, from 0.125x to 8x. Below 1x
+ *           the hills get wider and gentler. +/- multiply it.
+ *   paused  stops the camera moving; drawing keeps going.
+ * The colour theme isn't kept here on purpose — it's a how-we-draw-it choice,
+ * not a fact about the land, so it lives up in the Scene. */
 typedef struct {
-    PerlinNoise noise;     /* terrain source (sampled, never stored)    */
-    float       scroll;    /* camera x-position, in columns (accumulates)*/
-    float       speed;     /* scroll columns/frame, [−SPEED_MAX..MAX]    */
-    float       zoom;      /* base-frequency multiplier, [0.125..8]      */
-    bool        paused;    /* freeze the scroll advance (render goes on) */
+    PerlinNoise noise;     /* terrain source (sampled fresh, never stored) */
+    float       scroll;    /* camera position in columns (only counts up)  */
+    float       speed;     /* columns per frame, -SPEED_MAX..SPEED_MAX      */
+    float       zoom;      /* horizontal stretch, 0.125..8                  */
+    bool        paused;    /* stop the camera (drawing still runs)          */
 } Landscape;
 
-/* ── Scene ─────────────────────────────────────────────────────────────── *
- * The top-level state: WHAT is simulated (the Landscape) plus the RENDER state
- * that decides HOW/WHERE it is shown — the active colour theme and the current
- * terminal geometry. main() owns ONE Scene and threads it (or its Landscape
- * sub-object) to the functions that need it, so none of this is a global.
- * theme and rows/cols are kept OUT of the Landscape on purpose: a key toggles
- * the theme and a resize sets rows/cols — neither is a property of the terrain. */
+/* Everything in one bundle: the world (Landscape) plus the two things you need
+ * to draw it — which colour theme is active and how big the terminal is. The
+ * theme and size live here, not in the Landscape, because a keypress changes
+ * the theme and a window resize changes the size; neither is part of the land. */
 typedef struct {
-    Landscape landscape;   /* WHAT — the simulated world (§4)              */
-    int       theme;       /* RENDER — active palette, index into k_themes */
-    int       rows, cols;  /* RENDER — terminal size (set at init + resize)*/
+    Landscape landscape;   /* the world being drawn        */
+    int       theme;       /* which theme, index into k_themes */
+    int       rows, cols;  /* terminal size (set at start and on resize) */
 } Scene;
 
-/* The ONLY remaining globals: async signal flags. They must be global because
- * the signal handler (sig_h, §8) takes no parameter; all other state now lives
- * in the Scene that main() owns. */
+/* The only globals. They have to be globals because the signal handler can't be
+ * passed anything — everything else travels inside the Scene that main() owns. */
 static volatile sig_atomic_t g_quit   = 0;
 static volatile sig_atomic_t g_resize = 0;
 
-/* ===================================================================== */
-/* §2  PERFORMANCE  -- timing primitives (frame cap in main, §8)         */
-/* ===================================================================== */
-
-/* Timing primitives only. The 30 fps frame cap (RENDER_NS) is applied in
- * main() (§8): this program advances exactly one scroll step per frame, so
- * a simple frame cap suffices — no fixed-timestep accumulator. */
+/* ── §2  performance: timing helpers (the frame cap lives in main) ── */
 
 static long long clock_ns(void)
 {
@@ -420,59 +281,53 @@ static void clock_sleep_ns(long long ns)
     nanosleep(&ts, NULL);
 }
 
-/* ===================================================================== */
-/* §3  LOGIC  -- pure decisions: no mutation, no I/O                     */
-/* ===================================================================== */
+/* ── §3  logic: pure read-only helpers — no changing state, no drawing ── */
 
-/* Pure reads: each returns a value from its arguments alone — a const
- * PerlinNoise* (perlin/fbm), a const Landscape* (layer_row, column_horizons),
- * or plain scalars (band_cell, is_star) — with NO mutation and NO I/O. The
- * terrain is never stored; layer_row() recomputes a column on demand, so no
- * RENDER/EFFECTS ordering can corrupt a result. Only SIMULATION (§4) ever
- * writes the data these read. */
+/* Everything here just computes an answer from its inputs and returns it. None
+ * of it stores anything or touches the screen, which is why a column can be
+ * recomputed from scratch every frame without anything going stale. */
 
 static float fade(float t) { return t * t * t * (t * (t * 6.f - 15.f) + 10.f); }
 static float lerp(float a, float b, float t) { return a + t * (b - a); }
 
-/* Integer lattice cell containing v, wrapped into the 0..255 table (the
- * `& (PERM-1)` is a fast modulo-256 since PERM is a power of two). */
+/* Which grid cell a coordinate falls in, folded back into the table's 0..255
+ * range. The `& (PERM-1)` is just a fast way to take "remainder by 256". */
 static int lattice_index(float v) { return (int)floorf(v) & (PERM - 1); }
 
-/* The heart of gradient noise: the corner's gradient vector dotted with the
- * offset (dx,dy) from that corner to the sample point. Zero at the corner,
- * rising along the gradient direction — this is what gives Perlin noise its
- * smooth ramps instead of value-noise blockiness. */
+/* How strongly one corner's arrow points toward our sample point: 0 if we're
+ * sitting on the corner, growing as we move along the arrow's direction. This
+ * is the bit that makes Perlin noise roll smoothly instead of looking blocky. */
 static float grad_dot(const PerlinNoise *n, int hash, float dx, float dy)
 {
     return n->gx[hash] * dx + n->gy[hash] * dy;
 }
 
+/* The noise value at one point: find the grid cell, look up its four corners'
+ * arrows, and blend them, weighting by how close we are to each corner. */
 static float perlin(const PerlinNoise *n, float x, float y)
 {
-    /* lattice cell + the sample's offset within it, with smoothstep weights */
+    /* which cell we're in, and how far into it we are (0..1 each way) */
     int   xi = lattice_index(x), yi = lattice_index(y);
     float xf = x - floorf(x),    yf = y - floorf(y);
-    float u  = fade(xf),         v  = fade(yf);
+    float u  = fade(xf),         v  = fade(yf);   /* eased blend weights */
 
-    /* hash the four surrounding corners to gradient-table entries */
+    /* turn the four corner coordinates into table slots */
     int aa = n->perm[n->perm[xi  ] + yi  ];
     int ab = n->perm[n->perm[xi  ] + yi+1];
     int ba = n->perm[n->perm[xi+1] + yi  ];
     int bb = n->perm[n->perm[xi+1] + yi+1];
 
-    /* bilinearly blend each corner's gradient·offset ramp */
+    /* blend the four corners' contributions, left-right then top-bottom */
     return lerp(lerp(grad_dot(n, aa, xf,       yf      ),
                      grad_dot(n, ba, xf - 1.f, yf      ), u),
                 lerp(grad_dot(n, ab, xf,       yf - 1.f),
                      grad_dot(n, bb, xf - 1.f, yf - 1.f), u), v);
 }
 
-/* Fractal Brownian Motion: sum FBM_OCTAVES octaves of Perlin noise, each at
- * ×FBM_LACUNARITY frequency and ×FBM_GAIN amplitude of the last. Dividing by
- * the total amplitude m normalises the result to ≈ [-0.5, 0.5] — and that
- * normalisation makes the STARTING amplitude (a below) irrelevant: scale every
- * term by the same constant and it cancels in v/m, so 0.6 vs 1.0 is identical.
- * Only the gain/lacunarity RATIOS shape the terrain (see FBM_* in §1). */
+/* Build terrain by piling up several copies of the noise — each next one finer
+ * and fainter than the last (see the FBM_* knobs). Dividing by the running
+ * total `m` rescales the result to roughly -0.5..0.5; because of that rescale,
+ * the starting amplitude (a's initial 0.6) doesn't matter — only the ratios do. */
 static float fbm(const PerlinNoise *n, float x, float y)
 {
     float v = 0.f, a = 0.6f, f = 1.f, m = 0.f;
@@ -480,32 +335,33 @@ static float fbm(const PerlinNoise *n, float x, float y)
         v += a * perlin(n, x * f, y * f);
         m += a; a *= FBM_GAIN; f *= FBM_LACUNARITY;
     }
-    return v / m;   /* normalised to ≈ [-0.5, 0.5] */
+    return v / m;   /* roughly -0.5 .. 0.5 */
 }
 
-/* Deterministic star hash — no storage, no flicker */
+/* Is there a star at this cell? Decided straight from the coordinates, so the
+ * same cells are stars every frame — no list to keep, and they never flicker. */
 static bool is_star(int col, int row)
 {
     unsigned h = (unsigned)col * 2654435761u ^ (unsigned)row * 2246822519u;
-    return (h & 0x1FF) < 3;   /* ~0.6% density */
+    return (h & 0x1FF) < 3;   /* roughly 0.6% of cells */
 }
 
-/* Sample one parallax layer's peak row for this column. Reads the landscape's
- * noise field + camera scroll + zoom (three cohesive fields = "the moving
- * terrain"), so it takes const Landscape* rather than four loose scalars; it
- * is a pure read and cannot mutate. yoffset keeps layers independent in noise
- * space; scroll_frac is the layer's parallax factor. */
+/* The screen row of one layer's ridge at one column. It takes the whole
+ * Landscape (not loose numbers) because it needs the noise, the camera
+ * position and the zoom together — they're really one thing, "the moving
+ * terrain". scroll_frac is this layer's parallax speed; yoffset keeps it
+ * reading a different slice of noise than the other layers. */
 static int layer_row(const Landscape *ld, float scroll_frac, float base_freq,
                      float base, float amp,
                      float col, float yoffset, int draw_rows)
 {
-    /* Where this column samples the noise: parallax shifts the layer by a
-     * fraction of the camera scroll; zoom stretches the per-column frequency. */
+    /* where to read the noise: the camera shifts the layer by its parallax
+     * fraction, and zoom stretches how fast we step across columns */
     float sample_x = ld->scroll * scroll_frac + col * base_freq * ld->zoom;
-    float n        = fbm(&ld->noise, sample_x, yoffset);   /* ≈ [-0.5, 0.5] */
+    float n        = fbm(&ld->noise, sample_x, yoffset);
 
-    /* Map noise to a screen row: `base` is the layer's resting line (fraction
-     * from the top), `amp` how far its ridges rise above it. */
+    /* turn that into a row: start at the layer's resting line, then lift the
+     * ridge up toward the top by an amount set by the noise */
     float top_frac = base - (n + 0.5f) * amp;
     int   row      = (int)(top_frac * (float)draw_rows);
     if (row < 0)          row = 0;
@@ -513,9 +369,9 @@ static int layer_row(const Landscape *ld, float scroll_frac, float base_freq,
     return row;
 }
 
-/* The three ridge rows (far, mid, near) for a column, then forced into depth
- * order: each nearer ridge must sit at least one row BELOW the one behind it,
- * so the parallax layers can never visually invert. Pure read of the scene. */
+/* The three ridge rows (far, mid, near) for one column, then nudged so each
+ * nearer one sits at least a row below the one behind it. That keeps the layers
+ * from ever crossing over and looking inside-out. */
 static void column_horizons(const Landscape *ld, int col, int draw_rows,
                             int *rf, int *rm, int *rn)
 {
@@ -533,58 +389,53 @@ static void column_horizons(const Landscape *ld, int col, int draw_rows,
     if (*rn >= draw_rows) *rn = draw_rows - 1;
 }
 
-/* Glyph + colour pair for one cell, decided purely by where its row sits
- * relative to the three ridge rows: sky above the far ridge (with stars and a
- * top-to-horizon gradient), then a lit edge '^'/'~' at each ridge and a fill
- * below it, near→far. Returns the glyph and writes the colour pair via *cp. */
+/* Picks the character and colour for one cell, based only on where its row
+ * falls among the three ridges: sky above the far ridge (with stars and a
+ * lighter-to-darker gradient), then for each layer a lit ridge line and the
+ * fill below it. Returns the character; hands back the colour through *cp. */
 static chtype band_cell(int r, int rf, int rm, int rn, int col, int *cp)
 {
-    if (r < rf) {                                    /* ── sky ── */
+    if (r < rf) {                                    /* sky */
         float sky_t = (float)r / (float)(rf > 0 ? rf : 1);
         if (sky_t < SKY_STAR_MAX && is_star(col, r)) { *cp = CP_STAR; return '.'; }
         *cp = (sky_t < SKY_SPLIT) ? CP_SKY_HI : CP_SKY_LO;
         return ' ';
     }
-    if (r == rf) { *cp = CP_FAR_E;  return '^'; }    /* far ridge edge   */
+    if (r == rf) { *cp = CP_FAR_E;  return '^'; }    /* far ridge line   */
     if (r < rm)  { *cp = CP_FAR_F;  return (r == rf + 1) ? ':' : '.'; }
-    if (r == rm) { *cp = CP_MID_E;  return '^'; }    /* mid ridge edge   */
+    if (r == rm) { *cp = CP_MID_E;  return '^'; }    /* mid ridge line   */
     if (r < rn)  { *cp = CP_MID_F;  return (r == rm + 1) ? ':' : '#'; }
     if (r == rn) { *cp = CP_NEAR_E; return '~'; }    /* near ground edge */
-    *cp = (r < rn + NEAR_FILL_ROWS) ? CP_NEAR_F : CP_NEAR_B;   /* darker base */
+    *cp = (r < rn + NEAR_FILL_ROWS) ? CP_NEAR_F : CP_NEAR_B;   /* fades to base */
     return '#';
 }
 
-/* ===================================================================== */
-/* §4  SIMULATION  -- advances / builds state                            */
-/* ===================================================================== */
+/* ── §4  simulation: the only code that changes the world's state ── */
 
-/* The only writers of simulation state. The per-tick advance is a single line,
- *   if (!ld->paused) ld->scroll += ld->speed;   inside main()`s combine (§8) —
- * too trivial for its own function. noise_init() builds the gradient field;
- * landscape_init/landscape_reset set the camera + knobs (startup vs the 'r'
- * key, a USER EVENT). Mutates: Landscape.{scroll(tick), speed, zoom, paused},
- * PerlinNoise.{perm, gx, gy}. */
+/* The per-frame move is just one line in main() ("scroll += speed"), too small
+ * to be its own function. The functions here are the setup: make a fresh noise
+ * field, and reset the camera and knobs (at startup, or when 'r' is pressed). */
 
-/* Fill a PerlinNoise with a fresh random gradient field: assign each lattice
- * point a unit gradient at a random angle, Fisher–Yates shuffle the table,
- * then duplicate into the upper half so perlin()'s lookups wrap freely. */
+/* Fill in a brand-new random noise field: give every grid corner an arrow
+ * pointing a random way, shuffle the table, then copy the whole thing once more
+ * onto the end (the doubling perlin() relies on to avoid wrap-around math). */
 static void noise_init(PerlinNoise *n)
 {
-    /* 1. identity permutation + a random unit gradient (cos θ, sin θ) per entry */
+    /* start with slots 0,1,2,... in order, each with a random arrow */
     for (int i = 0; i < PERM; i++) {
         n->perm[i] = (unsigned char)i;
         float a = (float)rand() / RAND_MAX * 2.f * (float)M_PI;
         n->gx[i] = cosf(a);
         n->gy[i] = sinf(a);
     }
-    /* 2. Fisher–Yates shuffle — perm and its paired gradients move together */
+    /* shuffle them — keeping each slot's arrow with its slot */
     for (int i = PERM - 1; i > 0; i--) {
         int j = rand() % (i + 1);
         unsigned char t = n->perm[i]; n->perm[i] = n->perm[j]; n->perm[j] = t;
         float tx = n->gx[i]; n->gx[i] = n->gx[j]; n->gx[j] = tx;
         float ty = n->gy[i]; n->gy[i] = n->gy[j]; n->gy[j] = ty;
     }
-    /* 3. mirror the lower half into the upper so perlin()'s lookups wrap free */
+    /* copy the whole table onto the back of itself */
     for (int i = 0; i < PERM; i++) {
         n->perm[i + PERM] = n->perm[i];
         n->gx[i + PERM] = n->gx[i];
@@ -592,8 +443,8 @@ static void noise_init(PerlinNoise *n)
     }
 }
 
-/* Reset the camera + knobs to defaults and regenerate the terrain. Leaves
- * `paused` untouched (the 'r' key resets the world without un-pausing). */
+/* Back to a fresh start with new terrain. Deliberately leaves `paused` alone,
+ * so pressing 'r' while paused resets the world without un-pausing it. */
 static void landscape_reset(Landscape *ld)
 {
     ld->scroll = 0.f;
@@ -602,42 +453,24 @@ static void landscape_reset(Landscape *ld)
     noise_init(&ld->noise);
 }
 
-/* Full startup init: a clean (running) landscape. */
 static void landscape_init(Landscape *ld)
 {
     ld->paused = false;
     landscape_reset(ld);
 }
 
-/* ===================================================================== */
-/* §5  EFFECTS  -- cosmetic-only state                                   */
-/* ===================================================================== */
+/* ── §5  effects: none — nothing cosmetic is stored between frames ── */
+/* ── §6  delays: none — the only timing state is the pause toggle ── */
 
-/* No EFFECTS layer. There is no stored cosmetic state: the stars are a pure
- * positional hash (is_star, §3) and every terrain glyph/colour is derived at
- * render time from the noise field — nothing is kept between frames to glow,
- * trail or fade. */
+/* ── §7  render: turn the world into screen output (never changes it) ── */
 
-/* ===================================================================== */
-/* §6  DELAYS  -- pauses, holds, timers                                  */
-/* ===================================================================== */
-
-/* No DELAYS layer to speak of: the only timing state is Landscape.paused, a
- * single toggle checked in main()`s tick (§8). No holds, countdowns or timers;
- * the frame cap is PERFORMANCE (§2). */
-
-/* ===================================================================== */
-/* §7  RENDER  -- state -> screen (reads only, never mutates sim)        */
-/* ===================================================================== */
-
-/* state -> screen. Reads the Scene (its Landscape, theme and geometry),
- * sampling terrain via §3 LOGIC; writes ONLY the ncurses back buffer and the
- * colour-pair table. Never mutates simulation state. */
+/* These read the Scene and draw it; they only ever write to ncurses and the
+ * colour table, never back to the world. */
 
 static void theme_apply(int t)
 {
     const Theme *th = &k_themes[t];
-    /* All terrain pairs use -1 background so the sky stays transparent */
+    /* every slot gets the terminal-default background so the sky shows through */
     if (COLORS >= 256) {
         init_pair(CP_SKY_HI, th->c[0], -1);
         init_pair(CP_SKY_LO, th->c[1], -1);
@@ -670,13 +503,13 @@ static void color_init(int theme)
     start_color();
     use_default_colors();
     theme_apply(theme);
-    /* Action legend stays a fixed bright cyan across all themes (HUD
-     * standard); theme_apply() never touches it, so set it once here. */
+    /* the key legend is always cyan whatever the theme, so set it once here
+     * instead of in theme_apply() (which never touches it) */
     init_pair(CP_HINT, (COLORS >= 256) ? 51 : COLOR_CYAN, -1);
 }
 
-/* Draw s at (row,col) in pair|attr, clipped to `cols` (the terminal width) so
- * a long line can never wrap onto the next row and corrupt the display. */
+/* Draw a string, but cut it off at the right edge so a long line can't spill
+ * onto the next row and mess up the display. */
 static void hud_draw(int cols, int row, int col, int pair, int attr, const char *s)
 {
     if (col < 0) col = 0;
@@ -684,26 +517,26 @@ static void hud_draw(int cols, int row, int col, int pair, int attr, const char 
     if (avail <= 0) return;
     char buf[256];
     snprintf(buf, sizeof buf, "%s", s);
-    if ((int)strlen(buf) > avail) buf[avail] = '\0';   /* truncate, no wrap */
+    if ((int)strlen(buf) > avail) buf[avail] = '\0';   /* cut, don't wrap */
     attron(COLOR_PAIR(pair) | attr);
     mvprintw(row, col, "%s", buf);
     attroff(COLOR_PAIR(pair) | attr);
 }
 
-/* The HUD overlay: top two rows = data, bottom row = actions (project
- * standard). Every line is width-clipped by hud_draw(). */
+/* The status overlay: title and run-state on top, current settings underneath,
+ * and the key legend on the bottom row. */
 static void draw_hud(const Scene *sc)
 {
     int cols = sc->cols;
 
-    /* Row 0 left — title (bold so row 0 stays dominant). */
+    /* top-left: title (bold so it stands out) */
     hud_draw(cols, 0, 1, CP_HUD, A_BOLD, " PARALLAX LANDSCAPE ");
 
-    /* Row 0 right — run state, right-aligned. */
+    /* top-right: running or paused */
     const char *state = sc->landscape.paused ? " PAUSED " : " scrolling ";
     hud_draw(cols, 0, cols - (int)strlen(state), CP_HUD, A_BOLD, state);
 
-    /* Row 1 — parameters (no bold). */
+    /* second row: the live settings */
     char buf[256];
     snprintf(buf, sizeof buf,
              " scroll:%.0f  speed:%+.2f  zoom:%.1fx  theme:%s ",
@@ -711,14 +544,14 @@ static void draw_hud(const Scene *sc)
              (double)sc->landscape.zoom, k_themes[sc->theme].name);
     hud_draw(cols, 1, 0, CP_HUD, A_NORMAL, buf);
 
-    /* Bottom row — action / key legend. */
+    /* bottom row: the key legend */
     hud_draw(cols, sc->rows - 1, 0, CP_HINT, A_BOLD,
              " q:quit  p:pause  r:reset  <-/->:speed/dir  +/-:zoom  t:theme ");
 }
 
-/* Repaint the whole frame: for every column find its three parallax ridges,
- * then paint each cell by the band it falls in (painter's algorithm, far→near
- * already baked into the band order); finally lay the HUD over the top. */
+/* Repaint the whole picture: for each column work out its three ridges, fill
+ * the column top to bottom (sky first, then far/mid/near in order so each
+ * paints over the one behind), and finally lay the HUD on top. */
 static void scene_draw(const Scene *sc)
 {
     int draw_rows = sc->rows - HUD_TOP - HUD_BOTTOM;
@@ -740,14 +573,11 @@ static void scene_draw(const Scene *sc)
     draw_hud(sc);
 }
 
-/* ===================================================================== */
-/* §8  APP  -- signals, lifecycle, per-frame combine loop                */
-/* ===================================================================== */
+/* ── §8  app: signals, startup/shutdown, the main loop ── */
 
-/* Owns the signal flags, terminal lifecycle and the main loop. main() is the
- * ONE place that combines the layers per frame, in fixed order (see the
- * ARCHITECTURE block). User events — key handling and SIGWINCH resize —
- * mutate state but are NOT part of the per-frame advance. */
+/* main() sets up the terminal, then runs the one loop that ties it all
+ * together each frame. Keypresses and window resizes do change things, but
+ * they're separate from the steady camera advance. */
 
 static void sig_h(int s)
 {
@@ -772,7 +602,7 @@ int main(void)
     getmaxyx(stdscr, sc.rows, sc.cols);
     landscape_init(&sc.landscape);
 
-    Landscape *ld = &sc.landscape;   /* alias for the per-frame combine below */
+    Landscape *ld = &sc.landscape;   /* shorthand for the loop below */
 
     while (!g_quit) {
 
@@ -782,7 +612,7 @@ int main(void)
             getmaxyx(stdscr, sc.rows, sc.cols);
         }
 
-        /* USER EVENTS — mutate state but are NOT part of the scroll advance. */
+        /* read whatever key was pressed and act on it */
         int ch = getch();
         switch (ch) {
         case 'q': case 'Q': case 27: g_quit = 1; break;
@@ -805,13 +635,13 @@ int main(void)
 
         long long now = clock_ns();
 
-        if (!ld->paused) ld->scroll += ld->speed;   /* SIMULATION: one step */
+        if (!ld->paused) ld->scroll += ld->speed;   /* move the camera one step */
 
         erase();
-        scene_draw(&sc);                            /* RENDER (reads only) */
+        scene_draw(&sc);
         wnoutrefresh(stdscr);
         doupdate();
-        clock_sleep_ns(RENDER_NS - (clock_ns() - now));
+        clock_sleep_ns(RENDER_NS - (clock_ns() - now));   /* hold ~30 fps */
     }
     return 0;
 }

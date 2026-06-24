@@ -1,364 +1,20 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * procedural_constellation.c
- *   — Procedural constellation generator: place anchor stars in the
- *     sky, connect them with one of fifteen graph topologies,
- *     give the result a Latin-flavoured procedural name, and animate
- *     the "discovery" star-by-star and line-by-line.
+ * procedural_constellation.c — makes up constellations and reveals them.
  *
- * DEMO: A faint dust of background stars fills the screen. After a
- *       moment, brighter "anchor" stars wink into existence in a
- *       loose cluster. Once they are all lit, glowing dotted LINES
- *       trace out between them — connecting the stars into a single
- *       graph. The shape of that graph depends on the active pattern:
+ * Scatters a handful of bright "anchor" stars, connects them with one of
+ * fifteen line patterns (tree, chain, loop, ...), gives the figure a made-up
+ * Latin-ish name, and animates the whole "discovery" star by star then line by
+ * line. A faint twinkling backdrop of dots fills the rest of the sky.
  *
- *         TREE    minimum-spanning-tree on the anchor stars
- *                 (organic branching shape — Orion-like)
- *         CHAIN   anchor stars sorted left-to-right and connected
- *                 sequentially (Cassiopeia / Big Dipper-like)
- *         LOOP    polar-sorted around the cluster centroid and
- *                 connected in a cycle (Pegasus / Crown-like)
- *         SPOKE   one central star plus radial spokes to all others
- *                 (Crux / simple-cross-like)
+ * Sister files: ../worldgen/procedural_galaxy.c (a dense FIELD of stars, the
+ * opposite of this sparse named GRAPH); ../fractal_random/lightning.c (same
+ * line-drawing trick, applied to an animated lightning bolt).
  *
- *       When the trace finishes, a procedurally-generated name
- *       ("Aurelia Major", "Lyrenor", "Cygnara Borealis", ...) fades
- *       in below the figure. After a brief HOLD, the sky clears and the
- *       next constellation begins to discover itself.
- *
- * Study alongside:
- *   ../worldgen/procedural_galaxy.c
- *      — also stars, but a dense FIELD of them rendered from a
- *        density function. This file is the opposite: a SPARSE GRAPH
- *        of named anchor stars connected by deliberate edges.
- *   ../fractal_random/lightning.c
- *      — same Bresenham line-rasterisation idea applied to a single
- *        animated bolt of lightning instead of a static graph.
- *
- * Section map (re-cut by CONCERN — see ARCHITECTURE block below):
- *   §1 CONFIG       — constants, data tables, core state types
- *   §2 PERFORMANCE  — timing primitives (throttle policy lives in main)
- *   §3 LOGIC        — pure decisions: no mutation, no I/O
- *   §4 SIMULATION   — generation (place/topology/name) + the reveal tick
- *   §5 EFFECTS      — cosmetic-only state (one-line note: none stored)
- *   §6 DELAYS       — pauses, holds, timers (one-line note: phase machine)
- *   §7 RENDER       — state → screen; reads only, never mutates
- *   §8 APP          — user events + per-tick combine + main loop
- *
- * Keys:
- *   q / ESC    quit
- *   space      pause / resume the discovery animation
- *   r          regenerate constellation with a new seed
- *   n / N      next pattern  (cycles all 15: TREE, CHAIN, LOOP, SPOKE,
- *              WHEEL, FAN, STARPOLY, NEAREST, MESH, ARCH, BINARY, CROSS,
- *              TRIANGLES, SPIRAL, CATERPILLAR)
- *   p / P      previous pattern
- *   t / T      next / previous theme
- *   + / =      faster reveal
- *   -          slower
- *   ] / [      raise / lower tick Hz
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra \
- *     procedural/worldgen/procedural_constellation.c \
- *     -o constellation -lncurses -lm
+ * Build: gcc -std=c11 -O2 -Wall -Wextra
+ *        procedural/worldgen/procedural_constellation.c -o constellation
+ *        -lncurses -lm
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Three pieces composed together.
- *
- *                  (1) POINT PLACEMENT — a Poisson-ish jittered grid.
- *                      Subdivide a rectangular sky region into roughly
- *                      √N × √N cells; place ONE star in each cell at a
- *                      hash-driven offset from the cell centre. Result:
- *                      stars look organically scattered (no obvious
- *                      grid) but the minimum inter-star distance is
- *                      bounded below — none of the stars cluster in one
- *                      corner. This is the same trick stippling
- *                      algorithms use to avoid white-noise clumping.
- *
- *                  (2) GRAPH TOPOLOGY — the constellation "shape" is
- *                      really just an edge set over the anchor stars.
- *                      Fifteen edge-selection rules; the four canonical
- *                      ones below each correspond to a real-world
- *                      constellation morphology:
- *
- *                        TREE  : Minimum Spanning Tree via Prim's
- *                                algorithm. N-1 edges, connected,
- *                                no cycles. Mimics branched
- *                                constellations (Orion, Hercules).
- *                        CHAIN : sort by x, connect sequentially.
- *                                N-1 edges arranged left-to-right.
- *                                Mimics Cassiopeia / Big Dipper.
- *                        LOOP  : sort by polar angle around the
- *                                centroid, connect into a cycle.
- *                                N edges forming a closed polygon.
- *                                Mimics Pegasus / Corona.
- *                        SPOKE : pick the star nearest the centroid;
- *                                connect every other star to it.
- *                                N-1 edges all meeting at one hub.
- *                                Mimics Crux / simple-cross figures.
- *
- *                      The other eleven (WHEEL, FAN, STARPOLY, NEAREST,
- *                      MESH, ARCH, BINARY, CROSS, TRIANGLES, SPIRAL,
- *                      CATERPILLAR) layer more graph shapes — cycle+hub,
- *                      crossing star-polygons, k-nearest webs, two-cluster
- *                      binaries, spirals — over the same star set.
- *
- *                  (3) BRESENHAM LINE RASTERISATION — to draw an edge
- *                      between two integer cells we walk every cell
- *                      that lies along the line using Jack Bresenham's
- *                      1965 algorithm. The animated "trace" effect is
- *                      just a partial Bresenham: at reveal_t ∈ [0,1]
- *                      we plot the first ⌈reveal_t · steps⌉ cells.
- *                      The glyph at each cell is chosen from the
- *                      segment's overall direction:
- *                         dx ≫ dy → '-'    horizontal segment
- *                         dy ≫ dx → '|'    vertical segment
- *                         same-sign dx, dy → '\\'   down-right or up-left
- *                         opp-sign         → '/'    down-left or up-right
- *
- *                  Plus PROCEDURAL NAMING — pick one of N prefix roots
- *                  ("Auri", "Lyr", "Cygn"...) plus one of M suffixes
- *                  ("us", "ina", "ax"...) plus one of K modifiers
- *                  ("", "Major", "Borealis"...) all from the same
- *                  hash. Yields ~5000 unique names with constellation
- *                  flavour without any list of full names.
- *
- * Data-structure : Tiny — at most 12 stars and 24 edges in fixed
- *                  arrays. Stars have (x, y, twinkle_phase, reveal_t).
- *                  Edges have (from, to, reveal_t). Plus a 32-byte
- *                  name buffer. Total state per constellation: a few
- *                  hundred bytes. No allocations, no heap.
- *
- * Rendering      : ASCII only. Two layers:
- *                    - BACKDROP : every screen cell rolls a hash; if
- *                                 mod BG_DENSITY == 0 paint a faint
- *                                 '.' or '`' star. Twinkle modulated
- *                                 per-cell by time so the field shimmers.
- *                    - CONSTELLATION : revealed anchor stars as bright
- *                                 '*' / 'O' (BOLD); revealed edges as
- *                                 a Bresenham trail of '-' '|' '/' '\\'
- *                                 in the line tint (DIM); name label
- *                                 in a dedicated bright tint.
- *
- * Performance    : The whole rendering is O(W·H) backdrop hashing +
- *                  O(N²) MST + a few hundred Bresenham steps per
- *                  edge. Trivial — <1 ms / frame at 240×80×60 fps.
- *                  No per-tick allocation.
- *
- * References     :
- *
- *   Graph topologies (the 15 edge-selection rules) —
- *   • West, D.B. — "Introduction to Graph Theory" (2nd ed., 2001). The
- *     named families used here: path (CHAIN), cycle (LOOP), star (SPOKE),
- *     wheel (WHEEL), tree / spanning tree (TREE), etc.
- *   • Prim, R. (1957) — "Shortest connection networks and some
- *     generalizations", Bell System Tech. J. 36(6). The MST → TREE.
- *     https://en.wikipedia.org/wiki/Prim%27s_algorithm
- *   • Jaromczyk, J.W. & Toussaint, G.T. (1992) — "Relative neighborhood
- *     graphs and their relatives", Proc. IEEE 80(9). Proximity graphs —
- *     the 1- and 2-nearest-neighbour graphs behind NEAREST / MESH, and how
- *     the NN-graph, RNG and MST nest.
- *   • Wikipedia — "Star polygon" (the {n/2} crossing construction → STARPOLY)
- *     https://en.wikipedia.org/wiki/Star_polygon
- *
- *   Point placement & rendering —
- *   • Lloyd, S. (1982) — "Least squares quantization in PCM". The relaxation
- *     dual of the jittered-grid star scatter.
- *   • Wikipedia — "Poisson-disk sampling" (even-but-organic point spacing)
- *     https://en.wikipedia.org/wiki/Supersampling#Poisson_disc
- *   • Bresenham, J. (1965) — "Algorithm for computer control of a digital
- *     plotter", IBM Systems Journal 4(1):25-30. Integer line rasterisation
- *     — drawn partially (reveal_t) for the animated edge "trace".
- *     https://en.wikipedia.org/wiki/Bresenham%27s_line_algorithm
- *
- *   Domain —
- *   • Wikipedia — "Constellation"  https://en.wikipedia.org/wiki/Constellation
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * A constellation is two things and only two things: a small set of
- * points scattered in the sky, and a set of edges that someone — long
- * ago, around a fire — drew between those points to make a picture.
- * The points come first; the edges come second; the picture is
- * imaginary. Procedurally, we generate the points (jittered grid),
- * pick the edges (one of fifteen rules), draw the lines (Bresenham),
- * and slap on a name. There is nothing else.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine punching ten holes through a sheet of black paper, then
- * drawing pencil lines BETWEEN selected pairs of holes. The holes are
- * the stars; the pencil lines are the constellation. Different
- * constellations differ ONLY in (a) where you punched the holes and
- * (b) which pairs you chose to connect with pencil. Both are choices;
- * neither is intrinsic to the stars.
- *
- * Now: replace "punch holes" with "place jittered points in a grid",
- * and replace "draw pencil lines" with one of fifteen small algorithms.
- * That is the entire generator. The reason the result LOOKS like a
- * real constellation is that real constellations were drawn by humans
- * subject to the same constraints: stars roughly evenly distributed
- * across the visible sky, and edges chosen for a clear shape (mostly
- * short hops, every star reached — though a few patterns bend this on
- * purpose: STARPOLY crosses its own lines, BINARY leaves two clusters).
- *
- * The first FOUR topologies mirror the morphological families real
- * constellations fall into:
- *   - branchy ones (Orion, Hercules)            → MST  (TREE)
- *   - linear ones (Big Dipper, Cassiopeia's W)  → CHAIN
- *   - closed ones (Pegasus square, Corona)      → LOOP
- *   - radial ones (Crux, the Cross)             → SPOKE
- * The remaining eleven extend the catalogue with more graph shapes —
- * wheel, fan, star-polygon, nearest-neighbour mesh, arch, binary, cross,
- * triangulation, spiral, caterpillar — for variety as the sky cycles.
- * Picking one and applying it consistently produces a recognisable
- * constellation flavour every time.
- *
- * ALGORITHM IN STEPS
- * ──────────────────
- *  1. PICK N. Random integer in [5, 10] depending on pattern.
- *  2. PLACE N STARS in a region of size REG_W × REG_H:
- *     a. cols = round(√N), rows = ⌈N / cols⌉
- *     b. cell_w = REG_W / cols,  cell_h = REG_H / rows
- *     c. for each cell (c, r) in row-major order, until N stars:
- *           h = hash3(c, r, seed)
- *           jitter_x = ((h        & 0x3FF) − 512) · cell_w / 2048
- *           jitter_y = ((h >> 10) & 0x3FF) − 512) · cell_h / 2048
- *           star.x = c·cell_w + cell_w/2 + jitter_x
- *           star.y = r·cell_h + cell_h/2 + jitter_y
- *  3. BUILD EDGES per pattern:
- *       TREE  : Prim's. Maintain a "in_tree[]" bitset; repeatedly add
- *               the cheapest cross-edge until N-1 edges placed.
- *       CHAIN : sort stars by x; emit edges 0-1, 1-2, …, (N-2)-(N-1).
- *       LOOP  : compute centroid; sort stars by atan2(y-cy, x-cx);
- *               emit edges 0-1, 1-2, …, (N-1)-0.
- *       SPOKE : compute centroid; pick hub = nearest star to centroid;
- *               emit one edge from hub to every other star.
- *  4. NAME the constellation:
- *       prefix    = PREFIXES[hash(seed, 1) mod N_P]
- *       suffix    = SUFFIXES[hash(seed, 2) mod N_S]
- *       modifier  = MODIFIERS[hash(seed, 3) mod N_M]
- *       name      = prefix ++ suffix ++ (" " ++ modifier  if non-empty)
- *  5. ANIMATE in four phases:
- *       PHASE_DRAW_STARS : reveal stars one by one, fade-in over
- *                          PHASE_STARS_TOTAL seconds.
- *       PHASE_DRAW_EDGES : reveal edges in order, each over
- *                          PHASE_EDGE_TIME seconds. Per-edge
- *                          reveal_t ∈ [0,1] drives the partial
- *                          Bresenham plot.
- *       PHASE_HOLD       : freeze the figure, fade in the name.
- *       PHASE_FADE       : brief dwell, then regenerate.
- *
- * KEY FORMULAS
- * ────────────
- *  Bresenham (one cell per step, integer-only):
- *     dx, dy = |x1-x0|, |y1-y0|
- *     sx, sy = sign(x1-x0), sign(y1-y0)
- *     err    = dx − dy
- *     each step:
- *       plot(x, y)
- *       if 2·err >= -dy: err -= dy; x += sx
- *       if 2·err <=  dx: err += dx; y += sy
- *     stop when (x, y) == (x1, y1)
- *
- *  Animated partial Bresenham:
- *     total_steps = max(|dx|, |dy|) + 1
- *     step_limit  = ⌈reveal_t · total_steps⌉
- *
- *  Line-segment glyph from segment direction (dx, dy):
- *       |dx| ≥ 2·|dy|              → '-'
- *       |dy| ≥ 2·|dx|              → '|'
- *       sign(dx) == sign(dy)       → '\\'
- *       sign(dx) != sign(dy)       → '/'
- *
- *  Prim's MST (best-cross-edge until tree spans all N):
- *     while tree.size < N:
- *       pick (i, j) with i in tree, j not in tree, minimising d(i,j)²
- *       add j to tree; emit edge (i, j)
- *
- *  Polar sort key for LOOP topology:
- *     θ_i = atan2(y_i − cy, x_i − cx)         // centroid (cx, cy)
- *     sort stars[] ascending by θ_i           // counterclockwise cycle
- *
- *  Procedural name:
- *     name = prefix[hash%N_P]  ⊕  suffix[hash%N_S]  ⊕  modifier[hash%N_M]
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • REGION TOO SMALL. If the constellation region is narrower than
- *    cols, the jittered-grid placement collapses (cell_w < 1) and
- *    multiple stars overlap. Clamp REG_W ≥ 16 and REG_H ≥ 8 in the
- *    layout step; on tiny terminals this means the constellation
- *    region grows to fill the whole sky, which is fine.
- *
- *  • DUPLICATE STAR POSITIONS. With heavy jitter two stars in
- *    adjacent cells COULD land on the same (x, y). The MST is robust
- *    to that (zero-distance edges just fold the duplicates), but the
- *    rendering double-draws which looks weird. Reduce JITTER_FRAC
- *    below 0.5 so adjacent cells don't overlap.
- *
- *  • PRIM'S TIE-BREAKING. When two cross-edges have identical
- *    distance², the loop picks the first one found. That makes the
- *    MST seed-dependent in subtle ways (insertion order). It's
- *    deterministic — same seed, same MST — and that's all we need.
- *
- *  • LOOP WITH N=2. The polygon collapses to two points joined by
- *    two coincident edges. Skip LOOP for very small N.
- *
- *  • SORTING IN PLACE. CHAIN sorts stars[] by x, LOOP sorts by angle.
- *    The edge indices reference positions IN THE SORTED array, so
- *    the order matters. Don't re-sort after edge construction.
- *
- *  • LINE OFF-SCREEN. Bresenham can step into cells that are out of
- *    the renderable region (HUD rows, off-screen). Always bounds-
- *    check before mvaddch — the algorithm doesn't know about the HUD.
- *
- *  • REVEAL_T = 1.0 OFF-BY-ONE. ⌈1·total_steps⌉ might be one fewer
- *    than total_steps when total_steps is small and reveal_t is very
- *    slightly < 1. Let the fully-reached state plot ALL cells by
- *    using > 0.999 as the "complete" guard.
- *
- *  • NAME OVERFLOW. snprintf truncates if prefix+suffix+modifier is
- *    longer than the name buffer. Size the buffer to comfortably hold
- *    the longest combination of the largest fragment lengths.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • Pause (space) during DRAW_EDGES: a partially-traced edge freezes
- *    mid-draw. Resume: the edge continues from exactly where it
- *    paused. Verifies the fixed-step accumulator + reveal_t logic.
- *
- *  • Press 'r': regenerate. The new constellation has a
- *    DIFFERENT name and DIFFERENT star arrangement, but the topology
- *    family is the same as the active pattern.
- *
- *  • TREE pattern: count edges. Should be exactly (n_stars − 1). The
- *    edge graph should be CONNECTED (every star reachable from every
- *    other via edges) but ACYCLIC (no closed loops).
- *
- *  • CHAIN pattern: edges should run left-to-right with no crossings,
- *    each edge connecting horizontally-adjacent stars in the sort order.
- *
- *  • LOOP pattern: count edges = n_stars exactly. The edges should
- *    form a closed polygon (no break, no fork, every star is endpoint
- *    of exactly two edges).
- *
- *  • SPOKE pattern: one star is the endpoint of EVERY edge. That hub
- *    star should be visually near the centroid of the cluster.
- *
- *  • NAMING: trying many seeds should produce many different names
- *    with constellation flavour ("Aurelia", "Lyrenus", "Pegonor")
- *    rather than gibberish or repeats. With ~30 prefixes × 16
- *    suffixes × 10 modifiers, expect <0.05% repeat rate over 100 trials.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -376,62 +32,18 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ── ARCHITECTURE ─────────────────────────────────────────────────────── *
- *
- * Re-cut from first principles into separated concern-layers (a SEPARATION
- * pass: RELOCATE + LABEL only — every function body is byte-identical, nothing
- * renamed). Layer → section → what it mutates:
- *
- *   LAYER        §   MUTATES
- *   ─────────────────────────────────────────────────────────────────────
- *   CONFIG       §1  nothing — compile-time constants + const data tables
- *                    (themes, name fragments) + the core state types (Star,
- *                    Edge, Constellation, Phase), relocated up so the pure §3
- *                    helpers can see them.
- *   PERFORMANCE  §2  nothing — clock_ns / clock_sleep_ns are pure timers; the
- *                    frame cap + fixed-timestep accumulator are POLICY in main.
- *   LOGIC        §3  nothing — pure reads/maps: hash3, pattern_name, phase_name,
- *                    star_centroid, nearest_to, has_edge, bres_steps,
- *                    line_glyph_for, reveal_at (the staggered fade ramp),
- *                    jitter_offset. They only READ, so no RENDER/EFFECTS
- *                    reordering can corrupt them.
- *   SIMULATION   §4  Constellation.{stars,edges,n_*,name,seed,region_*} and
- *                    Scene.{con,phase,phase_t,total_t,paused,speed,
- *                    current_theme,current_pattern,sky_seed}. Generation
- *                    (constellation_gen → place_stars + make_* + gen_name) and
- *                    the per-tick reveal advance (scene_tick). Only writers.
- *   EFFECTS      §5  (none) — no stored cosmetic buffer; the twinkle is
- *                    render-derived. One-line section, not a real layer.
- *   DELAYS       §6  (none) — the HOLD + FADE dwells are phases of the scene
- *                    machine, timed inside scene_tick (§4). One-line section.
- *   RENDER       §7  ncurses back buffer + colour-pair table only (theme_apply,
- *                    color_init, draw_*, scene_draw, screen_draw). Reads §4
- *                    state via the §3 deciders; never writes simulation state.
- *   APP          §8  App.{running,need_resize,sim_fps}; drives Scene via the
- *                    combine + user events.
- *
- * PER-TICK COMBINE (the one place state advances — main(), §8):
- *
- *     while (sim_accum >= tick_ns)        // PERFORMANCE: fixed timestep
- *         scene_tick()                    //   SIMULATION (reveal) + DELAYS
- *     screen_draw() ; screen_present()    // RENDER (reads only; twinkle
- * derived) getch() → app_handle_key()          // USER EVENTS — see below
- *
- * Nothing other than scene_tick() advances simulation state. User events
- * (app_handle_key / app_do_resize) mutate Scene/Screen on a keypress or
- * SIGWINCH — and a key may trigger a full regeneration — but they run once per
- * frame OUTSIDE the accumulator loop, not as part of the tick.
- *
- * ─────────────────────────────────────────────────────────────────────── */
+/* The file is split into eight sections by what they touch. §1 config and the
+ * data tables. §2 timing helpers. §3 pure helpers that only read and decide.
+ * §4 the only code that changes the simulation (generate a sky, advance the
+ * reveal). §5/§6 are placeholders kept for layout symmetry — they hold no real
+ * code here. §7 drawing. §8 the main loop. Only scene_tick() (§4) advances the
+ * animation; keypresses and resizes change things too but happen outside the
+ * tick loop, once per frame. */
 
-/* ===================================================================== */
-/* §1  CONFIG  -- constants, data tables, core state types               */
-/* ===================================================================== */
+/* §1  config — constants, data tables, core types */
 
 enum {
-  /* Maximum number of anchor stars in a constellation. 12 covers
-   * even Orion's 17-star canonical figure compactly enough for
-   * an ASCII showcase. Larger N starts to look noisy. */
+  /* At most 12 bright stars per figure — more starts to look like noise. */
   N_STARS_MAX = 12,
   N_EDGES_MAX = 24,
 
@@ -447,103 +59,82 @@ enum {
   HUD_COLS = 80,
   FPS_UPDATE_MS = 500,
 
-  /* Background-star density: 1 in N cells in the sky carries a
-   * faint star. 60 → ~1.7 % of the sky; subtle sprinkle. */
+  /* How thinly the faint backdrop dots are sprinkled: 1 cell in 60. */
   BG_STAR_DENSITY = 60,
 
-  /* Color pair indices.  PAIR_HUD/PAIR_HINT reserved per CLAUDE.md. */
+  /* Color-pair slots. HUD/HINT are reserved by the project HUD standard. */
   PAIR_HUD = 1,
   PAIR_HINT = 2,
-  PAIR_BG_STAR = 3,   /* dim background sprinkle         */
-  PAIR_LINE = 4,      /* constellation lines             */
-  PAIR_STAR_BASE = 5, /* +0..+3 = 4 anchor-star tints    */
-  PAIR_NAME = 9,      /* constellation name              */
+  PAIR_BG_STAR = 3,   /* faint backdrop dots             */
+  PAIR_LINE = 4,      /* the constellation lines         */
+  PAIR_STAR_BASE = 5, /* +0..+3 = the 4 anchor-star tints*/
+  PAIR_NAME = 9,      /* the name caption                */
 };
 
 #define NS_PER_SEC 1000000000LL
 #define NS_PER_MS 1000000LL
 #define TICK_NS(f) (NS_PER_SEC / (f))
 
-/*
- * Animation timings (in seconds). The "speed" knob multiplies these
- * inversely — speed=16 doubles the rate, speed=4 halves it.
- */
-#define PHASE_STARS_TOTAL 1.6f /* full reveal of all anchor stars */
-#define PHASE_EDGE_TIME 0.30f  /* time to draw one edge           */
-#define PHASE_HOLD_TIME 6.0f   /* dwell once finished             */
-#define PHASE_FADE_TIME 0.6f   /* brief dwell before regenerating */
+/* How long each step of the animation takes, in seconds. The "speed" knob
+ * scales these: higher speed = faster reveal. */
+#define PHASE_STARS_TOTAL 1.6f /* time to light up all the stars  */
+#define PHASE_EDGE_TIME 0.30f  /* time to draw one line           */
+#define PHASE_HOLD_TIME 6.0f   /* how long to sit and admire it   */
+#define PHASE_FADE_TIME 0.6f   /* brief pause before the next sky */
 
-/* Anchor-star twinkle frequency (Hz): how fast a fully-revealed star pulses. */
+/* How fast a fully-lit star pulses, in pulses per second. */
 #define TWINKLE_HZ 0.6f
 
-/*
- * Jittered-grid star placement: maximum offset from cell centre as a
- * fraction of cell size. 0.40 keeps adjacent cells from overlapping
- * but feels organic.
- */
+/* How far a star is nudged off its grid-cell centre, as a fraction of the cell.
+ * 0.40 looks scattered without letting neighbouring stars overlap. */
 #define JITTER_FRAC 0.40f
 
-/*
- * ── Pattern ───────────────────────────────────────────────────────────── *
- * Fifteen edge-selection rules over the SAME anchor-star set. The intent: the
- * "shape" of a constellation is not the stars (those are placed once, the same
- * way for every pattern) but the GRAPH drawn over them — so a constellation
- * family is just a graph topology. Each enum value selects one make_* builder
- * (§4); none move the stars. The first four mirror the morphological families
- * real constellations fall into (branchy / linear / closed / radial); the rest
- * extend the catalogue (wheel, fan, crossing star-polygon, k-nearest mesh, …).
- * REFS: graph families — West, "Introduction to Graph Theory"; see file header.
- */
+/* Pattern — which of fifteen ways to connect the stars with lines.
+ *
+ * The stars are placed the same way every time; the PATTERN is only about which
+ * lines get drawn between them. So a constellation's "shape" really is just a
+ * choice of how to wire up the same dots. Each value picks one make_* builder
+ * in §4. The first four echo the four families real constellations fall into
+ * (branchy, straight-line, closed loop, spokes from a hub); the rest add more
+ * shapes for variety. */
 typedef enum {
-  PATTERN_TREE = 0,    /* MST — sparse organic branching         */
-  PATTERN_CHAIN,       /* left→right path                        */
-  PATTERN_LOOP,        /* convex cycle around the centroid       */
-  PATTERN_SPOKE,       /* central hub + spokes to all            */
-  PATTERN_WHEEL,       /* rim cycle + hub spokes (a wheel)        */
-  PATTERN_FAN,         /* one corner apex, rays to all (a fan)    */
-  PATTERN_STARPOLY,    /* star polygon — edges CROSS (pentagram)  */
-  PATTERN_NEAREST,     /* each star to its 1 nearest (scatter)    */
-  PATTERN_MESH,        /* each star to its 2 nearest (a web)      */
-  PATTERN_ARCH,        /* open angular arc (a crown)              */
-  PATTERN_BINARY,      /* two separate clusters (a binary)        */
-  PATTERN_CROSS,       /* two interleaved chains (a weave)        */
-  PATTERN_TRIANGLES,   /* apex fan + arc → tiled triangles        */
-  PATTERN_SPIRAL,      /* inner→outer by radius (an arm)          */
-  PATTERN_CATERPILLAR, /* x-sorted spine + leaves                 */
+  PATTERN_TREE = 0,    /* sparse organic branching, no loops     */
+  PATTERN_CHAIN,       /* a left-to-right line                   */
+  PATTERN_LOOP,        /* a closed ring                          */
+  PATTERN_SPOKE,       /* a central hub with spokes to all       */
+  PATTERN_WHEEL,       /* a ring plus spokes from the centre      */
+  PATTERN_FAN,         /* rays fanning out from one corner star    */
+  PATTERN_STARPOLY,    /* a star/pentagram whose lines cross      */
+  PATTERN_NEAREST,     /* each star linked to its 1 nearest        */
+  PATTERN_MESH,        /* each star linked to its 2 nearest (web)  */
+  PATTERN_ARCH,        /* an open sweeping arc                     */
+  PATTERN_BINARY,      /* two separate little clusters             */
+  PATTERN_CROSS,       /* two chains woven across each other       */
+  PATTERN_TRIANGLES,   /* a fan plus an arc, tiled into triangles  */
+  PATTERN_SPIRAL,      /* one arm winding inner to outer           */
+  PATTERN_CATERPILLAR, /* a spine with leaves hanging off it       */
   N_PATTERNS,
 } Pattern;
 
-/* ── Theme ─────────────────────────────────────────────────────────────── *
- * WHAT  One named colour palette (10 ship; t/T cycles). A theme assigns a
- *       256-colour code to every drawable element; theme_apply() loads them
- *       into the ncurses pairs. Same 10-name menu as the sibling showcases.
+/* Theme — one named colour scheme (10 of them; t/T cycles).
  *
- * VALUE LOGIC  Five roles, each a separate slot so the backdrop, lines, stars
- *       and caption can be tinted independently: bg_star (the faint sky
- *       sprinkle — theme-tinted, not gray, so each sky has character), line
- *       (the constellation edges), star[4] (four anchor-star tints, picked
- *       per star by Star.color_idx so neighbours differ), name_color (the
- *       caption). Every code sits in the BRIGHT half of the cube so even A_DIM
- *       cells stay legible on default-black. REFS: documentation/COLOR.md. */
+ * Each part of the picture gets its own colour slot so they can be tinted
+ * independently. theme_apply() loads these into the ncurses colour pairs. Every
+ * colour is kept in the bright half of the 256-colour space so nothing
+ * disappears against a black terminal. See documentation/COLOR.md. */
 typedef struct {
-  const char *name; /* HUD label (t/T cycles)                       */
-  short bg_star;    /* faint backdrop-sprinkle tint                 */
-  short line;       /* constellation edge tint                      */
-  short star[4];    /* 4 anchor-star tints, indexed by Star.color_idx*/
-  short name_color; /* caption tint                                 */
+  const char *name; /* shown in the HUD                             */
+  short bg_star;    /* the faint backdrop dots                      */
+  short line;       /* the constellation lines                      */
+  short star[4];    /* four star tints; each star picks one by hash */
+  short name_color; /* the name caption                             */
 } Theme;
 
 #define N_THEMES 10
 
-/*
- * Tuned for legibility on dark terminals: every entry sits in the
- * brighter half of the 256-colour cube so even A_DIM cells stay
- * readable.  bg_star is theme-tinted (not generic dark gray) so
- * each backdrop carries its theme's character — green dust for
- * MATRIX, purple haze for NOVA, etc.  star[3] (the dimmest anchor
- * tint) avoids the deep-shadow indices that previously vanished
- * against a default-black terminal background.
- */
+/* All colours chosen bright so they stay readable on a dark terminal. The
+ * backdrop dots are tinted per theme (green dust for MATRIX, purple for NOVA)
+ * instead of plain gray, so each sky has its own mood. */
 static const Theme themes[N_THEMES] = {
     /* name        bg   line  star{0,1,2,3}              name_col */
     {"DEFAULT", 245, 252, {226, 230, 159, 117}, 226},
@@ -558,15 +149,10 @@ static const Theme themes[N_THEMES] = {
     {"ARCTIC", 153, 195, {231, 219, 195, 159}, 195},
 };
 
-/*
- * Procedural name fragments. The combinatorial space —
- *   ~33 prefixes × 16 suffixes × 10 modifiers  ≈ 5 280 combinations
- * — is large enough that consecutive seeds rarely collide.
- *
- * Roots are clipped so the prefix+suffix concatenation reads as a
- * single Latin-flavoured word (e.g., "Lyr" + "ax" → "Lyrax",
- * "Cygn" + "us" → "Cygnus").
- */
+/* Name pieces. A name is one prefix + one suffix + an optional modifier word.
+ * The prefixes are clipped so prefix+suffix reads as one Latin-ish word
+ * ("Lyr"+"ax" -> "Lyrax"). With ~33 x 16 x 10 = ~5000 combinations, two skies
+ * in a row almost never get the same name. */
 static const char *PREFIXES[] = {
     "Auri",   "Lyr",    "Dracon", "Cygn",  "Pegas", "Hydr",  "Casso",
     "Cepheu", "Andro",  "Boote",  "Virg",  "Aquil", "Sagit", "Capric",
@@ -582,7 +168,7 @@ static const char *SUFFIXES[] = {
 
 static const char *MODIFIERS[] = {
     "",           "",        "",
-    "",           "", /* most names are unmodified  */
+    "",           "", /* blanks: most names get no modifier */
     " Major",     " Minor",  " Borealis",
     " Australis", " Magnus",
 };
@@ -591,18 +177,16 @@ static const int N_PREFIXES = (int)(sizeof PREFIXES / sizeof PREFIXES[0]);
 static const int N_SUFFIXES = (int)(sizeof SUFFIXES / sizeof SUFFIXES[0]);
 static const int N_MODIFIERS = (int)(sizeof MODIFIERS / sizeof MODIFIERS[0]);
 
-/* ── Star ──────────────────────────────────────────────────────────────── *
- * One anchor star — a graph VERTEX, the node-link diagram's node. Placed once
- * by place_stars (a jittered grid) and never moved; the topology builders only
- * read positions and emit edges between them.
- *   x,y           position in REGION cell coords (0..region_w/h); rendered at
- *                 gx0+x, gy0+y. Some make_* sort the array in place, so an
- *                 index is only meaningful relative to the current order.
- *   twinkle_phase 0..255 → an angle fed to sinf so each star pulses out of
- *                 phase with its neighbours (no shared, lock-step flicker).
- *   color_idx     0..3, indexes Theme.star[] — a per-star tint, hash-chosen.
- *   reveal_t      0..1 fade-in progress during the DISCOVER phase; SIMULATION
- *                 state written by scene_tick, read by draw_anchor_star. */
+/* Star — one bright anchor star, a dot the lines connect.
+ *
+ * Placed once and never moved. Some patterns sort the stars[] array in place,
+ * so a star's index only means something relative to the current order.
+ *   x,y           where it sits inside the constellation region (0..region_w/h);
+ *                 drawn on screen at gx0+x, gy0+y.
+ *   twinkle_phase 0..255, a starting point for its pulse so neighbours twinkle
+ *                 out of step instead of all blinking together.
+ *   color_idx     0..3, which of the theme's four star tints to use.
+ *   reveal_t      0..1, how far this star has faded in. scene_tick writes it. */
 typedef struct {
   int x, y;
   uint8_t twinkle_phase;
@@ -610,51 +194,43 @@ typedef struct {
   float reveal_t;
 } Star;
 
-/* ── Edge ──────────────────────────────────────────────────────────────── *
- * One constellation line — a graph EDGE between two stars (indices into the
- * Constellation's stars[]). The topology IS the edge set; the 15 patterns
- * differ only in which edges they emit.
- *   reveal_t  0..1 partial-Bresenham progress during the TRACE phase: the line
- *             is drawn for its first ⌈reveal_t·steps⌉ cells, so it appears to
- *             grow from one endpoint. SIMULATION state (scene_tick writes it).
- */
+/* Edge — one line between two stars (by their index in stars[]). The set of
+ * edges IS the pattern; the fifteen patterns differ only in which lines they
+ * choose to draw.
+ *   reveal_t  0..1, how much of the line has been drawn so far. At 0.5 only the
+ *            first half is on screen, so the line looks like it's growing from
+ *            one end. scene_tick writes it. */
 typedef struct {
   int from, to;
   float reveal_t;
 } Edge;
 
-/* ── Constellation ─────────────────────────────────────────────────────── *
- * WHAT  The figure: a small node-link graph (anchor stars + the edges over
- *       them) plus its procedural name. This is the domain object every render
- *       reads; SIMULATION (§4) is its only writer, rebuilt wholesale per sky.
+/* Constellation — one whole figure: the stars, the lines between them, and the
+ * name. This is the thing the drawing code reads. It is rebuilt from scratch
+ * for every new sky; §4 is the only place that writes it.
  *
- * WHY FIXED ARRAYS  stars[]/edges[] are static (N_STARS_MAX=12, N_EDGES_MAX=24)
- *       — tiny and never malloc'd; a rebuild overwrites in place.
- *
- * VALUE LOGIC  n_stars / n_edges are the live counts (≤ the array caps); name
- *       is the generated label; seed is what this figure was grown from (also
- *       reused by the backdrop hash); region_w/h record the area the stars were
- *       placed into, so a resize knows to regenerate. REFS: node-link graph
- *       drawing + the proximity/spanning graphs behind the patterns — see the
- *       file-header References block. */
+ * The arrays are fixed-size and never malloc'd — a rebuild just overwrites them
+ * in place.
+ *   n_stars/n_edges  how many of the arrays are actually in use.
+ *   name             the made-up name.
+ *   seed             the number this figure was grown from (also reused to seed
+ *                    the backdrop sprinkle).
+ *   region_w/h       the area the stars were placed in, so a resize knows the
+ *                    layout is stale and must be regenerated. */
 typedef struct {
-  Star stars[N_STARS_MAX]; /* the vertices (graph nodes)              */
+  Star stars[N_STARS_MAX];
   int n_stars;
-  Edge edges[N_EDGES_MAX]; /* the lines (graph edges) = the topology  */
+  Edge edges[N_EDGES_MAX];
   int n_edges;
-  char name[40];          /* procedural Latin-flavoured name         */
-  int seed;               /* what this figure was generated from     */
-  int region_w, region_h; /* the cell area the stars were placed in  */
+  char name[40];
+  int seed;
+  int region_w, region_h;
 } Constellation;
 
-/* ── Phase ─────────────────────────────────────────────────────────────── *
- * The reveal animation's state machine, advanced by scene_tick (§4):
- *   DRAW_STARS — stars fade in one slice at a time ("discovery").
- *   DRAW_EDGES — edges trace in via partial Bresenham.
- *   HOLD       — figure frozen, name caption fades in (the DELAYS dwell).
- *   FADE       — a brief dwell, then scene_rebuild regenerates a new sky.
- * The order is the lifecycle; phase_t (in Scene) measures time within the
- * current phase, and the thresholds are PHASE_*_TIME (§1). */
+/* Phase — which step of the reveal animation we're in, advanced by scene_tick.
+ * They run in this order: stars fade in, then lines draw in, then the figure
+ * holds while the name appears, then a brief fade before the next sky. phase_t
+ * (in Scene) tracks the time spent in the current phase. */
 typedef enum {
   PHASE_DRAW_STARS = 0,
   PHASE_DRAW_EDGES = 1,
@@ -662,13 +238,9 @@ typedef enum {
   PHASE_FADE = 3,
 } Phase;
 
-/* ===================================================================== */
-/* §2  PERFORMANCE  -- timing primitives (throttle policy in main, §8)   */
-/* ===================================================================== */
+/* §2  timing helpers */
 
-/* Timing primitives only. The 60 fps frame cap and the fixed-timestep
- * accumulator that decides how many scene_tick()s run per frame are POLICY,
- * applied in main() (§8). */
+/* Just a clock and a sleep. The actual frame-rate pacing lives in main(). */
 
 static int64_t clock_ns(void) {
   struct timespec t;
@@ -686,19 +258,13 @@ static void clock_sleep_ns(int64_t ns) {
   nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  LOGIC  -- pure decisions: no mutation, no I/O                     */
-/* ===================================================================== */
+/* §3  pure helpers — only read and decide, never change anything */
 
-/* Pure reads / decisions: each returns a value from its arguments (or the
- * read-only star/edge arrays + name tables) with NO mutation and NO I/O. The
- * topology builders that MUTATE (sort stars, append edges) live in §4; only
- * the pure deciders are here — the hash, the centroid / nearest / has-edge
- * queries, the Bresenham step-count + line glyph, the enum→string mappings, and
- * the small math (reveal_at staggered ramp, jitter_offset) — so no
- * RENDER/EFFECTS reordering can corrupt them. */
+/* Everything here just computes an answer from its inputs: no state is changed
+ * and nothing is drawn. The code that DOES change things (sorting stars,
+ * adding lines) lives in §4. */
 
-/* 5-char padded names so the HUD field width stays fixed. */
+/* Names padded to 5 chars so the HUD column stays a fixed width. */
 static const char *pattern_name(Pattern p) {
   static const char *names[N_PATTERNS] = {
       "TREE ", "CHAIN", "LOOP ", "SPOKE", "WHEEL", "FAN  ", "POLY*", "NEAR ",
@@ -707,11 +273,9 @@ static const char *pattern_name(Pattern p) {
   return ((int)p >= 0 && (int)p < N_PATTERNS) ? names[p] : "?    ";
 }
 
-/*
- * hash3 — stateless 3-int avalanche hash. Same routine as the other
- * procedural showcases. Drives jitter, name selection, and the
- * background-star sprinkle.
- */
+/* Turns three integers into one well-scrambled number — same inputs always give
+ * the same result, but tiny input changes scatter the output. Used to drive the
+ * star jitter, the name choices, and the backdrop sprinkle. */
 static inline uint32_t hash3(int wx, int wy, int wz) {
   uint32_t h = (uint32_t)wx * 73856093u ^ (uint32_t)wy * 19349663u ^
                (uint32_t)wz * 83492791u;
@@ -723,11 +287,7 @@ static inline uint32_t hash3(int wx, int wy, int wz) {
   return h;
 }
 
-/* ----------------------------------------------------------------------- *
- * Shared helpers for the extra topologies (below).                        *
- * ----------------------------------------------------------------------- */
-
-/* Integer centroid of the star set. */
+/* The average position of all the stars — the middle of the cluster. */
 static void star_centroid(const Star *stars, int n, int *cx, int *cy) {
   long sx = 0, sy = 0;
   for (int i = 0; i < n; i++) {
@@ -738,7 +298,8 @@ static void star_centroid(const Star *stars, int n, int *cx, int *cy) {
   *cy = (int)(sy / n);
 }
 
-/* Index of the star nearest (px,py), skipping `except` (-1 = none). */
+/* Which star is closest to point (px,py); pass `except` to skip a star (-1 to
+ * skip none, e.g. so a star doesn't match itself). */
 static int nearest_to(const Star *stars, int n, int px, int py, int except) {
   int best = -1;
   long bd2 = (long)1 << 60;
@@ -755,7 +316,7 @@ static int nearest_to(const Star *stars, int n, int px, int py, int except) {
   return best;
 }
 
-/* True if undirected edge {a,b} is already present. */
+/* Is there already a line between stars a and b? (order doesn't matter). */
 static bool has_edge(const Edge *edges, int n_edges, int a, int b) {
   for (int i = 0; i < n_edges; i++)
     if ((edges[i].from == a && edges[i].to == b) ||
@@ -764,22 +325,16 @@ static bool has_edge(const Edge *edges, int n_edges, int a, int b) {
   return false;
 }
 
-/* ----------------------------------------------------------------------- *
- * Bresenham — total step count.                                           *
- * ----------------------------------------------------------------------- */
-
-/*
- * bres_steps — how many cells the line from (x0,y0) to (x1,y1) will
- * occupy when rendered. Equals max(|dx|, |dy|) + 1 (one start cell
- * plus that many movement steps).
- */
+/* How many cells a line from (x0,y0) to (x1,y1) will fill — its length in
+ * character cells, counting both endpoints. */
 static inline int bres_steps(int x0, int y0, int x1, int y1) {
   int dx = abs(x1 - x0);
   int dy = abs(y1 - y0);
   return (dx > dy ? dx : dy) + 1;
 }
 
-/* line_glyph_for — pick '-' / '|' / '/' / '\' from segment direction. */
+/* Picks the character that best matches the line's slant: '-' if mostly flat,
+ * '|' if mostly upright, otherwise '/' or '\' for the two diagonals. */
 static inline char line_glyph_for(int dx, int dy) {
   int adx = abs(dx), ady = abs(dy);
   if (adx >= 2 * ady)
@@ -806,10 +361,10 @@ static const char *phase_name(Phase p) {
   }
 }
 
-/* Staggered fade-in value at `now` for an item whose animation window is
- * [start, start+slice]: 0 before it starts, a linear ramp to 1 across the
- * window, 1 after. The "reveal wavefront" that sweeps the stars then the edges
- * in turn is just this evaluated with start = i·slice for item i. */
+/* Fade-in progress for something that starts at time `start` and takes `slice`
+ * seconds: 0 before it starts, climbing smoothly to 1 by the end, 1 after.
+ * Give each star/line a later start and they light up one after another, like a
+ * wave sweeping across the figure. */
 static inline float reveal_at(float now, float start, float slice) {
   if (now >= start + slice)
     return 1.0f;
@@ -818,43 +373,28 @@ static inline float reveal_at(float now, float start, float slice) {
   return 0.0f;
 }
 
-/* Hash-driven jitter offset for jittered-grid placement: maps the low 10 bits
- * of `hbits` (0..1023, recentred to ±512) to an offset within ±JITTER_FRAC of
- * a cell's size. Integer fixed-point (×1024 then /1024) avoids floats. */
+/* A small random nudge for placing a star: takes some hash bits and turns them
+ * into an offset somewhere within +/-JITTER_FRAC of a cell's size. Done in
+ * integer math (scale up by 1024, then back down) to stay off floats. */
 static inline int jitter_offset(uint32_t hbits, int cell_size) {
   return ((int)(hbits & 0x3FFu) - 512) * cell_size * (int)(JITTER_FRAC * 1024) /
          (512 * 1024);
 }
 
-/* ===================================================================== */
-/* §4  SIMULATION  -- advances state (only writers of sim state)         */
-/* ===================================================================== */
+/* §4  simulation — the only code that changes anything */
 
-/* The ONLY writers of simulation state. Two phases of work:
- *  • GENERATION (once per new sky) — constellation_gen runs place_stars, one
- *    of the 15 make_* topology builders (some sort the star array in place,
- *    all append to edges via add_edge), and gen_name.
- *  • the per-tick ADVANCE — scene_tick drives the phase machine and writes the
- *    reveal_t fade/trace progress onto every star and edge.
- * Mutates: Constellation.{stars,edges,n_stars,n_edges,name,seed,region_*};
- * Scene.{con,phase,phase_t,total_t,paused,speed,current_theme,
- * current_pattern,sky_seed}. scene_tick() is the single per-tick entry point
- * (called only from main, §8); user events (key/resize) also mutate Scene but
- * are NOT part of the tick -- see §8. */
+/* Two jobs: build a whole new sky (constellation_gen, run once when the sky
+ * changes), and nudge the reveal animation forward (scene_tick, run every
+ * tick). Nothing else writes the simulation. Keypresses and resizes also change
+ * state, but they happen in §8, outside the per-tick loop. */
 
-/* ----------------------------------------------------------------------- *
- * Star placement — jittered grid.                                         *
- * ----------------------------------------------------------------------- */
-
-/*
- * place_stars — drop n stars into a region using a jittered-grid
- * scheme. Region is divided into ~√n × ⌈n/√n⌉ cells; each cell hosts
- * ONE star at a hash-driven offset from the cell centre. The result
- * looks organically scattered without clusters or gaps.
- */
+/* Scatters n stars across the region. It lays a rough grid over the area, drops
+ * one star per cell, then nudges each star off its cell centre by a small
+ * random amount. The grid keeps them spread out (no clumps or gaps); the nudge
+ * keeps it from looking like a grid. */
 static void place_stars(Star *stars, int n, int region_w, int region_h,
                         int seed) {
-  /* Lay a √n × ⌈n/√n⌉ grid of cells over the region. */
+  /* A roughly square grid with about n cells. */
   int cols = (int)ceilf(sqrtf((float)n));
   if (cols < 1)
     cols = 1;
@@ -867,8 +407,8 @@ static void place_stars(Star *stars, int n, int region_w, int region_h,
   if (cell_h < 1)
     cell_h = 1;
 
-  /* One star per cell, hash-jittered off the cell centre (so it scatters
-   * organically) plus its per-star twinkle phase and tint. */
+  /* One star per cell: start at the cell centre, nudge it, then clamp it inside
+   * the region and pick its twinkle phase and tint from the same hash. */
   int idx = 0;
   for (int r = 0; r < rows && idx < n; r++) {
     for (int c = 0; c < cols && idx < n; c++) {
@@ -893,17 +433,13 @@ static void place_stars(Star *stars, int n, int region_w, int region_h,
   }
 }
 
-/* ----------------------------------------------------------------------- *
- * Topology builders — fifteen ways to pick edges over the same star set.  *
- * ----------------------------------------------------------------------- */
+/* The fifteen line patterns. Each one takes the same stars and decides which
+ * pairs to connect. Several sort the stars[] array in place first. */
 
-/*
- * make_tree — Prim's minimum-spanning-tree algorithm. Repeatedly
- * adds the cheapest cross-edge between the current tree and the
- * unvisited stars. Distance metric is squared Euclidean (no sqrt).
- *
- * Time complexity: O(N²); for N ≤ 12 this is ~144 ops. Trivial.
- */
+/* Connects all the stars with the shortest total length of line and no loops (a
+ * "minimum spanning tree", Prim 1957). It grows the tree one star at a time,
+ * each step reaching out to whichever unconnected star is closest to the tree
+ * so far. Result: an organic branching shape. */
 static void make_tree(const Star *stars, int n, Edge *edges, int *n_edges) {
   *n_edges = 0;
   if (n < 2)
@@ -943,11 +479,9 @@ static void make_tree(const Star *stars, int n, Edge *edges, int *n_edges) {
   }
 }
 
-/*
- * sort_by_x — bubble-sort stars[] in place by x. N is tiny (≤ 12)
- * so the O(N²) cost is negligible and we avoid qsort's static-state
- * comparator awkwardness.
- */
+/* Reorders the stars left to right by their x position. A plain bubble sort:
+ * with at most 12 stars it's plenty fast and saves the fuss of a qsort
+ * comparator. */
 static void sort_by_x(Star *stars, int n) {
   for (int i = 0; i < n - 1; i++) {
     for (int j = 0; j < n - 1 - i; j++) {
@@ -960,10 +494,8 @@ static void sort_by_x(Star *stars, int n) {
   }
 }
 
-/*
- * make_chain — sort stars left-to-right and connect (0)-(1)-(2)-…-(N-1).
- * Produces N-1 edges arranged in a non-crossing left-to-right path.
- */
+/* Sorts the stars left to right and joins them in that order, like connect-the-
+ * dots. Gives a single line that never crosses itself. */
 static void make_chain(Star *stars, int n, Edge *edges, int *n_edges) {
   *n_edges = 0;
   if (n < 2)
@@ -977,11 +509,9 @@ static void make_chain(Star *stars, int n, Edge *edges, int *n_edges) {
   *n_edges = n - 1;
 }
 
-/*
- * sort_by_angle — bubble-sort stars[] in place by polar angle around
- * (cx, cy). After this, neighbouring entries in the array sit next
- * to each other on the polygonal cycle around the centroid.
- */
+/* Reorders the stars by the angle each one sits at around the centre (cx,cy) —
+ * going around like a clock. Afterwards, stepping through the array walks the
+ * stars in a ring, so neighbours in the array are neighbours on the loop. */
 static void sort_by_angle(Star *stars, int n, int cx, int cy) {
   float ang[N_STARS_MAX];
   for (int i = 0; i < n; i++)
@@ -1000,10 +530,8 @@ static void sort_by_angle(Star *stars, int n, int cx, int cy) {
   }
 }
 
-/*
- * make_loop — angular-sort around the centroid, then connect the
- * stars into a closed cycle. N edges (vs N-1 for the other patterns).
- */
+/* Orders the stars around the centre, then joins them into a closed ring (the
+ * last star links back to the first). */
 static void make_loop(Star *stars, int n, Edge *edges, int *n_edges) {
   *n_edges = 0;
   if (n < 3)
@@ -1024,11 +552,8 @@ static void make_loop(Star *stars, int n, Edge *edges, int *n_edges) {
   *n_edges = n;
 }
 
-/*
- * make_spoke — pick the star nearest the centroid as the hub; emit
- * one edge from hub to every other star. N-1 edges all sharing one
- * vertex.
- */
+/* Picks the star nearest the middle as the hub, then draws a line from it to
+ * every other star — like spokes on a wheel hub. */
 static void make_spoke(const Star *stars, int n, Edge *edges, int *n_edges) {
   *n_edges = 0;
   if (n < 2)
@@ -1064,7 +589,8 @@ static void make_spoke(const Star *stars, int n, Edge *edges, int *n_edges) {
   *n_edges = eidx;
 }
 
-/* Append edge {from,to} (skips self-loops and respects N_EDGES_MAX). */
+/* Adds one line between two stars (ignores a star-to-itself line and stops once
+ * the array is full). */
 static void add_edge(Edge *edges, int *n_edges, int from, int to) {
   if (*n_edges >= N_EDGES_MAX || from == to)
     return;
@@ -1074,8 +600,7 @@ static void add_edge(Edge *edges, int *n_edges, int from, int to) {
   (*n_edges)++;
 }
 
-/* make_wheel — a rim cycle (angular order) plus spokes from the most-central
- * star to all others: cycle + hub = a wheel. */
+/* A loop around the outside plus spokes from the most central star: a wheel. */
 static void make_wheel(Star *stars, int n, Edge *edges, int *n_edges) {
   *n_edges = 0;
   if (n < 4) {
@@ -1093,8 +618,8 @@ static void make_wheel(Star *stars, int n, Edge *edges, int *n_edges) {
       add_edge(edges, n_edges, hub, i); /* spokes */
 }
 
-/* make_fan — lowest star is the apex; rays to every other star (a hand-fan
- * fanning out from one corner; unlike SPOKE the apex is on the edge). */
+/* The lowest star is the corner; lines fan out from it to all the rest — like a
+ * hand fan. (Unlike SPOKE, the corner sits at the edge, not the middle.) */
 static void make_fan(const Star *stars, int n, Edge *edges, int *n_edges) {
   *n_edges = 0;
   if (n < 2)
@@ -1107,9 +632,9 @@ static void make_fan(const Star *stars, int n, Edge *edges, int *n_edges) {
     add_edge(edges, n_edges, apex, i);
 }
 
-/* make_starpoly — angular order, but connect every-other vertex (i → i+2). For
- * an ODD star count this traces one closed path whose edges CROSS the middle —
- * a pentagram / heptagram. (constellation_gen feeds it an odd n.) */
+/* Goes around the ring but skips every other star (connect 0-2-4-...). With an
+ * odd number of stars this traces one path whose lines cross through the middle
+ * — a five- or seven-pointed star. (gen always feeds this an odd count.) */
 static void make_starpoly(Star *stars, int n, Edge *edges, int *n_edges) {
   *n_edges = 0;
   if (n < 5) {
@@ -1123,8 +648,8 @@ static void make_starpoly(Star *stars, int n, Edge *edges, int *n_edges) {
     add_edge(edges, n_edges, i, (i + 2) % n);
 }
 
-/* make_nearest — each star to its single nearest neighbour (deduped): a sparse
- * organic scatter of short links. */
+/* Links each star to its single closest neighbour: a loose scatter of short
+ * lines. */
 static void make_nearest(const Star *stars, int n, Edge *edges, int *n_edges) {
   *n_edges = 0;
   if (n < 2)
@@ -1136,8 +661,7 @@ static void make_nearest(const Star *stars, int n, Edge *edges, int *n_edges) {
   }
 }
 
-/* make_mesh — each star to its TWO nearest neighbours (deduped): a fuller
- * organic web than NEAREST. */
+/* Links each star to its TWO closest neighbours: a fuller web than NEAREST. */
 static void make_mesh(const Star *stars, int n, Edge *edges, int *n_edges) {
   *n_edges = 0;
   if (n < 2)

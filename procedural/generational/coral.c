@@ -1,102 +1,22 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * coral.c  —  Radial DLA coral / fungus, grown outward from a centre seed
+ * coral.c — Grows a branching coral/lichen shape outward from a centre dot.
  *
- * Diffusion-Limited Aggregation (DLA) grown from the middle of the screen:
- *   — A single seed is frozen at the centre.
- *   — "Spore" walkers are launched from a circle just outside the current
- *     cluster and random-walk inward (a gravity-free drift toward the
- *     centre) until they touch the aggregate and freeze where they stand.
- *   — Because the growing tips screen the interior from incoming walkers,
- *     the cluster cannot fill in solid: it ramifies into branches — the
- *     self-similar dendrite that makes DLA look like coral, lichen, or
- *     fungus spreading from a spore.
+ * It's Diffusion-Limited Aggregation (DLA): a seed sits in the middle, then
+ * tiny "spore" particles wander in from outside and freeze the moment they
+ * touch what's already grown. The outer twigs catch wanderers before they
+ * reach the inside, so the shape can't fill solid — it keeps branching, the
+ * way coral, lichen, or frost does. Cells are coloured by how far they are
+ * from the centre, giving rings of colour.
  *
- * Colour encoding (radial rainbow):
- *   Each cell is coloured at freeze time by its distance from the centre:
- *     centre → coral red ; middle → violet / yellow / lime ;
- *     tips   → teal / lemon-green
- *   so the reef reads as concentric colour bands radiating outward,
- *   independent of the order cells happened to freeze.
+ * Founding paper: Witten & Sander (1981), "Diffusion-Limited Aggregation, a
+ * Kinetic Critical Phenomenon", Phys. Rev. Lett. 47, 1400.
+ * Practical notes (launch/kill circles, inward-walk speed-up):
+ * Paul Bourke, paulbourke.net/fractals/dla/.
+ * Palette-brightness rule the presets follow: documentation/COLOR.md.
  *
- * Presets: 15 named visual styles (palette + branchiness + thin/fat
- *   contact + glyphs). The reef grows ONCE and then HOLDS on the finished
- *   piece — no auto-restart, no auto style switch. The user starts a fresh
- *   grow with n / p (switch preset) or r (regrow the same preset).
- *
- * Keys:
- *   q / ESC   quit
- *   spc       pause / resume
- *   n / p     next / previous preset
- *   r         restart growth (same preset)
- *   + =       more walkers
- *   -         fewer walkers
- *   ] [       faster / slower
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra coral.c -o coral -lncurses -lm
- *
- * Sections
- * --------
- *   §1   config
- *   §2   clock
- *   §3   color
- *   §3.5 presets — 15 visual styles
- *   §4   grid
- *   §5   walker
- *   §6   scene
- *   §7   screen
- *   §8   app
+ * Build: gcc -std=c11 -O2 -Wall -Wextra coral.c -o coral -lncurses -lm
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Diffusion-Limited Aggregation (DLA), radial form. A seed
- *                  sits at the centre; random walkers launched from a
- *                  surrounding circle stick on first contact (probability
- *                  stick_prob, set per preset). Walkers drift inward so they
- *                  reliably reach the cluster instead of wandering off.
- *
- * Physics        : The branching IS the screening effect — a protruding tip
- *                  is far more likely to catch a wandering walker than a
- *                  sheltered interior gap, so growth concentrates at the
- *                  extremities and runs away into dendrites. The same
- *                  instability shapes mineral dendrites, electrodeposits,
- *                  lichen, and coral.
- *
- * Math           : DLA clusters are fractal: in 2D the mass within radius r
- *                  scales as r^D with D ≈ 1.71 — scale-free, branchy at every
- *                  magnification. Higher sticking probability → stronger
- *                  screening → more open/ramified; lower → denser, blob-like.
- *
- * References     : ALGORITHM — DLA, fractal growth, the screening instability
- *                  • Witten & Sander (1981), "Diffusion-Limited Aggregation,
- *                    a Kinetic Critical Phenomenon", Phys. Rev. Lett. 47,
- *                    1400. THE founding paper: the model, the screening that
- *                    forces branching, and the fractal dimension.
- *                  • Witten & Sander (1983), "Diffusion-limited aggregation",
- *                    Phys. Rev. B 27, 5686. Fuller treatment of D ≈ 1.71 and
- *                    the cluster's scaling.
- *                  • Vicsek, Tamás (1992), "Fractal Growth Phenomena", 2nd
- *                    ed., World Scientific. Textbook on DLA and its relatives
- *                    (dielectric breakdown, electrodeposition, viscous
- *                    fingering) — why so many systems share this morphology.
- *                  • Mandelbrot (1982), "The Fractal Geometry of Nature",
- *                    W. H. Freeman. The wider language of self-similarity and
- *                    fractal dimension this growth lives in.
- *                  • Bourke, Paul — "DLA: Diffusion Limited Aggregation",
- *                    paulbourke.net/fractals/dla/. Practical, code-oriented
- *                    notes: launch/kill circles, the inward-walk speed-up.
- *                  • Procedural Content Generation Wiki / RogueBasin — DLA for
- *                    organic level features (caves, ore veins, lightning).
- *
- *                  RENDERING — terminal / ASCII output
- *                  • Padala, Pradeep — "NCURSES Programming HOWTO" (TLDP).
- *                    Reference for the erase→draw→doupdate frame model,
- *                    colour pairs, and non-blocking input used here.
- *                  • documentation/COLOR.md (this project) — 256-colour cube
- *                    layout and the palette-brightness rule the presets obey.
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -109,9 +29,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1  config ── */
 
 enum {
     SIM_FPS_MIN     = 10,
@@ -128,36 +46,33 @@ enum {
 
     N_CORAL_COLORS  =   6,
 
-    /* Radial-growth tuning shared by all presets (DLA from a centre seed).
-     * Branchiness, contact rule, drift and colours vary per preset below. */
-    SPAWN_MARGIN    =   5,   /* launch walkers this many cells beyond tips */
-    KILL_MARGIN     =  20,   /* relaunch a walker if it strays this far    */
+    /* How far out new particles start, and how far they may stray before
+     * we give up and relaunch them. */
+    SPAWN_MARGIN    =   5,   /* start walkers this many cells past the tips */
+    KILL_MARGIN     =  20,   /* relaunch a walker that strays this far out  */
 
     FPS_UPDATE_MS   = 500,
 
-    /* Frame pacing. RENDER_FPS_CAP throttles screen redraws (independent of
-     * the simulation tick rate Control.sim_fps). DT_CAP_MS clamps a single
-     * frame's measured dt so a long stall can't trigger a spiral of death. */
+    /* How fast we redraw the screen, and a safety cap so one long pause
+     * (e.g. the terminal was buried) can't make the sim try to catch up
+     * forever and lock up. */
     RENDER_FPS_CAP  =  60,
     DT_CAP_MS       = 100,
 
-    /* Rows reserved for the HUD: one data bar (top) + one action bar
-     * (bottom). The reef is drawn in the band between them, so neither
-     * bar ever overlaps the coral. */
+    /* One status bar at the top, one key-list bar at the bottom. The coral
+     * draws in the rows between them so the bars never sit on top of it. */
     HUD_ROW_TOP     =   1,
     HUD_ROW_BOTTOM  =   1,
 };
 
-/* 2*pi — launch walkers at a uniform random angle on the spawn circle. */
+/* A full turn in radians — used to pick a random launch angle. */
 #define TAU          6.2831853f
 
 #define NS_PER_SEC   1000000000LL
 #define NS_PER_MS    1000000LL
 #define TICK_NS(f)   (NS_PER_SEC / (f))
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* ── §2  clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -176,47 +91,48 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color                                                              */
-/* ===================================================================== */
+/* ── §3  color ── */
 
 /*
- * Colour-pair slots. The six CORAL bands are the radial gradient (centre
- * → tip); their actual colours are NOT fixed here — they are supplied by
- * the active preset (see §3.5) and re-bound with init_pair on every switch.
- * The HUD/HINT pairs are fixed (yellow / cyan, per the project standard).
+ * Names for our colour-pair slots. The six coral slots are the rings from
+ * centre to tip; their actual colours aren't set here — each preset (§3.5)
+ * fills them in and they get re-set whenever you switch preset. The two HUD
+ * slots stay fixed yellow/cyan, matching every other demo in the project.
  */
 typedef enum {
-    COL_CORAL_1 = 1,   /* radial band 1 (centre)                      */
+    COL_CORAL_1 = 1,   /* innermost ring (the centre)  */
     COL_CORAL_2 = 2,
     COL_CORAL_3 = 3,
     COL_CORAL_4 = 4,
     COL_CORAL_5 = 5,
-    COL_CORAL_6 = 6,   /* radial band 6 (outer tips)                  */
-    COL_WALKER  = 7,   /* drifting spore particles                    */
-    COL_HUD     = 8,   /* HUD data bar    — bright yellow             */
-    COL_HINT    = 9,   /* HUD action bar  — bright cyan               */
+    COL_CORAL_6 = 6,   /* outermost ring (the tips)    */
+    COL_WALKER  = 7,   /* the drifting spore particles */
+    COL_HUD     = 8,   /* top status bar  — yellow     */
+    COL_HINT    = 9,   /* bottom key bar  — cyan       */
 } ColorID;
 
-/* ===================================================================== */
-/* §3.5  presets — 15 unique visual styles                                */
-/* ===================================================================== */
+/* ── §3.5  presets — 15 visual styles ── */
 
 /*
- * Preset — a complete visual style. Switching preset (n/p) changes how the
- * reef LOOKS and GROWS but not the algorithm. The reef grows once to the
- * edge and then holds; n/p or r begins a fresh grow.
+ * Preset — one named look. Switching preset (n/p) changes how the coral
+ * looks AND how bushy it grows, but the underlying method is always the
+ * same. The shape grows once and then stops; n/p or r starts a fresh one.
  *
- *   palette[6]      radial colour bands, centre → tip (xterm-256 indices,
- *                   all in the bright half so they read on black)
- *   stick_prob      freeze chance on first contact. High → strong
- *                   screening → wispy open branches; low → walkers probe
- *                   deeper → dense, blobby growth.
- *   eight_neighbour true counts diagonal contact too → fatter clumps;
- *                   false (von Neumann) → thin dendrites.
- *   inward_bias     % of steps biased toward the centre (drift speed).
- *   glyphs[6]       one ASCII char per band, dense → light.
- *   bold_tips       A_BOLD the two outermost bands for extra glow.
+ *   name            shown in the top bar
+ *   palette[6]      the six ring colours, centre → tip (xterm-256 colour
+ *                   numbers, all kept bright enough to show on black)
+ *   walker_col      colour of the drifting spore dots
+ *   stick_prob      chance a touching particle actually freezes (0..1).
+ *                   High = it almost always sticks at the tips, so the tips
+ *                   grab everything first and the shape stays wispy and open.
+ *                   Low = particles slip past the tips and pack in deeper,
+ *                   giving a denser, blobbier shape.
+ *   eight_neighbour true also counts diagonal touches, making thicker clumps;
+ *                   false only counts up/down/left/right, giving thin twigs.
+ *   inward_bias     out of every 100 steps, how many nudge toward the centre
+ *                   (higher = particles reach the shape faster).
+ *   glyphs[6]       one character per ring, densest at the centre.
+ *   bold_tips       brighten the two outer rings for a glow.
  */
 typedef struct {
     const char *name;
@@ -250,7 +166,7 @@ static const Preset presets[N_PRESETS] = {
   { "SPRING",   {120,156,192,228,222,159}, 254, 0.88f, false, 30, "**++::", false },
 };
 
-/* preset_apply — bind the preset's palette into the coral colour pairs. */
+/* Copy this preset's colours into the coral colour slots. */
 static void preset_apply(const Preset *p)
 {
     if (COLORS >= 256) {
@@ -281,66 +197,48 @@ static void color_init(void)
     preset_apply(&presets[0]);
 }
 
-/* ===================================================================== */
-/* §4  grid                                                               */
-/* ===================================================================== */
+/* ── §4  grid ── */
 
 /*
- * Grid — the frozen coral aggregate, grown radially from a centre seed.
+ * Grid — the frozen coral so far, plus everything needed to keep growing it.
  *
- *   cells[y][x] == 0  →  empty
- *   cells[y][x] == n  →  frozen, draw with COLOR_PAIR(n)
- *
- * Colour is assigned at freeze time by distance from the centre (see
- * grid_color_for_radius): centre = COL_CORAL_1, edge = COL_CORAL_6 — a
- * radial rainbow baked in once and never changed after freezing.
- *
- * max_radius is the distance of the farthest frozen cell from the centre;
- * walkers launch from just beyond it. max_radius reaching reset_radius is
- * what tells the scene the growth is complete.
- *
- * WHY a single buffer (no double buffer): unlike a synchronous CA, DLA is
- * SEQUENTIAL — a cell freezes permanently the instant a walker sticks, and
- * later walkers must see it immediately to grow off it. So a frozen cell is
- * never re-evaluated; one array suffices and in-place writes are correct.
- *
- * Ref: Witten & Sander (1981) — the DLA model; see the References block.
+ * Each cell holds 0 (empty) or a small number 1..6 that is both "frozen"
+ * and the colour ring to draw it with. Once a cell freezes it never changes,
+ * and later particles need to see it right away to build off it — so a single
+ * array is correct here, no double-buffering needed. (DLA model: Witten &
+ * Sander 1981.)
  */
 typedef struct {
-    /* the aggregate */
-    uint8_t cells[GRID_ROWS_MAX][GRID_COLS_MAX];  /* 0 = empty; n = frozen,
-                                                   * drawn with COLOR_PAIR(n) */
-    int     frozen_count;   /* live tally of frozen cells (HUD readout)     */
+    /* the frozen shape itself */
+    uint8_t cells[GRID_ROWS_MAX][GRID_COLS_MAX];  /* 0 = empty; 1..6 = frozen,
+                                                   * the number is its colour  */
+    int     frozen_count;   /* how many cells are frozen (shown in the HUD)   */
 
-    /* radial geometry — the basis of growth, colour, and the done test */
-    int     ccx, ccy;       /* centre cell — the seed / growth origin       */
-    int     max_radius;     /* distance of the farthest frozen cell         */
-    int     reset_radius;   /* growth is "done" once max_radius reaches this
-                             * (≈ the nearer screen half); also the divisor
-                             * that maps radius → colour band               */
-    int     rows, cols;     /* grid extent in cells                         */
+    /* where the centre is and how far the shape has spread */
+    int     ccx, ccy;       /* the centre cell — where the seed sits          */
+    int     max_radius;     /* distance of the farthest frozen cell out       */
+    int     reset_radius;   /* growth is finished once max_radius hits this
+                             * (about half the shorter screen side); also the
+                             * number we divide by to turn distance → colour   */
+    int     rows, cols;     /* grid size in cells                             */
 
-    /* Active-preset growth/draw style, copied in by grid_init so the walker
-     * and renderer read it here instead of reaching back to presets[]. */
-    float       stick_prob;       /* freeze chance on contact (branchiness) */
-    bool        eight_neighbour;  /* diagonal contact too → fatter clumps   */
-    int         inward_bias;      /* % of walker steps drifting to centre   */
-    const char *glyphs;           /* 6 band chars; points into presets[]    */
-    bool        bold_tips;        /* A_BOLD the two outer bands             */
+    /* The current preset's growth/look settings, copied in so the rest of
+     * the code reads them here instead of digging back into presets[]. */
+    float       stick_prob;       /* chance a touching particle freezes      */
+    bool        eight_neighbour;  /* count diagonal touches too (thicker)    */
+    int         inward_bias;      /* steps-per-100 nudged toward the centre  */
+    const char *glyphs;           /* 6 ring characters; points into presets[] */
+    bool        bold_tips;        /* brighten the two outer rings            */
 } Grid;
 
-/* grid_radius() — integer distance of (cx,cy) from the centre seed. */
+/* How far the cell (cx,cy) is from the centre, rounded to a whole number. */
 static int grid_radius(const Grid *g, int cx, int cy)
 {
     int dx = cx - g->ccx, dy = cy - g->ccy;
     return (int)(sqrtf((float)(dx * dx + dy * dy)) + 0.5f);
 }
 
-/*
- * grid_color_for_radius() — map distance-from-centre to a colour band.
- *   radius 0            → COL_CORAL_1 (centre)
- *   radius reset_radius → COL_CORAL_6 (outer tips)
- */
+/* Turn a distance-from-centre into a ring colour: 0 = innermost, far = tip. */
 static uint8_t grid_color_for_radius(const Grid *g, int radius)
 {
     int idx = (int)((float)radius / (float)g->reset_radius * N_CORAL_COLORS);
@@ -359,8 +257,8 @@ static void grid_init(Grid *g, int cols, int rows, const Preset *p)
 {
     if (cols > GRID_COLS_MAX) cols = GRID_COLS_MAX;
     if (rows > GRID_ROWS_MAX) rows = GRID_ROWS_MAX;
-    if (cols < 1) cols = 1;            /* never let the HUD reservation   */
-    if (rows < 1) rows = 1;            /* shrink the grid below one cell  */
+    if (cols < 1) cols = 1;            /* on a tiny terminal the HUD rows  */
+    if (rows < 1) rows = 1;            /* could leave nothing — keep 1x1   */
     memset(g->cells, 0, sizeof g->cells);
     g->frozen_count = 0;
     g->cols         = cols;
@@ -369,14 +267,14 @@ static void grid_init(Grid *g, int cols, int rows, const Preset *p)
     g->ccy          = rows / 2;
     g->max_radius   = 0;
 
-    /* Adopt the active preset's growth + draw style. */
+    /* Take on this preset's growth + look settings. */
     g->stick_prob      = p->stick_prob;
     g->eight_neighbour = p->eight_neighbour;
     g->inward_bias     = p->inward_bias;
     g->glyphs          = p->glyphs;
     g->bold_tips       = p->bold_tips;
 
-    /* Grow until the cluster reaches the nearer screen edge. */
+    /* Stop growing once the shape reaches roughly the nearest screen edge. */
     int half = (cols < rows ? cols : rows) / 2;
     g->reset_radius = half > 1 ? half - 1 : 1;
 
@@ -398,10 +296,10 @@ static bool grid_frozen(const Grid *g, int cx, int cy)
 }
 
 /*
- * grid_touching() — is (cx,cy) adjacent to the cluster? A walker that lands
- * on such a cell is a candidate to freeze. The preset chooses the contact
- * rule: 4-neighbour (von Neumann) keeps branches thin and dendritic;
- * 8-neighbour also counts diagonals → fuller, blobbier growth.
+ * Is this cell next to the frozen shape? If so, a particle sitting here may
+ * freeze. The preset decides whether diagonal neighbours count: counting
+ * only the four sides gives thin twigs; counting diagonals too gives
+ * thicker, fuller growth.
  */
 static bool grid_touching(const Grid *g, int cx, int cy)
 {
@@ -422,9 +320,9 @@ static void grid_draw(const Grid *g, WINDOW *w)
             if (col == 0) continue;
 
             attr_t attr = COLOR_PAIR((int)col);
-            if (g->bold_tips && col >= 5) attr |= A_BOLD;   /* glow the tips */
+            if (g->bold_tips && col >= 5) attr |= A_BOLD;   /* brighten the tips */
 
-            /* glyph for this radial band (preset-defined, dense → light) */
+            /* pick this ring's character from the preset */
             char ch = (col >= 1 && col <= N_CORAL_COLORS) ? g->glyphs[col - 1] : '*';
 
             wattron(w, attr);
@@ -434,31 +332,27 @@ static void grid_draw(const Grid *g, WINDOW *w)
     }
 }
 
-/* ===================================================================== */
-/* §5  walker                                                             */
-/* ===================================================================== */
+/* ── §5  walker ── */
 
 /*
- * Walker — one drifting "spore" particle searching for the cluster.
+ * Walker — one drifting "spore" particle looking for the shape.
  *
- * Launched on a circle just outside the current cluster, it random-walks
- * with a mild bias toward the centre (Grid.inward_bias) so it reliably
- * reaches the aggregate instead of diffusing away. On first contact it
- * freezes with probability Grid.stick_prob; the screening of the outer
- * tips is what turns the frozen set into branches rather than a disc.
- * (Both come from the active preset — see §3.5.)
+ * It starts on a circle just outside the shape and wanders randomly, with a
+ * gentle pull toward the centre so it actually finds the shape instead of
+ * floating off. When it first touches, it freezes (sometimes — see
+ * stick_prob). The pull strength and freeze chance both come from the
+ * current preset.
  */
 typedef struct {
-    int  cx, cy;     /* current cell in grid space (the random-walk position) */
-    bool active;     /* false = slot unused (walkers[] is a fixed pool of size
-                      * WALKER_MAX; only the first Control.n_walkers are live) */
+    int  cx, cy;     /* where the particle is right now (grid cell)            */
+    bool active;     /* false = this slot is unused. walkers[] is a fixed pool;
+                      * only the first Control.n_walkers slots are in play.    */
 } Walker;
 
 /*
- * walker_spawn() — launch on the spawn circle: a uniform random angle at
- * radius (max_radius + SPAWN_MARGIN), clamped into the grid. Spawning just
- * beyond the tips (rather than at the screen edge) means the walker finds
- * the cluster in a few steps, keeping the animation lively.
+ * Drop a particle at a random spot on a circle just outside the shape.
+ * Starting close to the tips (not way out at the screen edge) means it
+ * reaches the shape in a few steps, so the animation keeps moving.
  */
 static void walker_spawn(Walker *w, const Grid *g)
 {
@@ -475,8 +369,8 @@ static void walker_spawn(Walker *w, const Grid *g)
     w->active = true;
 }
 
-/* try_stick() — freeze the walker's current cell if it touches the cluster
- * and wins the preset's stick_prob roll. Returns true on freeze. */
+/* If the particle is touching the shape and wins a stick_prob coin flip,
+ * freeze it here. Returns true if it froze. */
 static bool try_stick(Walker *w, Grid *g)
 {
     if (grid_frozen(g, w->cx, w->cy) || !grid_touching(g, w->cx, w->cy))
@@ -487,17 +381,16 @@ static bool try_stick(Walker *w, Grid *g)
     return true;
 }
 
-/* step_toward — the unit step (-1, 0, +1) that moves `from` one cell toward
- * `to`. The atom of the walker's inward drift. */
+/* Which way to step (-1, 0, or +1) to get one cell closer to `to`. */
 static inline int step_toward(int from, int to)
 {
     return (from < to) - (from > to);
 }
 
 /*
- * out_of_play — has (x,y) left the active region? True if off the grid, or
- * strayed more than KILL_MARGIN beyond the cluster. Either way the walker
- * is abandoned and relaunched rather than wandering uselessly far away.
+ * Has the particle wandered too far to be useful? True if it left the grid
+ * or drifted well past the shape. When that happens we just relaunch it
+ * instead of letting it roam pointlessly far away.
  */
 static bool out_of_play(const Grid *g, int x, int y)
 {
@@ -506,9 +399,9 @@ static bool out_of_play(const Grid *g, int x, int y)
 }
 
 /*
- * walker_pick_step — choose this tick's move: inward_bias% of the time a
- * step toward the centre (so the walker reliably reaches the cluster),
- * else a uniform random 4-direction step. Pure read; returns via dx,dy.
+ * Pick this step's direction. Most of the time (inward_bias out of 100) it
+ * heads toward the centre so the particle keeps closing in; otherwise it
+ * goes a random one of the four directions. Result comes back via dx,dy.
  */
 static void walker_pick_step(const Walker *w, const Grid *g, int *dx, int *dy)
 {
@@ -531,54 +424,51 @@ static void walker_pick_step(const Walker *w, const Grid *g, int *dx, int *dy)
 }
 
 /*
- * walker_tick() — advance one step toward the cluster and try to stick.
- * Returns true when the walker froze a cell (caller should relaunch it).
+ * Move the particle one step and see if it freezes. Returns true if it did,
+ * which tells the caller to launch a fresh particle in its place.
  */
 static bool walker_tick(Walker *w, Grid *g)
 {
     if (!w->active) return false;
 
     int dx, dy;
-    walker_pick_step(w, g, &dx, &dy);          /* drift toward the cluster */
+    walker_pick_step(w, g, &dx, &dy);
     int nx = w->cx + dx;
     int ny = w->cy + dy;
 
-    if (out_of_play(g, nx, ny)) {              /* wandered off → relaunch  */
+    if (out_of_play(g, nx, ny)) {              /* drifted too far → restart it */
         walker_spawn(w, g);
         return false;
     }
 
-    /* About to step onto the cluster → try to stick where we stand. */
+    /* Next cell is already part of the shape: try to stick where we are. */
     if (grid_frozen(g, nx, ny))
         return try_stick(w, g);
 
-    /* Move, then try to stick at the new cell. */
+    /* Otherwise move, then try to stick at the new spot. */
     w->cx = nx;
     w->cy = ny;
     return try_stick(w, g);
 }
 
-/* ===================================================================== */
-/* §6  scene                                                              */
-/* ===================================================================== */
+/* ── §6  scene ── */
 
 /*
- * Control — the user-tunable knobs, gathered in one place: every field is
- * something a key changes, nothing the algorithm decides on its own. Bounds
- * for each live in §1 config; app_handle_key clamps to them.
+ * Control — the settings the user changes with keys, kept in one spot. The
+ * allowed ranges live in §1 config; app_handle_key keeps these inside them.
  */
 typedef struct {
-    int  preset_idx;      /* n/p   — visual style, index into presets[]   */
-    int  n_walkers;       /* +/-   — active drifting spores                */
-    int  sim_fps;         /* [ ]   — simulation tick rate (Hz)            */
-    bool paused;          /* space — freeze the simulation                */
+    int  preset_idx;      /* n/p   — which visual style (index into presets[]) */
+    int  n_walkers;       /* +/-   — how many particles are drifting           */
+    int  sim_fps;         /* [ ]   — how many growth steps per second          */
+    bool paused;          /* space — is growth frozen?                         */
 } Control;
 
 /*
- * Scene — the whole showcase in one structure, three concerns kept apart:
- *   grid + walkers   WHAT is simulated (the reef and the spores building it)
- *   ctrl             HOW the user drives it (the knobs)
- *   done             WHERE in the lifecycle (growth finished → hold)
+ * Scene — the whole running demo in one place:
+ *   grid + walkers   the shape and the particles building it
+ *   ctrl             the user's settings
+ *   done             true once growth has finished and we're just holding
  */
 typedef struct {
     Grid    grid;
@@ -588,15 +478,15 @@ typedef struct {
 } Scene;
 
 /*
- * scene_build — (re)grow the reef at (cols,rows) in the CURRENT preset's
- * style: bind its palette, seed the grid with its growth params, relaunch
- * the walker swarm. The shared core of init / regrow / preset-switch.
+ * Start a fresh growth at this size in the current preset's style: set its
+ * colours, reseed the grid, and launch the particles. Shared by startup,
+ * regrow, and preset-switch.
  */
 static void scene_build(Scene *s, int cols, int rows)
 {
     const Preset *p = &presets[s->ctrl.preset_idx];
-    preset_apply(p);                          /* palette → colour pairs   */
-    grid_init(&s->grid, cols, rows, p);       /* fresh seed + growth style */
+    preset_apply(p);
+    grid_init(&s->grid, cols, rows, p);
     s->done = false;
 
     for (int i = 0; i < WALKER_MAX; i++)
@@ -605,8 +495,8 @@ static void scene_build(Scene *s, int cols, int rows)
         walker_spawn(&s->walkers[i], &s->grid);
 }
 
-/* scene_init — full setup for startup / resize. Resets walker count and
- * pause; preserves the chosen preset and speed (set once at startup). */
+/* Full setup for startup or a resize. Resets particle count and pause, but
+ * keeps the chosen preset and speed (those are set once at startup). */
 static void scene_init(Scene *s, int cols, int rows)
 {
     s->ctrl.n_walkers = WALKER_DEFAULT;
@@ -614,9 +504,8 @@ static void scene_init(Scene *s, int cols, int rows)
     scene_build(s, cols, rows);
 }
 
-/* scene_regrow — restart growth at the current size, keeping preset, walker
- * count and pause state. Triggered only by the user: r (same preset) or
- * n/p (switch preset) — there is no automatic restart. */
+/* Restart growth at the same size, keeping the current settings. Only the
+ * user triggers this (r, or n/p) — nothing restarts on its own. */
 static void scene_regrow(Scene *s)
 {
     scene_build(s, s->grid.cols, s->grid.rows);
@@ -626,11 +515,8 @@ static void scene_tick(Scene *s)
 {
     if (s->ctrl.paused || s->done) return;
 
-    /*
-     * Growth complete: the cluster radius has reached the screen edge.
-     * Freeze on the finished reef — NO auto-restart. The user starts a
-     * fresh grow with n/p (switch preset) or r (same preset).
-     */
+    /* The shape has reached the edge — mark it finished and just hold it.
+     * It won't restart by itself; the user does that with n/p or r. */
     if (s->grid.max_radius >= s->grid.reset_radius) {
         s->done = true;
         return;
@@ -647,7 +533,7 @@ static void scene_draw(const Scene *s, WINDOW *w)
 {
     grid_draw(&s->grid, w);
 
-    if (s->done) return;          /* finished reef — no drifting spores */
+    if (s->done) return;          /* finished — don't draw the particles */
 
     wattron(w, COLOR_PAIR(COL_WALKER) | A_DIM);
     for (int i = 0; i < s->ctrl.n_walkers; i++) {
@@ -661,20 +547,16 @@ static void scene_draw(const Scene *s, WINDOW *w)
     wattroff(w, COLOR_PAIR(COL_WALKER) | A_DIM);
 }
 
-/* ===================================================================== */
-/* §7  screen                                                             */
-/* ===================================================================== */
+/* ── §7  screen ── */
 
 /*
- * Screen — the terminal's current size, cached from getmaxyx(). WHY cache
- * it: the dimensions change only on a resize (SIGWINCH → screen_resize
- * re-reads them), yet every frame needs them to size the grid and pin the
- * HUD bars. Units are character cells — this is cell-space rendering, no
- * sub-pixel coordinates.
+ * Screen — the terminal's current width and height, remembered here. Every
+ * frame needs the size to lay things out, but it only changes on a resize,
+ * so we read it once (and again on resize) rather than every frame.
  */
 typedef struct {
-    int cols;   /* terminal width  in character columns */
-    int rows;   /* terminal height in character rows    */
+    int cols;   /* terminal width  in characters */
+    int rows;   /* terminal height in characters */
 } Screen;
 
 static void screen_init(Screen *s)
@@ -704,11 +586,9 @@ static void screen_resize(Screen *s)
 }
 
 /*
- * hud_bar — paint one full-width status bar on `row`: fill the row with
- * spaces in `pair`, then write `buf` clipped to the terminal width with
- * mvaddnstr. Clipping (not mvprintw) is what stops an over-long string
- * from wrapping down onto the reef. Drives both the top data bar and the
- * bottom action bar.
+ * Paint one full-width coloured bar of text across `row`. The text is cut
+ * off at the screen width on purpose — using mvaddnstr instead of mvprintw
+ * stops a too-long line from wrapping down onto the coral.
  */
 static void hud_bar(int row, int cols, int pair, const char *buf)
 {
@@ -726,7 +606,7 @@ static void screen_draw(Screen *s, const Scene *sc, double fps)
 
     const Control *c = &sc->ctrl;
 
-    /* Row 0 — DATA: identity, active preset, live state, one clipped line. */
+    /* Top bar: name, current preset, status, and live counters. */
     char data[160];
     snprintf(data, sizeof data,
              " CORAL DLA  %s (%d/%d)  %s  frozen:%-5d  walkers:%-3d  %5.1f fps  %d Hz ",
@@ -734,7 +614,7 @@ static void screen_draw(Screen *s, const Scene *sc, double fps)
              c->paused ? "PAUSED " : sc->done ? "DONE   " : "growing",
              sc->grid.frozen_count, c->n_walkers, fps, c->sim_fps);
 
-    /* Last row — ACTIONS only: every interactive key, nothing else. */
+    /* Bottom bar: the list of keys you can press. */
     static const char *keys =
         " q:quit  spc:pause  n/p:preset  r:reset  +/-:walkers  [/]:speed ";
 
@@ -748,24 +628,22 @@ static void screen_present(void)
     doupdate();
 }
 
-/* ===================================================================== */
-/* §8  app                                                                */
-/* ===================================================================== */
+/* ── §8  app ── */
 
 /*
- * App — the top-level program object: the showcase, the screen, and the two
- * signal flags. WHY a single g_app global: POSIX signal handlers take no
- * user pointer, so the handlers below reach the program through this one
- * well-known instance — the only global, by design; everything else is
- * passed by pointer.
+ * App — everything the program runs on: the demo, the screen size, and two
+ * flags that signal handlers flip. It lives in one global because signal
+ * handlers can't be handed a pointer, so they reach the program through this
+ * one known spot. It's the only global; everything else is passed around.
+ *
+ * The two flags use volatile sig_atomic_t because that's the only kind of
+ * variable a signal handler is allowed to touch safely.
  */
 typedef struct {
-    Scene                 scene;       /* the showcase (reef + control)      */
-    Screen                screen;      /* cached terminal size               */
-    volatile sig_atomic_t running;     /* 0 ⇒ exit main loop (SIGINT/TERM).
-                                        * volatile sig_atomic_t: the only
-                                        * type safe to touch in a handler    */
-    volatile sig_atomic_t need_resize; /* 1 ⇒ re-read size (SIGWINCH)         */
+    Scene                 scene;       /* the demo (shape + settings)        */
+    Screen                screen;      /* current terminal size              */
+    volatile sig_atomic_t running;     /* set to 0 to quit (Ctrl-C / kill)   */
+    volatile sig_atomic_t need_resize; /* set to 1 when the window resized   */
 } App;
 
 static App g_app;
@@ -774,9 +652,8 @@ static void on_exit_signal(int sig)   { (void)sig; g_app.running = 0;     }
 static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
 static void cleanup(void)             { endwin(); }
 
-/* (Re)build the scene to fit the screen, reserving the HUD rows so the
- * reef lives in the band between the two bars. The single place that knows
- * the screen→grid size mapping. */
+/* Build the scene to fit the screen, leaving the top and bottom HUD rows
+ * free. The one place that turns screen size into grid size. */
 static void app_build_scene(App *app)
 {
     scene_init(&app->scene, app->screen.cols,
@@ -842,10 +719,9 @@ static bool app_handle_key(App *app, int ch)
 }
 
 /*
- * app_step_simulation — FIXED-TIMESTEP update: bank the frame's real
- * elapsed time, then spend it one whole TICK at a time (rate = sim_fps),
- * leaving the sub-tick remainder in *sim_accum for next frame. Decouples
- * simulation speed from frame rate.
+ * Run the growth at a steady pace no matter the frame rate. We add up the
+ * real time that has passed and spend it in fixed-size ticks; whatever
+ * doesn't fill a whole tick is carried over to next frame in *sim_accum.
  */
 static void app_step_simulation(App *app, int64_t dt, int64_t *sim_accum)
 {
@@ -859,10 +735,8 @@ static void app_step_simulation(App *app, int64_t dt, int64_t *sim_accum)
 }
 
 /*
- * app_pace_frame — sleep so each rendered frame lasts about one
- * RENDER_FPS_CAP period, regardless of how long this frame's work took.
- * frame_start = when this iteration began; frame_dt = the previous frame's
- * measured length. Holds a steady cap and keeps the process off a busy-spin.
+ * Sleep just enough that each frame lasts about the same length, so we hold
+ * a steady frame rate instead of spinning the CPU as fast as it can go.
  */
 static void app_pace_frame(int64_t frame_start, int64_t frame_dt)
 {
@@ -882,7 +756,7 @@ int main(void)
 
     App *app     = &g_app;
     app->running = 1;
-    app->scene.ctrl.sim_fps = SIM_FPS_DEFAULT;   /* set once; survives resize */
+    app->scene.ctrl.sim_fps = SIM_FPS_DEFAULT;   /* set once; kept across resizes */
 
     screen_init(&app->screen);
     app_build_scene(app);
@@ -901,17 +775,17 @@ int main(void)
             sim_accum  = 0;
         }
 
-        /* Measure this frame's real elapsed time, capped so a long stall
-         * can't trigger a spiral of death; advance the clock. */
+        /* How long since the last frame? Capped so one long pause can't make
+         * the sim try to replay a huge backlog and freeze up. */
         int64_t now = clock_ns();
         int64_t dt  = now - frame_time;
         frame_time  = now;
         if (dt > DT_CAP_MS * NS_PER_MS) dt = DT_CAP_MS * NS_PER_MS;
 
-        /* Advance the simulation by that much real time. */
+        /* Grow by that much time. */
         app_step_simulation(app, dt, &sim_accum);
 
-        /* Update the FPS readout once per FPS_UPDATE_MS window. */
+        /* Refresh the fps number every so often. */
         frame_count++;
         fps_accum += dt;
         if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -921,12 +795,12 @@ int main(void)
             fps_accum   = 0;
         }
 
-        /* Sleep to the frame cap, THEN draw (steady pacing). */
+        /* Wait out the frame, then draw — keeps the pace even. */
         app_pace_frame(frame_time, dt);
         screen_draw(&app->screen, &app->scene, fps_display);
         screen_present();
 
-        /* Drain one input event. */
+        /* Handle one keypress if there is one. */
         int ch = getch();
         if (ch != ERR && !app_handle_key(app, ch))
             app->running = 0;

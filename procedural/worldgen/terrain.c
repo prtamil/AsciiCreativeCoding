@@ -2,98 +2,19 @@
 /*
  * terrain.c — Fractal Terrain (Diamond-Square)
  *
- * Generates a 65×65 heightmap (2^6+1 grid) with the diamond-square midpoint
- * displacement algorithm, renders it as ASCII elevation contours scaled to
- * the terminal, and slowly erodes it each tick with thermal weathering.
+ * Builds a random mountain landscape on a 65x65 grid, shows it as coloured
+ * ASCII (water through snowcap), and slowly wears it down over time so peaks
+ * round off into plains.
  *
- * DIAMOND-SQUARE ALGORITHM
- * ─────────────────────────
- * Iteratively bisects each square:
- *
- *   Diamond step  — centre of each size×size square:
- *     h[y+h][x+h] = avg(4 corners) + random × scale
- *
- *   Square  step  — midpoint of each diamond edge:
- *     h[y][x] = avg(up to 4 diamond neighbours) + random × scale
- *
- *   scale *= ROUGHNESS each iteration.
- *   After generation, normalise [lo, hi] → [0, 1] so the full contour
- *   range is always visible regardless of random seed.
- *
- * THERMAL WEATHERING EROSION
- * ──────────────────────────
- * Each tick, ERODE_PASSES sweeps of all cells:
- *   diff = h[y][x] − h[ny][nx]
- *   if diff > TALUS:
- *     move = RATE × (diff − TALUS)
- *     h[y][x]   -= move      ← material falls off steep slope
- *     h[ny][nx] += move      ← deposited at base
- * Gentle slopes (diff ≤ TALUS) are stable; peaks erode to plains over time.
- *
- * HEIGHT → CONTOUR MAPPING
- * ─────────────────────────
- *   < 0.20  '~'  deep water    blue dim
- *   < 0.30  '~'  water         blue
- *   < 0.40  '.'  lowland       yellow dim
- *   < 0.52  '-'  foothills     green
- *   < 0.65  '^'  slopes        green bold
- *   < 0.78  '#'  peaks         orange
- *   ≥ 0.78  '*'  snowcap       cyan bold
- *
- * Display is bilinearly interpolated from the 65×65 grid to fit any terminal.
- *
- * Keys:
- *   q/ESC quit   space pause/resume   r regenerate   e toggle erosion
- *   ] / [   sim Hz up / down
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra terrain.c -o terrain -lncurses -lm
+ * The two ideas it leans on:
+ *   • Diamond-Square — the classic recipe for fake-but-believable terrain.
+ *     Start with corner heights, repeatedly fill in the midpoint of each gap
+ *     with the average of its neighbours plus a shrinking dash of randomness.
+ *     (Fournier/Fussell/Carpenter 1982; Miller 1986 fixed the seams.)
+ *   • Thermal weathering — the same way a sandpile slumps: wherever the ground
+ *     is too steep, shove a little dirt downhill until it settles.
+ *     (Musgrave/Kolb/Mace 1989.)
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Diamond-Square algorithm for fractal terrain generation,
- *                  combined with thermal weathering erosion simulation.
- *                  Diamond-Square: a 2D analogue of midpoint displacement.
- *                  Step 1 (diamond): centre of each square = mean of 4 corners
- *                    + random(amplitude).
- *                  Step 2 (square): edge midpoints = mean of 2 opposing corners
- *                    + mean of 2 adjacent diamonds + random(amplitude).
- *                  Amplitude halved each iteration → fractal terrain.
- *
- * Math           : Diamond-Square produces 1/f^(2H) power spectrum where H is
- *                  the Hurst exponent.  With amplitude_factor=0.5 → H≈0.5
- *                  (standard Brownian surface, "white" terrain).
- *                  Thermal erosion rule: if slope > TALUS threshold, move
- *                  RATE × (slope − TALUS) material downhill.  This rounds peaks
- *                  and fills valleys, mimicking real geological weathering.
- *
- * Rendering      : Height-mapped to terrain types (water/plains/hills/rock/snow).
- *                  Contour lines drawn at regular height intervals using marching
- *                  squares on the interior, producing topographic map style.
- *
- * References      :
- *
- *   Fractal terrain generation & erosion (the concepts) —
- *   • Fournier, A., Fussell, D. & Carpenter, L. (1982) — "Computer Rendering of
- *     Stochastic Models", CACM 25(6). The origin of Diamond-Square / midpoint
- *     displacement for terrain.
- *   • Miller, G.S.P. (1986) — "The Definition and Rendering of Terrain Maps",
- *     SIGGRAPH. The corrected square step that removes the creasing artefacts of
- *     naive midpoint displacement.
- *   • Musgrave, F.K., Kolb, C. & Mace, R. (1989) — "The Synthesis and Rendering
- *     of Eroded Fractal Terrains", SIGGRAPH. The thermal-weathering (talus-angle)
- *     erosion model used here.
- *   • Mandelbrot, B. (1982) — "The Fractal Geometry of Nature". fBm, the Hurst
- *     exponent H, and the 1/f^(2H) power spectrum the Math note cites.
- *   • Ebert, Musgrave, Peachey, Perlin & Worley — "Texturing & Modeling: A
- *     Procedural Approach". The textbook tying fractal terrain + erosion together.
- *
- *   Contour rendering —
- *   • Lorensen, W. & Cline, H. (1987) — "Marching Cubes", SIGGRAPH; the contour
- *     lines here are its 2D analogue, "marching squares".
- *     https://en.wikipedia.org/wiki/Marching_squares
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -106,55 +27,26 @@
 #include <time.h>
 #include <stdio.h>
 
-/* ── ARCHITECTURE ─────────────────────────────────────────────────────── *
+/*
+ * How the file is laid out. The whole "world" is one square heightmap: built
+ * once, then nibbled at each tick. The sections below split that work apart so
+ * each piece touches only what it owns:
  *
- * Re-cut from first principles into separated concern-layers (a SEPARATION
- * pass: RELOCATE + LABEL only — every function body is byte-identical, nothing
- * renamed). The world is a single heightmap that is generated once and then
- * eroded each tick. Layer → section → what it mutates:
+ *   §1 config      the dial settings (grid size, roughness, erosion strength)
+ *   §2 performance the clock and sleep used to pace the frame rate
+ *   §3 logic       clampf — keeps a number inside a range, nothing else
+ *   §4 simulation  the only code that changes the terrain: build it, erode it
+ *   §5 effects     nothing — colours/contours are worked out fresh while drawing
+ *   §6 delays      nothing — just the pause flag
+ *   §7 render      reads the heightmap and paints it; never changes it
+ *   §8 app         the main loop that ties it together and handles keys
  *
- *   LAYER        §   MUTATES
- *   ─────────────────────────────────────────────────────────────────────
- *   CONFIG       §1  nothing — compile-time constants only (grid size,
- *                    ROUGHNESS, TALUS, EROSION_RATE, …).
- *   PERFORMANCE  §2  nothing — clock_ns / clock_sleep_ns are pure timers; the
- *                    frame cap + fixed-timestep accumulator are POLICY in main.
- *   LOGIC        §3  nothing — clampf, the one pure decision (the RNG helpers
- *                    are NOT pure — rand() advances hidden state — so they sit
- *                    in §4). No render/effects reorder can change a LOGIC result.
- *   SIMULATION   §4  Terrain.{hmap,erode_count} + Scene.{erode,paused} (+ the
- *                    global RNG). The world is GENERATED (terrain_generate:
- *                    Diamond-Square) then ERODED each tick (terrain_erode:
- *                    thermal weathering); scene_tick is the per-tick advance.
- *                    The ONLY writers of sim state.
- *   EFFECTS      §5  (none) — no stored cosmetic buffer; the contour lines are
- *                    derived at render time. One-line section, not a real layer.
- *   DELAYS       §6  (none) — only the pause flag (Scene.paused), checked in
- *                    scene_tick (§4). No timers.
- *   RENDER       §7  ncurses back buffer + colour-pair table only (color_init,
- *                    terrain_draw + its sample_height / terrain_glyph helpers,
- *                    scene_draw, screen_draw). Reads the heightmap (const); never
- *                    writes simulation state.
- *   APP          §8  App.{running,need_resize,sim_fps}; drives Scene via the
- *                    combine + user events.
- *
- * PER-TICK COMBINE (the one place state advances — main(), §8):
- *
- *     while (sim_accum >= tick_ns)        // PERFORMANCE: fixed timestep
- *         scene_tick()                    //   SIMULATION (one erosion sweep)
- *     screen_draw() ; screen_present()    // RENDER (reads only; contours re-derived)
- *     getch() → app_handle_key()          // USER EVENTS — see below
- *
- * Nothing other than scene_tick() advances simulation state, and it does so only
- * while not paused. User events (app_handle_key: 'r' regenerates the heightmap,
- * 'e' toggles erosion) mutate Scene/Terrain on a keypress, once per
- * frame OUTSIDE the accumulator loop, not as part of the tick.
- *
- * ─────────────────────────────────────────────────────────────────────── */
+ * Each frame (in main): run any due erosion ticks, draw, then read one keypress.
+ * Only the erosion tick changes the terrain, and only when not paused. Keys like
+ * 'r' (rebuild) and 'e' (toggle erosion) act once per frame, outside the tick.
+ */
 
-/* ===================================================================== */
-/* §1  CONFIG  -- constants (grid size, roughness, erosion knobs)        */
-/* ===================================================================== */
+/* §1  config — the dial settings (grid size, roughness, erosion strength) */
 
 enum {
     SIM_FPS_MIN     = 10,
@@ -163,7 +55,7 @@ enum {
     SIM_FPS_STEP    = 10,
     FPS_UPDATE_MS   = 500,
 
-    GRID_N          = 6,                  /* grid exponent: 2^6 = 64       */
+    GRID_N          = 6,                  /* grid is 2^GRID_N + 1 cells wide */
     GRID            = (1 << GRID_N) + 1,  /* 65 × 65 heightmap             */
 };
 
@@ -171,31 +63,23 @@ enum {
 #define NS_PER_MS    1000000LL
 #define TICK_NS(f)   (NS_PER_SEC / (f))
 
-/*
- * ROUGHNESS — scale multiplier per iteration (0 = very smooth, 1 = fractal noise).
- * 0.60 gives natural-looking mid-frequency mountains.
- */
+/* How much the random nudge shrinks each round. Lower = smoother, rolling
+ * hills; higher = jagged, noisy terrain. 0.60 lands on natural-looking peaks. */
 #define ROUGHNESS    0.60f
 
-/*
- * TALUS — maximum stable height difference between adjacent cells.
- * Cells steeper than TALUS erode.
- */
+/* The steepest a slope can get before it starts to slump. A bigger gap between
+ * two neighbouring cells than this counts as "too steep, let it slide". */
 #define TALUS        0.022f
 
-/*
- * EROSION_RATE — fraction of excess slope moved per cell per pass.
- * At 60 Hz × ERODE_PASSES=2 per tick: steady, visible erosion over minutes.
- */
+/* How aggressively the too-steep dirt slides downhill, and how many erosion
+ * sweeps run per tick. Small on purpose: the land softens over minutes, not
+ * in a flash. */
 #define EROSION_RATE 0.0012f
 #define ERODE_PASSES 2
 
-/* ===================================================================== */
-/* §2  PERFORMANCE  -- timing primitives (throttle policy in main, §8)   */
-/* ===================================================================== */
+/* §2  performance — the clock and sleep used to pace the frame rate */
 
-/* Timing primitives only. The frame cap and the fixed-timestep accumulator
- * that decide how many scene_tick()s run per frame are POLICY, in main (§8). */
+/* Just the raw timers. How they're used to cap the frame rate lives in main. */
 
 static int64_t clock_ns(void)
 {
@@ -214,44 +98,25 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  LOGIC  -- pure decisions: no mutation, no I/O                     */
-/* ===================================================================== */
-
-/* Pure decisions — clampf is the only one: it returns a value from its
- * arguments with NO mutation and NO I/O. (The RNG helpers are NOT here: rand()
- * advances hidden library state, so they live in §4 with the generation that
- * consumes them.) Nothing in RENDER/EFFECTS can change a LOGIC result. */
+/* §3  logic — clampf, keeps a number inside a range, nothing else */
 
 static float clampf(float v, float lo, float hi)
 {
     return v < lo ? lo : v > hi ? hi : v;
 }
 
-/* ===================================================================== */
-/* §4  SIMULATION  -- advances state (generate + erode the heightmap)    */
-/* ===================================================================== */
-
-/* The ONLY writers of simulation state. The world is a single 65x65 heightmap
- * that is GENERATED then continuously ERODED:
- *  • terrain_generate — Diamond-Square fills the heightmap (uses the randf
- *    stochastic source + clampf), then normalises it to [0,1].
- *  • terrain_erode — one thermal-weathering sweep, moving material downhill
- *    where the slope exceeds TALUS; scene_tick applies it every tick while
- *    Scene.erode is on, so the terrain keeps smoothing over time.
- * Mutates: Terrain.{hmap,erode_count} and Scene.{erode,paused} (+ the global
- * RNG). scene_tick() is the single per-tick entry, called only from main (§8);
- * user events (r regenerate, e toggle erode) also mutate Scene/Terrain but are
- * NOT part of the tick -- see §8. */
+/* §4  simulation — the only code that changes the terrain: build it, erode it */
 
 /* ── Terrain ───────────────────────────────────────────────────────────── *
- * The simulated terrain: a square height field plus how far it has eroded. This
- * is the domain object Diamond-Square fills and thermal weathering smooths — the
- * "height field" of the fractal-terrain literature. The control knobs (pause /
- * erode-on-off) are NOT here; they are how the user drives it, and live on Scene.
- *   hmap         (GRID×GRID) heights ∈ [0,1]; GRID = 2^n+1 so the corners line
- *                up for midpoint displacement.
- *   erode_count  erosion sweeps applied to this height field (reset on regen). */
+ * The landscape itself: a grid of heights, plus a tally of how much erosion
+ * it has been through. Everything else in the program either fills this in or
+ * reads it to draw. The user's controls (pause, erosion on/off) deliberately
+ * live elsewhere, on Scene — this struct is just the ground.
+ *   hmap         the height at each grid point, each value 0.0 (lowest) to
+ *                1.0 (highest). The grid is 2^n+1 wide on purpose so the
+ *                outer corners always line up when we fill in midpoints.
+ *   erode_count  how many erosion sweeps this land has taken (back to 0 on
+ *                rebuild) — shown in the HUD so you can watch it climb. */
 typedef struct {
     float hmap[GRID][GRID];
     int   erode_count;
@@ -259,13 +124,15 @@ typedef struct {
 
 /* ── RNG helpers ────────────────────────────────────────────────────── */
 
+/* A random number from 0 to 1, and one from -1 to +1 — the dice rolls that
+ * give the terrain its bumps. */
 static float randf01(void) { return (float)rand() / (float)RAND_MAX; }
 static float randf11(void) { return randf01() * 2.0f - 1.0f; }
 
 /* ── Diamond-Square generation ──────────────────────────────────────── */
 
-/* diamond_step — for every stride×stride square, set its CENTRE to the mean of
- * the square's four corners plus a random displacement scaled by `scale`. */
+/* Fills the centre of each square: average its four corners, then nudge that
+ * up or down by a random amount. `scale` is how big the nudge can be. */
 static void diamond_step(float (*h)[GRID], int stride, int half, float scale)
 {
     for (int y = 0; y < GRID - 1; y += stride) {
@@ -277,9 +144,10 @@ static void diamond_step(float (*h)[GRID], int stride, int half, float scale)
     }
 }
 
-/* square_step — set every diamond midpoint to the mean of its in-grid edge
- * neighbours (2 on the border, 4 inside) plus a random displacement. The
- * alternating start column per row visits only the diamond centres. */
+/* The other half of the recipe: fills the points sitting on the edges between
+ * those centres. Each one averages the neighbours it actually has (4 inside the
+ * map, only 2 along the border), then gets the same random nudge. The staggered
+ * start per row is what lands us exactly on those edge points. */
 static void square_step(float (*h)[GRID], int stride, int half, float scale)
 {
     for (int y = 0; y < GRID; y += half) {
@@ -295,8 +163,9 @@ static void square_step(float (*h)[GRID], int stride, int half, float scale)
     }
 }
 
-/* normalize_heights — rescale the whole field so its min→max spans exactly
- * [0,1], so the full terrain-type / contour range is visible. */
+/* Stretches the whole map so its lowest point becomes 0 and its highest becomes
+ * 1. Without this a flat-ish random map might be all "plains" green; this makes
+ * sure every run shows the full range from water to snow. */
 static void normalize_heights(float (*h)[GRID])
 {
     float lo = 1.0f, hi = 0.0f;
@@ -312,22 +181,21 @@ static void normalize_heights(float (*h)[GRID])
                 h[y][x] = (h[y][x] - lo) / range;
 }
 
-/*
- * terrain_generate — fill hmap with a fresh Diamond-Square heightmap. Each pass
- * halves the stride and the displacement amplitude (scale *= ROUGHNESS), adding
- * finer detail — a 1/f^(2H) fractal surface — then the field is normalised.
- */
+/* Builds a brand-new landscape from scratch. Each round works at half the spacing
+ * of the last and with a smaller random nudge, so we lay down big shapes first
+ * and finer wrinkles after — the look of real fractal terrain. */
 static void terrain_generate(Terrain *t)
 {
     float (*h)[GRID] = t->hmap;
 
-    /* Seed the four corners; midpoint displacement fills the rest. */
+    /* Start by giving the four corners random heights; everything in between
+     * gets filled in by the two steps below. */
     h[0][0]               = randf01();
     h[0][GRID - 1]        = randf01();
     h[GRID - 1][0]        = randf01();
     h[GRID - 1][GRID - 1] = randf01();
 
-    float scale = 0.5f;                          /* displacement amplitude */
+    float scale = 0.5f;                          /* how big the random nudge can be */
     for (int stride = GRID - 1; stride > 1; stride >>= 1) {
         int half = stride >> 1;
         diamond_step(h, stride, half, scale);
@@ -341,6 +209,10 @@ static void terrain_generate(Terrain *t)
 
 /* ── Thermal weathering ─────────────────────────────────────────────── */
 
+/* One round of "let steep ground slump". For every cell, look at its four
+ * neighbours; wherever the drop to a neighbour is steeper than TALUS, shift a
+ * little height from the high side to the low side. Run enough times and the
+ * mountains soften into hills. */
 static void terrain_erode(Terrain *t)
 {
     float (*h)[GRID] = t->hmap;
@@ -374,12 +246,11 @@ static void terrain_init(Terrain *t)
 }
 
 /* ── Scene ─────────────────────────────────────────────────────────────── *
- * The whole session, as a table of contents: the terrain being simulated plus
- * how the user is driving it. scene_tick (the per-tick orchestrator) is the only
- * writer that advances state; user events flip the knobs.
- *   terrain   WHAT is simulated — the height field (§4 generates/erodes it).
- *   erode     HOW the user drives it — keep applying thermal weathering? (e)
- *   paused    run-state — freeze the erosion (spc). */
+ * The running session: the land itself plus the two switches the user flips
+ * while watching it.
+ *   terrain   the landscape being simulated (built and worn down in §4).
+ *   erode     is erosion turned on? toggled with the 'e' key.
+ *   paused    is everything frozen? toggled with the spacebar. */
 typedef struct {
     Terrain terrain;
     bool    erode;
@@ -401,30 +272,11 @@ static void scene_tick(Scene *s, float dt, int cols, int rows)
     if (s->erode)  terrain_erode(&s->terrain);
 }
 
-/* ===================================================================== */
-/* §5  EFFECTS  -- cosmetic-only state                                   */
-/* ===================================================================== */
+/* §5  effects — nothing stored; colours and glyphs are worked out while drawing */
 
-/* No EFFECTS layer. Nothing cosmetic is stored: the terrain glyphs and the
- * topographic contour lines are DERIVED at render time by bilinearly sampling
- * the heightmap (terrain_draw, §7) — there is no glow/trail buffer. */
+/* §6  delays — nothing but the pause flag, which Scene already carries */
 
-/* ===================================================================== */
-/* §6  DELAYS  -- pauses, holds, timers                                  */
-/* ===================================================================== */
-
-/* No separate layer. The only control is the pause flag (Scene.paused), which
- * early-returns scene_tick (§4) so erosion halts. There are no holds or timers. */
-
-/* ===================================================================== */
-/* §7  RENDER  -- state -> screen (reads only, never mutates sim)        */
-/* ===================================================================== */
-
-/* state -> screen. terrain_draw bilinearly samples the heightmap onto the
- * terminal, picking a terrain-type glyph/colour per cell and overlaying
- * contour lines; screen_draw lays the HUD over it. Reads Terrain; writes ONLY
- * the ncurses back buffer and the colour-pair table (color_init at init).
- * Never mutates simulation state. */
+/* §7  render — reads the heightmap and paints it; never changes it */
 
 static void color_init(void)
 {
@@ -453,9 +305,10 @@ static void color_init(void)
 
 /* ── Drawing ────────────────────────────────────────────────────────── */
 
-/* sample_height — bilinearly sample the height field at a terminal cell. The
- * cell maps to a fractional grid coordinate; interpolating the four surrounding
- * grid heights keeps contours smooth and band-free at any terminal size. */
+/* The 65x65 grid rarely matches the terminal's size, so a screen cell usually
+ * lands between four grid points. This blends those four heights by how close
+ * the cell is to each — a smooth read that avoids blocky stair-steps at any
+ * window size. */
 static float sample_height(const Terrain *t, int row, int col, int rows, int cols)
 {
     float gy_f = (float)(row - 1) / (float)(rows - 2) * (float)(GRID - 1);
@@ -474,9 +327,9 @@ static float sample_height(const Terrain *t, int row, int col, int rows, int col
          + t->hmap[gy + 1][gx + 1] * tx          * ty;
 }
 
-/* terrain_glyph — classify a height into a terrain band; returns the glyph and
- * fills the pair + attr out-params with its colour. The thresholds ARE the
- * band table. */
+/* Turns a height into what you actually see: which character to draw, and its
+ * colour. Low ground is water, high ground is snow, with bands in between — the
+ * list of cutoffs below is the whole map legend. */
 static char terrain_glyph(float v, int *pair, chtype *attr)
 {
     if      (v < 0.20f) { *pair = 6; *attr = A_DIM;  return '~'; }  /* deep water */
@@ -488,8 +341,8 @@ static char terrain_glyph(float v, int *pair, chtype *attr)
     else                { *pair = 5; *attr = A_BOLD; return '*'; }  /* peaks/snow */
 }
 
-/* terrain_draw — paint the height field: per terminal cell, sample the height
- * and draw its terrain-type glyph. */
+/* Paints the whole map: for each screen cell, look up the blended height there
+ * and stamp down the matching character and colour. */
 static void terrain_draw(const Terrain *t, WINDOW *w, int cols, int rows)
 {
     if (cols < 2 || rows < 3) return;
@@ -515,9 +368,9 @@ static void scene_draw(const Scene *s, WINDOW *w,
     terrain_draw(&s->terrain, w, cols, rows);
 }
 
-/* Screen — the terminal viewport: just its current size in cells, refreshed at
- * startup and on resize. Pure presentation geometry; holds no simulation state.
- * (terrain_draw maps the GRID×GRID height field onto these rows × cols.) */
+/* Screen — just how big the terminal currently is, in character cells. We read
+ * this at startup and again whenever the window is resized, so the map can be
+ * stretched to fill whatever space is available. */
 typedef struct { int cols, rows; } Screen;
 
 static void screen_init(Screen *s)
@@ -559,15 +412,7 @@ static void screen_draw(const Screen *s, const Scene *sc,
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
-/* ===================================================================== */
-/* §8  APP  -- events + per-tick combine + main loop                     */
-/* ===================================================================== */
-
-/* Owns the App aggregate, signal flags, user-event handlers and the main loop.
- * main() is the ONE place that combines the layers per tick, in fixed order:
- * scene_tick (SIM, gated by the pause flag) -> screen_draw (RENDER) ->
- * screen_present -> input. app_handle_key() mutates state on USER EVENTS (a
- * keypress; r regenerates, e toggles erosion) and is OUTSIDE the tick. */
+/* §8  app — the main loop that ties it together and handles keys */
 
 typedef struct {
     Scene                 scene;
@@ -637,6 +482,8 @@ int main(void)
         int64_t now = clock_ns();
         int64_t dt  = now - frame_time;
         frame_time  = now;
+        /* If the program was stalled (window dragged, machine busy), don't try
+         * to "catch up" all the missed time at once — it would freeze. Cap it. */
         if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
 
         int64_t tick_ns = TICK_NS(app->sim_fps);

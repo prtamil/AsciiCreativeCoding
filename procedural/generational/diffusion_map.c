@@ -1,22 +1,13 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * diffusion_map.c  —  Diffusion-Limited Aggregation without symmetry
+ * diffusion_map.c — grows tree-like fractal blobs on the terminal.
  *
- * Particles random-walk from a launch circle until they touch the growing
- * cluster and stick.  Without the D6 symmetry constraint of snowflake.c,
- * the aggregate is free to grow in any direction, producing natural fractal
- * branching arms and organic, asymmetric dendrites — the classic DLA
- * morphology described by Witten & Sander (1981).
- *
- * A second "Eden" mode skips the random walk entirely: a random frontier
- * cell (any empty cell adjacent to the cluster) is chosen uniformly and
- * added.  Eden growth is much faster but produces rounder, less fractal
- * shapes (no diffusion bias toward tips).
- *
- * Color is by age_delta = current_frame - cell_join_frame:
- *   newest cells = bright / bold; oldest = dim
- *
- * Themes cycle across 5 color palettes (5 age levels each).
+ * Specks wander in from the edge by random walk and freeze the moment they
+ * bump into the growing cluster. Tips reach out and grab passing specks first,
+ * so the shape branches into spidery arms (this is "diffusion-limited
+ * aggregation"; Witten & Sander 1981). Press 'n' for a faster "Eden" mode that
+ * just fills in random edge cells instead — it grows rounder, plainer blobs,
+ * which makes the contrast easy to see.
  *
  * Keys:
  *   q / ESC   quit
@@ -30,106 +21,17 @@
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra diffusion_map.c -o diffusion_map -lncurses -lm
  *
- * Sections (cut by concern — see ARCHITECTURE block)
- * --------
- *   §1  config
- *   §2  rng
- *   §3  state              (AggregateGrid + Scene types)
- *   §4  logic              (pure decisions — const AggregateGrid*)
- *   §5  simulation         (advances state; scene_tick = combine point)
- *   §6  effects            (none — fade derived in render)
- *   §7  render             (state → screen, read-only)
- *   §8  performance/delays (clock primitives, frame cap)
- *   §9  platform/app       (ncurses, signals, main loop)
+ * References (the things the code can't tell you):
+ *   Witten & Sander, Phys. Rev. Lett. 47, 1400 (1981) — the original DLA paper.
+ *   Eden, Proc. 4th Berkeley Symp. (1961) — origin of the Eden growth model.
+ *   Meakin, "Fractals, Scaling and Growth Far from Equilibrium" (1998) — the
+ *     launch-ring / kill-radius walker recipe used here.
+ *   Bourke, paulbourke.net/dataformats/asciiart — the @ # + : . brightness ramp.
+ *
+ * Sections:
+ *   §1 config  §2 rng  §3 state  §4 logic  §5 simulation
+ *   §6 effects (none)  §7 render  §8 timing  §9 ncurses/main loop
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Two aggregation modes in one file:
- *                  DLA (Diffusion-Limited Aggregation, Witten & Sander 1981):
- *                    Particles launched from a ring, random-walk until they
- *                    touch the cluster.  Tip-screening effect: tips extend
- *                    further from the centre and capture walkers preferentially,
- *                    creating fractal branching with D ≈ 1.7 in 2D.
- *                  Eden model: directly attach a random frontier cell.
- *                    No diffusion → no tip screening → compact, rounder shapes
- *                    (D → 2 as cluster grows; no fractal structure at large scales).
- *
- * Math           : DLA fractal dimension D ≈ 1.71 in 2D.
- *                  Cluster radius R ~ N^(1/D) where N = number of particles.
- *                  Comparison between modes in the same code illustrates how
- *                  diffusion (randomness in the approach path) is necessary for
- *                  fractal self-similar morphology.
- *
- * Performance    : DLA walker cost: O(R²) expected random-walk steps per particle
- *                  (hitting probability from radius 2R to R ≈ 1/(log R) in 2D).
- *                  Eden mode: O(frontier size) per particle — much faster.
- *
- * References     : Concepts —
- *                   [1] Witten & Sander, "Diffusion-Limited Aggregation, a Kinetic
- *                       Critical Phenomenon", Phys. Rev. Lett. 47, 1400 (1981).
- *                       The founding DLA paper.
- *                   [2] Witten & Sander, "Diffusion-limited aggregation",
- *                       Phys. Rev. B 27, 5686 (1983). Full theory; D ≈ 1.71.
- *                   [3] Meakin, "Fractals, Scaling and Growth Far from Equilibrium"
- *                       (Cambridge, 1998). Definitive treatment of DLA & Eden, and
- *                       the launch-circle / kill-radius walker algorithm used here.
- *                   [4] Vicsek, "Fractal Growth Phenomena", 2nd ed. (World
- *                       Scientific, 1992). Broad survey of DLA, Eden, and kin.
- *                   [5] Eden, "A two-dimensional growth process", Proc. 4th Berkeley
- *                       Symp. Math. Stat. Prob. (1961). Origin of the Eden model.
- *                   [6] Mandelbrot, "The Fractal Geometry of Nature" (Freeman,
- *                       1982). Fractal dimension as a measure of branching.
- *                   [7] Bourke, "Constructing a diffusion limited aggregate",
- *                       paulbourke.net/fractals/dla. Practical implementation recipe.
- *                  Rendering —
- *                   [8] Bourke, "Character representation of grey scale images",
- *                       paulbourke.net/dataformats/asciiart. The intensity→glyph
- *                       ramp behind age_to_char()'s @ # + : . mapping.
- *                   [9] Ben-Halim & Raymond, "Writing Programs with NCURSES"
- *                       (NCURSES HOWTO). Color pairs, erase/refresh, the terminal
- *                       rendering model used in §7 and §9.
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── ARCHITECTURE (layers + types) ───────────────────────────────────────
- *
- * One real domain type — AggregateGrid — carries the simulated object AND its
- * growth clock (joined[] timestamps are meaningless without frame, so they
- * live together).  Everything else the user touches is a handful of loose
- * fields on Scene; none forms a concept a textbook would name, so none gets a
- * struct of its own.  Each tick, scene_tick() (§5) is the ONE state advance.
- *
- *   LAYER          §   READS / MUTATES                    KEY FUNCTIONS
- *   ------------  --   ------------------------------     -------------------------
- *   CONFIG         1   (constants only)                  —
- *   RNG            2   g_lcg                             lcg_f, lcg_i, seed_rng
- *   STATE          3   defines AggregateGrid, Scene      (types + the one Scene)
- *   LOGIC          4   const AggregateGrid* (read)       aggregate_has_neighbor, cell_age,
- *                                                        chebyshev_from_centre,
- *                                                        collect_frontier, age_to_pair/char
- *   SIMULATION     5   AggregateGrid* / Scene* (mutate)  aggregate_reset/add_cell, launch_on_ring,
- *                                                        random_walk_step, dla_step, eden_step,
- *                                                        scene_tick <-- combine point
- *   EFFECTS        6   (none — see note)                 —
- *   RENDER         7   const sub-types → terminal        aggregate_draw, color_init_theme,
- *                                                        screen_draw_hud, render_frame
- *   PERF/DELAYS    8   (local timing only)               clock_ns, clock_sleep_ns
- *   PLATFORM/APP   9   Scene*, g_scr_*, signal flags     main, app_init, app_resize,
- *                                                        app_handle_key, install_signals
- *
- * Contracts:
- *   (a) Signature convention IN FORCE: a pure read takes a const pointer
- *       (const AggregateGrid*); a mutator takes a non-const pointer. Workers take
- *       the narrowest sub-type; only whole-scene orchestrators — scene_init,
- *       scene_tick, and the app_* drivers (app_init / app_resize / app_handle_key)
- *       — take Scene*, so hanging data off Scene never re-couples the layers.
- *   (b) LOGIC (§4) never mutates and does no I/O; RENDER (§7) writes only to
- *       the terminal. Neither can corrupt the other's inputs.
- *   (c) scene_tick() is the single per-tick combine point. reset/resize/key in
- *       §9 also mutate state, but are USER EVENTS, not part of the tick.
- *   (d) EFFECTS is empty: the age fade is derived at RENDER time from
- *       joined[][] (a SIMULATION field), not stored as cosmetic state.
- * ──────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -156,30 +58,32 @@ enum {
     WALKER_DEFAULT  =   3,
     WALKER_MAX      =  10,
 
-    MAX_STEPS       = 500,   /* max random-walk steps before aborting     */
-    LAUNCH_PAD      =   3,   /* launch circle = radius + LAUNCH_PAD       */
+    MAX_STEPS       = 500,   /* give up on a wandering speck after this many steps */
+    LAUNCH_PAD      =   3,   /* specks start this far outside the cluster's edge   */
 
     N_THEMES        =   5,
-    N_AGE_LEVELS    =   5,   /* color pairs CP_A0 … CP_A4                 */
-    CP_HUD          =   1,   /* data line (row 0)                         */
-    CP_A0           =   2,   /* newest cells (index offset 0)             */
+    N_AGE_LEVELS    =   5,   /* 5 colour shades, newest cell to oldest             */
+    CP_HUD          =   1,   /* colour slot for the top status line                */
+    CP_A0           =   2,   /* colour slot for the newest cells; next 4 follow it */
     /* CP_A1 = 3, CP_A2 = 4, CP_A3 = 5, CP_A4 = 6                        */
-    CP_HINT         =   7,   /* action line (bottom row)                  */
+    CP_HINT         =   7,   /* colour slot for the bottom key-hint line           */
 
     FPS_UPDATE_MS   = 500,
-    MAX_FRAME_MS    = 200,   /* clamp dt to this — avoids the spiral-of-death
-                                after a stall (slow terminal / suspend)    */
+    MAX_FRAME_MS    = 200,   /* if a frame ran way long (slow terminal, suspend),
+                                pretend it was only this long so the loop doesn't
+                                try to "catch up" and stall forever                */
 };
 
-/* age_delta thresholds: 0-5, 6-20, 21-80, 81-300, 300+ */
+/* How old a cell can be and still count in each shade, newest to oldest. */
 static const int AGE_THRESH[N_AGE_LEVELS] = { 5, 20, 80, 300, INT32_MAX };
 
 #define RENDER_NS   (1000000000LL / RENDER_FPS)
 #define NS_PER_SEC  1000000000LL
 #define NS_PER_MS   1000000LL
 
-/* one full turn in radians; kept at this exact literal (not 2·M_PI) so the
-   RNG-driven launch angles — and thus the exact cluster — are unchanged */
+/* One full turn around a circle. Frozen at this exact rounded value (not the
+   more precise 2·M_PI) on purpose: the random launch angles depend on it, so
+   changing it would grow a different-looking cluster from the same seed. */
 static const float TWO_PI = 6.28318f;
 
 /* ===================================================================== */
@@ -194,14 +98,14 @@ static float lcg_f(void)
     return (float)(g_lcg >> 8) / (float)(1u << 24);
 }
 
-/* integer in [0, n) */
+/* A random whole number from 0 up to (but not including) n. */
 static int lcg_i(int n)
 {
     g_lcg = g_lcg * 1664525u + 1013904223u;
     return (int)((g_lcg >> 8) % (uint32_t)n);
 }
 
-/* Seed the generator from the monotonic clock so every run differs */
+/* Mix the clock into the seed so each run grows a different cluster. */
 static void seed_rng(void)
 {
     struct timespec ts;
@@ -214,95 +118,88 @@ static void seed_rng(void)
 /* ===================================================================== */
 
 /*
- * AggregateGrid — the cluster grown by diffusion-limited aggregation, stored on
- * a square lattice (one cell per terminal character).
+ * AggregateGrid — the growing blob and everything we know about it.
  *
- * WHY a grid (not just a point list): on-lattice DLA is *defined* on a lattice —
- * particles occupy discrete sites, "stick" by 4-neighbor adjacency, and the
- * cluster's reach is measured in lattice steps. The grid is the model, not an
- * implementation detail (Witten & Sander 1981 [1]; Meakin 1998 [3]).
+ * The blob lives on a grid, one cell per character on screen. A grid (rather
+ * than a list of points) is the natural fit: in this model specks land on grid
+ * squares and stick when they touch a neighbouring filled square, so "the grid"
+ * really is the thing being grown, not just storage for it.
  *
- * WHY the clock lives here: each cell records the frame it joined (joined[]),
- * and RENDER fades a cell by age = frame - joined. Those timestamps are
- * meaningless without the clock that stamped them, so `frame` belongs WITH the
- * grid rather than in a separate "lifecycle" struct.
+ * The grid also carries its own little clock (`frame`). Every cell remembers
+ * which frame it stuck on, and the colours fade with age (now minus that
+ * stamp). The stamps mean nothing without the clock they were measured against,
+ * so the clock rides along here instead of in a separate struct.
  *
- * All buffers are fixed-size — the hot path never allocates (project memory rule).
+ * Everything is fixed-size so the busy loop never has to ask for memory.
  */
 typedef struct {
-    /* the lattice — SIMULATION writes, LOGIC + RENDER only read */
-    uint8_t  cell  [ROWS_MAX][COLS_MAX];  /* membership: 0 = empty, 1 = aggregate.
-                                             a compact byte grid that memset() clears
-                                             in one shot on reset.                  */
-    uint16_t joined[ROWS_MAX][COLS_MAX];  /* frame each cell stuck, low 16 bits.
-                                             uint16_t halves memory vs int; past
-                                             ~65k frames the stored value wraps, so
-                                             an age computed across a wrap is only
-                                             approximate — harmless, as such cells
-                                             already sit in the oldest tier. Drives
-                                             the age→colour/glyph ramp (Bourke [8]). */
+    /* the grid itself — only the simulation writes here; logic and drawing read */
+    uint8_t  cell  [ROWS_MAX][COLS_MAX];  /* is this square filled? 0 = empty,
+                                             1 = part of the blob. One byte each so
+                                             a single memset() wipes it on reset.   */
+    uint16_t joined[ROWS_MAX][COLS_MAX];  /* the frame this square got filled, kept
+                                             as the low 16 bits to save memory. Past
+                                             ~65k frames the number rolls over, so a
+                                             very old cell's age can come out fuzzy —
+                                             harmless, since it's already in the
+                                             oldest, dimmest shade either way.       */
 
-    /* geometry — emerges from growth; sizes the walker launch ring */
-    int rows, cols;   /* ACTIVE extent (≤ ROWS_MAX/COLS_MAX); taken from the
-                         terminal size so the cluster fills the visible screen.     */
-    int cx, cy;       /* seed centre. Growth starts from one central cell so the
-                         aggregate can branch radially in every direction.          */
-    int radius;       /* largest Chebyshev distance max(|dr|,|dc|) of any cell from
-                         the centre. Chebyshev — not Euclidean — so the launch ring
-                         and kill radius are cheap box bounds: walkers spawn at
-                         radius+LAUNCH_PAD and die past ~2·radius (the launch-circle
-                         / kill-radius scheme of Meakin [3]). Grows as tips extend. */
-    int size;         /* occupied-cell count = N particles. Feeds the HUD and is the
-                         N in cluster radius R ~ N^(1/D), D≈1.71 (Vicsek [4];
-                         Mandelbrot [6]).                                            */
+    /* size and shape — these grow on their own as the blob grows */
+    int rows, cols;   /* how much of the grid we actually use, matched to the
+                         terminal so the blob fills the visible screen.             */
+    int cx, cy;       /* the centre cell we start from, so the blob can branch out
+                         in every direction.                                         */
+    int radius;       /* how far the blob reaches from the centre, measured as the
+                         bigger of the row gap and column gap (chessboard distance).
+                         Using that instead of true straight-line distance keeps the
+                         launch ring and the "too far, give up" check to cheap box
+                         comparisons. Grows as the arms reach outward.               */
+    int size;         /* how many squares are filled — shown in the status line.    */
 
-    /* growth clock — the time axis joined[] is measured against */
-    int frame;        /* monotonically increasing tick counter, reset to 1 on clear.
-                         age_delta = frame - joined, clamped ≥ 0.                    */
+    /* the growth clock that joined[] is measured against */
+    int frame;        /* ticks up every step, reset to 1 on clear. A cell's age is
+                         this minus its joined-stamp (never negative).               */
 } AggregateGrid;
 
 /*
- * Scene — the whole program in one place, read like a table of contents.
+ * Scene — the whole program's state in one place, like a table of contents.
  *
- * Only `aggregate` earns a type of its own; the remaining fields are loose knobs
- * that no aggregation textbook would name as a concept, so they stay flat —
- * grouped by what they BELONG to, not by the key that happens to toggle them
- * (hence `theme`, a render choice, sits apart from the simulation knobs).
+ * Only the blob is complex enough to deserve its own type; the rest are just
+ * user-facing knobs, grouped by what they affect (the colour theme sits apart
+ * from the growth knobs since it only changes how cells look, not how they grow).
  */
 typedef struct {
-    AggregateGrid aggregate;  /* WHAT is simulated, plus its growth clock.        */
+    AggregateGrid aggregate;  /* the blob being grown, plus its clock.            */
 
-    /* HOW the user drives the simulation (SIMULATION knobs) */
-    bool eden_mode;  /* which growth model is running:
-                        false = DLA — diffusion-limited random walk; tip-screening
-                                yields fractal dendrites, D≈1.71 (Witten&Sander [1]).
-                        true  = Eden — attach a uniformly-random frontier cell; no
-                                diffusion → no screening → compact blob, D→2
-                                (Eden 1961 [5]).
-                        Both modes grow on the SAME grid so the morphologies can be
-                        compared directly — that contrast is the point of the demo. */
-    int  n_walkers;  /* particles deposited per tick (WALKER_MIN..WALKER_MAX). A
-                        throughput knob only — it sets how FAST the cluster grows,
-                        not its shape. Bounded because each DLA particle costs an
-                        O(R²) random walk, so large values stall the frame rate.    */
-    bool paused;     /* run-state: true freezes growth while RENDER keeps drawing,
-                        so the current aggregate stays on screen for inspection.    */
+    /* knobs that change how the blob grows */
+    bool eden_mode;  /* which growth style is running:
+                        false = DLA — specks wander in and stick; arms grab passers-by
+                                first, so it branches (the default, fractal look).
+                        true  = Eden — just fill a random edge cell each step; no
+                                wandering, so it grows into a plain rounded blob.
+                        Both run on the same grid so you can flip between them and
+                        compare — that side-by-side is the whole point of the demo. */
+    int  n_walkers;  /* how many cells to add per frame (WALKER_MIN..WALKER_MAX).
+                        Only a speed dial — it changes how fast the blob grows, not
+                        its shape. Capped because each wandering speck is expensive,
+                        so a high count would drag the frame rate down.             */
+    bool paused;     /* true = stop growing but keep drawing, so you can study the
+                        current shape on screen.                                    */
 
-    /* RENDER: which palette — a view choice, deliberately kept off the sim knobs
-       (it changes how cells are coloured, nothing about how they grow). */
-    int  theme;      /* index into THEME_FG / THEME_NAME, 0..N_THEMES-1.            */
+    /* knob that changes only how the blob looks */
+    int  theme;      /* which colour palette, 0..N_THEMES-1.                       */
 } Scene;
 
 static Scene g_scene;
 
-/* terminal geometry — owned by PLATFORM (§9), read by RENDER (§7) */
+/* current terminal size; the §9 setup code sets it, the drawing code reads it */
 static int g_scr_rows, g_scr_cols;
 
 /* ===================================================================== */
-/* §4  logic  —  pure decisions: no mutation, no I/O, readable in isolation */
+/* §4  logic  —  questions about the grid; they answer, never change it    */
 /* ===================================================================== */
 
-/* True if any 4-neighbor of (r,c) is part of the aggregate */
+/* True if any of the four squares touching (r,c) is part of the blob. */
 static bool aggregate_has_neighbor(const AggregateGrid *agg, int r, int c)
 {
     if (r > 0              && agg->cell[r-1][c]) return true;
@@ -312,7 +209,7 @@ static bool aggregate_has_neighbor(const AggregateGrid *agg, int r, int c)
     return false;
 }
 
-/* Map age_delta to color pair index (CP_A0 … CP_A4) */
+/* Pick the colour slot for a cell of this age (newer = brighter). */
 static int age_to_pair(int age_delta)
 {
     for (int i = 0; i < N_AGE_LEVELS; i++)
@@ -321,7 +218,7 @@ static int age_to_pair(int age_delta)
     return CP_A0 + N_AGE_LEVELS - 1;
 }
 
-/* Map age_delta to display character */
+/* Pick the on-screen character for a cell of this age (newer = denser glyph). */
 static chtype age_to_char(int age_delta)
 {
     if (age_delta <= AGE_THRESH[0]) return (chtype)'@';
@@ -331,9 +228,9 @@ static chtype age_to_char(int age_delta)
     return (chtype)'.';
 }
 
-/* Chebyshev (chessboard) distance from the seed centre to (r,c). The launch
- * ring and kill radius use this metric, not Euclidean, so they stay cheap
- * square box-bounds (Meakin [3]). */
+/* How far (r,c) is from the centre, measured like a chess king: the bigger of
+ * the row gap and the column gap. Cheaper than true distance, and that's all
+ * the launch ring and the give-up check need. */
 static int chebyshev_from_centre(const AggregateGrid *agg, int r, int c)
 {
     int dr = abs(r - agg->cy);
@@ -341,16 +238,16 @@ static int chebyshev_from_centre(const AggregateGrid *agg, int r, int c)
     return (dr > dc) ? dr : dc;
 }
 
-/* Age of a cell in frames: how long ago it joined, clamped ≥ 0 (a join stamp
- * can read "ahead" only after the 16-bit wrap; see the joined[] note). */
+/* How many frames ago this cell stuck. Never negative — a stamp can only look
+ * "in the future" after the 16-bit counter rolls over (see the joined[] note). */
 static int cell_age(const AggregateGrid *agg, int r, int c)
 {
     int age = agg->frame - (int)agg->joined[r][c];
     return (age < 0) ? 0 : age;
 }
 
-/* Gather the growth frontier — every empty cell touching the aggregate — into
- * the caller's arrays; returns how many were found. */
+/* List every empty cell that touches the blob (the spots it could grow into)
+ * into the caller's arrays, and return how many there are. */
 static int collect_frontier(const AggregateGrid *agg, int *fr, int *fc)
 {
     int n = 0;
@@ -368,9 +265,10 @@ static int collect_frontier(const AggregateGrid *agg, int *fr, int *fc)
 }
 
 /* ===================================================================== */
-/* §5  simulation  —  the only layer that advances state                  */
+/* §5  simulation  —  the only place the grid actually changes            */
 /* ===================================================================== */
 
+/* The four steps a wandering speck can take: up, down, left, right. */
 static const int DR4[4] = { -1, 1,  0, 0 };
 static const int DC4[4] = {  0, 0, -1, 1 };
 
@@ -380,7 +278,7 @@ static void aggregate_set_size(AggregateGrid *agg, int cols, int rows)
     agg->rows = (rows < ROWS_MAX) ? rows : ROWS_MAX;
 }
 
-/* Clear the lattice, restart the clock, and re-seed a single cell at the centre */
+/* Wipe the grid, restart the clock, and drop one seed cell in the middle. */
 static void aggregate_reset(AggregateGrid *agg)
 {
     memset(agg->cell,   0, sizeof agg->cell);
@@ -391,27 +289,28 @@ static void aggregate_reset(AggregateGrid *agg)
     agg->frame  = 1;
     agg->size   = 0;
 
-    /* Seed: single cell at center, stamped at the initial frame */
+    /* The starting cell: one square in the middle, stamped with frame 1. */
     agg->cell  [agg->cy][agg->cx] = 1;
     agg->joined[agg->cy][agg->cx] = 1;
     agg->size  = 1;
 }
 
-/* Add cell (r,c) to the aggregate, stamping it with the current frame */
+/* Fill square (r,c), stamp it with the current frame, and grow the counts. */
 static void aggregate_add_cell(AggregateGrid *agg, int r, int c)
 {
     agg->cell  [r][c] = 1;
     agg->joined[r][c] = (uint16_t)(agg->frame & 0xFFFF);
     agg->size++;
 
-    /* extend the tracked cluster extent if this cell reaches further out */
+    /* if this cell reaches further out than any before, the blob just grew. */
     int reach = chebyshev_from_centre(agg, r, c);
     if (reach > agg->radius) agg->radius = reach;
 }
 
-/* Spawn a walker at a random point on the launch ring (radius + LAUNCH_PAD),
- * clamped inside the grid. The 0.5 on the row term squashes the ring vertically
- * to correct for ~2:1 terminal character aspect, so it reads as a circle. */
+/* Drop a new speck at a random spot on a ring just outside the blob, kept
+ * inside the grid. The row part is halved because terminal characters are about
+ * twice as tall as they are wide — without that squash the "circle" would look
+ * like a tall oval. */
 static void launch_on_ring(const AggregateGrid *agg, int *r, int *c)
 {
     float angle = lcg_f() * TWO_PI;
@@ -426,7 +325,7 @@ static void launch_on_ring(const AggregateGrid *agg, int *r, int *c)
     if (*c >= agg->cols) *c = agg->cols - 1;
 }
 
-/* Move (r,c) one unit in a uniformly random 4-direction (one random-walk step) */
+/* Nudge the speck one square in a random direction — one step of its wander. */
 static void random_walk_step(int *r, int *c)
 {
     int dir = lcg_i(4);
@@ -435,12 +334,12 @@ static void random_walk_step(int *r, int *c)
 }
 
 /*
- * dla_step — advance growth by one DLA particle:
- *   1. Launch on the ring around the cluster.
- *   2. Random-walk until it sticks, wanders past the kill radius, or
- *      exhausts MAX_STEPS.
- *   3. Stick where it first touches the aggregate.
- * Returns true if the particle stuck.
+ * dla_step — grow the blob by one wandering speck.
+ *   1. Drop it on the ring just outside the blob.
+ *   2. Let it wander until it touches the blob, drifts too far away, or runs out
+ *      of patience.
+ *   3. Freeze it on the spot where it first touches.
+ * Returns true if it stuck, false if it gave up.
  */
 static bool dla_step(AggregateGrid *agg)
 {
@@ -451,44 +350,45 @@ static bool dla_step(AggregateGrid *agg)
 
     for (int step = 0; step < MAX_STEPS; step++) {
         if (r < 0 || r >= agg->rows || c < 0 || c >= agg->cols)
-            return false;                                  /* walked off-grid */
+            return false;                                  /* wandered off the grid */
 
         if (chebyshev_from_centre(agg, r, c) > kill_radius)
-            return false;                                  /* wandered too far — abandon */
+            return false;                                  /* drifted too far — give up */
 
         if (aggregate_has_neighbor(agg, r, c)) {
             if (agg->cell[r][c] == 0) {
-                aggregate_add_cell(agg, r, c);             /* touched cluster → stick */
+                aggregate_add_cell(agg, r, c);             /* touched the blob — freeze here */
                 return true;
             }
-            /* already occupied — keep walking */
+            /* this square's already filled — keep wandering */
         }
 
         random_walk_step(&r, &c);
     }
-    return false;                                          /* never stuck */
+    return false;                                          /* ran out of steps */
 }
 
 /*
- * eden_step — advance growth by one Eden particle: pick a uniformly random cell
- * from the growth frontier and add it. No diffusion, so growth has no tip bias.
+ * eden_step — grow the blob the simple way: pick a random empty cell along its
+ * edge and fill it. No wandering, so no arms reach out ahead of the rest —
+ * that's why Eden grows a plain rounded blob.
  * Returns true if a cell was added.
  */
 static bool eden_step(AggregateGrid *agg)
 {
-    /* scratch frontier buffers — static so they are not re-allocated per call */
+    /* room to list the edge cells; static so we don't grab memory every call. */
     static int fr[ROWS_MAX * COLS_MAX];
     static int fc[ROWS_MAX * COLS_MAX];
 
     int n = collect_frontier(agg, fr, fc);
-    if (n == 0) return false;                  /* aggregate fully enclosed */
+    if (n == 0) return false;                  /* no edge left — blob fills the grid */
 
-    int idx = lcg_i(n);                        /* uniform pick over the frontier */
+    int idx = lcg_i(n);                        /* every edge cell equally likely */
     aggregate_add_cell(agg, fr[idx], fc[idx]);
     return true;
 }
 
-/* Orchestrator: set the user-tunable knobs to their defaults */
+/* Set the user knobs to their starting values. */
 static void scene_init(Scene *s)
 {
     s->eden_mode = false;
@@ -497,10 +397,9 @@ static void scene_init(Scene *s)
 }
 
 /*
- * scene_tick — THE single per-tick combine point (contract c).
- * Order each tick: (1) DELAY gate (paused), (2) advance the growth clock,
- * (3) SIMULATION step (DLA or Eden). LOGIC is consulted inside the step calls;
- * RENDER and EFFECTS are never touched here.
+ * scene_tick — one step of the whole simulation, and the only place the blob
+ * grows: if not paused, bump the clock and add this frame's batch of cells
+ * (wandering specks in DLA mode, random edge fills in Eden mode).
  */
 static void scene_tick(Scene *s)
 {
@@ -522,24 +421,24 @@ static void scene_tick(Scene *s)
 /* ===================================================================== */
 
 /*
- * No EFFECTS layer.  There is no cosmetic-only state (no glow/trail/flash
- * buffer).  The bright→dim age fade is derived at RENDER time (§7
- * aggregate_draw) from age_delta = frame - joined[r][c]; since it is computed,
- * not stored, there is nothing for an EFFECTS layer to own or mutate.
+ * Nothing lives here. The only visual flourish is the bright-to-dim fade as
+ * cells age, and that's worked out fresh while drawing (§7) from each cell's
+ * stick-time — it's never stored, so there's nothing for this section to keep.
  */
 
 /* ===================================================================== */
-/* §7  render  —  state → screen, reads only, never mutates state         */
+/* §7  render  —  draws the grid to the screen; never changes it          */
 /* ===================================================================== */
 
 /*
- * 5 themes × 5 age levels (newest → oldest):
+ * The five colour palettes. Each row is one theme, listed newest cell to
+ * oldest, so a cell starts bright and fades as it ages:
  *
- *  Coral:  231 226 208 196 124  white→yellow→orange→red→dark red
- *  Ice:    231 123  51  27  17  white→cyan→blue→dark
- *  Lava:   231 220 208 196  88  white→yellow→orange→red→dark
- *  Plasma: 231 213 165  93  54  white→pink→purple→dark
- *  Mono:   255 251 244 238 235  bright→dark grays
+ *  Coral:  white -> yellow -> orange -> red -> dark red
+ *  Ice:    white -> cyan -> blue -> dark
+ *  Lava:   white -> yellow -> orange -> red -> dark
+ *  Plasma: white -> pink -> purple -> dark
+ *  Mono:   bright -> dark grays
  */
 static const short THEME_FG[N_THEMES][N_AGE_LEVELS] = {
     { 231, 226, 208, 196, 124 },  /* Coral  */
@@ -553,14 +452,14 @@ static const char *THEME_NAME[N_THEMES] = {
     "Coral", "Ice", "Lava", "Plasma", "Mono"
 };
 
-/* Fallback 8-color equivalents for each age level */
+/* Stand-in colours for old terminals that only have 8 of them. */
 static const short THEME_FG8[N_AGE_LEVELS] = {
     COLOR_WHITE, COLOR_CYAN, COLOR_CYAN, COLOR_RED, COLOR_RED
 };
 
 static void color_init_theme(int theme)
 {
-    /* HUD pairs: bright yellow data line, bright cyan action line */
+    /* The two status lines: yellow up top, cyan at the bottom. */
     if (COLORS >= 256) {
         init_pair(CP_HUD,  226, COLOR_BLACK);
         init_pair(CP_HINT,  51, COLOR_BLACK);
@@ -569,7 +468,7 @@ static void color_init_theme(int theme)
         init_pair(CP_HINT, COLOR_CYAN,   COLOR_BLACK);
     }
 
-    /* Age level pairs CP_A0 … CP_A4 */
+    /* The five age shades for the blob itself. */
     for (int i = 0; i < N_AGE_LEVELS; i++) {
         if (COLORS >= 256)
             init_pair((short)(CP_A0 + i),
@@ -590,7 +489,7 @@ static void aggregate_draw(const AggregateGrid *agg)
             int pair  = age_to_pair(age);
             chtype ch = age_to_char(age);
             attr_t attr = (attr_t)COLOR_PAIR(pair);
-            if (age <= AGE_THRESH[0]) attr |= A_BOLD;     /* newest tier glows bold */
+            if (age <= AGE_THRESH[0]) attr |= A_BOLD;     /* freshest cells glow bold */
 
             attron(attr);
             mvaddch(r, c, ch);
@@ -599,22 +498,22 @@ static void aggregate_draw(const AggregateGrid *agg)
     }
 }
 
-/* Draw a HUD line at row, clipped to the terminal width so it never overflows */
+/* Print one status line, trimmed so it never spills off the right edge. */
 static void hud_line(int row, int pair, const char *s)
 {
     char buf[128];
     int n = snprintf(buf, sizeof buf, "%s", s);
-    if (n > g_scr_cols) buf[g_scr_cols] = '\0';   /* clip to screen width */
+    if (n > g_scr_cols) buf[g_scr_cols] = '\0';   /* cut it to fit the screen width */
 
     attron(COLOR_PAIR(pair) | A_BOLD);
     mvprintw(row, 0, "%s", buf);
     attroff(COLOR_PAIR(pair) | A_BOLD);
 }
 
-/* Status line summarises the whole scene; read-only, so const Scene* is fine */
+/* Draw both status lines: mode/theme/counts up top, key reminders at the bottom. */
 static void screen_draw_hud(const Scene *s, double fps)
 {
-    /* Top: live data */
+    /* Top line: what's happening right now. */
     char data[128];
     snprintf(data, sizeof data,
              " %s | %s | walkers:%d | size:%d | %.1f fps ",
@@ -625,7 +524,7 @@ static void screen_draw_hud(const Scene *s, double fps)
              fps);
     hud_line(0, CP_HUD, data);
 
-    /* Bottom: interactive keys */
+    /* Bottom line: the keys you can press. */
     hud_line(g_scr_rows - 1, CP_HINT,
              " q:quit  spc:pause  r:reset  t/T:theme  +/-:walkers  n:mode ");
 }
@@ -636,7 +535,7 @@ static void screen_present(void)
     doupdate();
 }
 
-/* Compose one frame: clear, draw the aggregate, overlay the HUD, flush */
+/* Paint one full frame: wipe, draw the blob, lay the status lines on top, show it. */
 static void render_frame(const Scene *s, double fps)
 {
     erase();
@@ -646,7 +545,7 @@ static void render_frame(const Scene *s, double fps)
 }
 
 /* ===================================================================== */
-/* §8  performance / delays  —  timing primitives + frame cap             */
+/* §8  timing  —  read the clock and sleep, to hold a steady frame rate    */
 /* ===================================================================== */
 
 static int64_t clock_ns(void)
@@ -667,7 +566,7 @@ static void clock_sleep_ns(int64_t ns)
 }
 
 /* ===================================================================== */
-/* §9  platform / app  —  ncurses setup, signals, input, main loop        */
+/* §9  app  —  terminal setup, signals, keypresses, and the main loop      */
 /* ===================================================================== */
 
 static volatile sig_atomic_t g_running    = 1;
@@ -677,7 +576,7 @@ static void on_exit_signal(int sig)   { (void)sig; g_running     = 0; }
 static void on_resize_signal(int sig) { (void)sig; g_need_resize = 1; }
 static void cleanup(void)             { endwin(); }
 
-/* Restore the terminal on exit and route quit/resize signals to flags */
+/* Tidy the terminal on exit, and turn quit/resize signals into simple flags. */
 static void install_signals(void)
 {
     atexit(cleanup);
@@ -753,7 +652,7 @@ static bool app_handle_key(Scene *s, int ch)
     return true;
 }
 
-/* Bring up the terminal and seed the simulation to its starting state */
+/* Start up the screen and reset everything to its opening state. */
 static void app_init(Scene *s)
 {
     s->theme = 0;
@@ -786,7 +685,7 @@ int main(void)
 
         scene_tick(&g_scene);
 
-        /* measure frame time and refresh the FPS readout twice a second */
+        /* time this frame, and recompute the fps number twice a second */
         int64_t now = clock_ns();
         int64_t dt  = now - last_frame;
         last_frame  = now;
@@ -802,12 +701,12 @@ int main(void)
 
         render_frame(&g_scene, fps_display);
 
-        /* read one key; a quit request ends the loop */
+        /* grab one keypress; if it was 'quit', stop the loop */
         int ch = getch();
         if (ch != ERR && !app_handle_key(&g_scene, ch))
             g_running = 0;
 
-        /* throttle to RENDER_FPS: sleep off whatever time the frame left */
+        /* sleep off the rest of this frame's time slice so the rate stays steady */
         int64_t elapsed = clock_ns() - last_frame + dt;
         clock_sleep_ns(RENDER_NS - elapsed);
     }

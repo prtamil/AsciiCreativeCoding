@@ -1,159 +1,25 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * procedural_city.c
- *   — A procedural city plan: a recursive L-system rewrites a single
- *     "city block" into roads and ever-smaller sub-blocks; the leaves
- *     of the recursion are lots that get assigned building types.
- *     The city is drawn growing in real time, depth-by-depth, then
- *     held briefly before being torn down and re-grown from a new
- *     seed.
+ *   Grows a fake city in the terminal. We start with one big block,
+ *   keep slicing it in half with roads until the pieces are small
+ *   enough to be a single lot, then fill each lot with buildings or a
+ *   park. The whole thing is animated growing in, held a few seconds,
+ *   then torn down and re-grown from a fresh random seed.
  *
- *
- * Study alongside:
- *   ../generational/bsp_dungeon_showcase.c
- *      — the same BSP recursion, applied to dungeon rooms instead
- *        of city lots. The recursion engine is identical; only the
- *        leaf interpretation differs.
- *   ../worldgen/procedural_galaxy.c
- *      — also a "world from a function" file, but using radial /
- *        polar geometry (continuous) rather than Cartesian recursion
- *        (discrete). Two complementary strategies for procedural
- *        place-making.
- *
- * Section map (re-cut by CONCERN — see ARCHITECTURE block below):
- *   §1 CONFIG       — constants, data tables, core state types
- *   §2 PERFORMANCE  — timing primitives (throttle policy lives in main)
- *   §3 LOGIC        — pure decisions: no mutation, no I/O (glyph deciders)
- *   §4 SIMULATION   — advances state: the city build + the car traffic
- *   §5 EFFECTS      — cosmetic-only state (one-line note: none stored)
- *   §6 DELAYS       — pauses, holds, timers (one-line note: woven in)
- *   §7 RENDER       — state → screen; reads only, never mutates
- *   §8 APP          — user events + per-tick combine + main loop
- *
- * Keys:
- *   q / ESC    quit
- *   space      pause / resume the build animation
- *   r          tear down and rebuild with a new seed
- *   n / N      next pattern  (GRID → ORGANIC → DISTRICTS → PARKS → ...)
- *   p / P      previous pattern
- *   t / T      next / previous theme
- *   + / =      faster build
- *   -          slower build
- *   ] / [      raise / lower tick Hz
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra \
- *     procedural/worldgen/procedural_city.c \
- *     -o city -lncurses -lm
- */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Two ideas composed together.
- *
- *                  (1) An L-SYSTEM (Lindenmayer system) over rectangu-
- *                      lar blocks. The alphabet has two non-terminal
- *                      symbols { Block(w,h) } and three terminals
- *                      { HSplit, VSplit, Lot }. The productions are
- *                      stochastic and parametric:
- *
- *                        Block(w, h) → HSplit  Block(w, ½h) Block(w, ½h)
- *                                         when h > 2·MIN_LOT_H + 1
- *                        Block(w, h) → VSplit  Block(½w, h) Block(½w, h)
- *                                         when w > 2·MIN_LOT_W + 1
- *                        Block(w, h) → Lot
- *                                         when both above fail
- *                                         OR when depth = MAX_DEPTH
- *
- *                      Choice between HSplit / VSplit is biased by the
- *                      block's aspect ratio (always split the longer
- *                      side) with a hash-driven tie-breaker. The
- *                      *position* of the split is exact-centre in the
- *                      GRID pattern and jittered ±33 % in the others.
- *                      The L-system is iterated to fixed-point — each
- *                      Block keeps rewriting until it becomes a Lot.
- *
- *                      Geometrically this is a binary space partition
- *                      (BSP) of the rectangle; "L-system" is the
- *                      formal-language framing — the city plan is a
- *                      derivation tree of the grammar.
- *
- *                  (2) PER-LOT CONTENT. Each Lot leaf is filled with
- *                      ONE building type, chosen as a function of:
- *                        - the lot's centre position vs the city centre
- *                          (zoning gradient: skyscrapers downtown,
- *                           houses at the edges, in DISTRICTS / PARKS
- *                           patterns)
- *                        - a hash of the lot's bounds (random tint
- *                          variation)
- *                        - one bit of the same hash (PARKS pattern:
- *                          ~25 % of lots become green spaces)
- *                      Building "height" is encoded by glyph: h, H, #,
- *                      @ — visually progressive density.
- *
- *                  Plus an ANIMATION PASS — every cell is stamped with
- *                  a "creation step" computed during subdivision, then
- *                  rendered only when the global build_step counter
- *                  has caught up. This visualises the L-system
- *                  derivation in time.
- *
- * Data-structure : A flat 2-D Cell array, one per terminal cell:
- *                    Cell { type:1, color:1, step:2 } = 4 bytes
- *                  No lot list, no road graph — every per-cell
- *                  question (is this a road? what colour? when does
- *                  it appear?) reads exactly one Cell. The recursion
- *                  itself only writes — it allocates nothing.
- *
- * Rendering      : ASCII only. Roads are drawn with a NEIGHBOUR-AWARE
- *                  glyph chooser: at each road cell, look N/S/E/W; if
- *                  any vertical road neighbour AND any horizontal road
- *                  neighbour, draw '+'; otherwise draw '|' or '-'. The
- *                  same logic naturally produces T-junctions and
- *                  corners without explicit case enumeration. After
- *                  the build completes, building cells get a subtle
- *                  per-second "window-light" twinkle: a cheap hash on
- *                  (x, y, time) flips ~2 % of cells to A_BOLD,
- *                  imitating the random pattern of lit windows in a
- *                  night skyline.
- *
- * Performance    : The whole subdivision finishes in microseconds —
- *                  ~20 000 cells written by ~500 recursive calls.
- *                  All per-frame work is the render loop:
- *                  O(W·H) cell visits with one neighbour lookup and
- *                  one mvaddch each — well under 1 ms for the
- *                  full 240×80 grid. No allocation in steady state;
- *                  rebuild reuses the same buffer.
- *
- * References     :
- *
- *   Generation & layout —
- *   • Lindenmayer, A. (1968) — "Mathematical models for cellular
- *     interactions in development", J. Theor. Biol. 18. The original
- *     L-system paper.
- *   • Prusinkiewicz & Lindenmayer (1990) — The Algorithmic Beauty of
- *     Plants. The canonical reference for L-system formalisms.
+ * The slicing is the formal idea called an "L-system" / binary space
+ * partition; the building zoning is from the "shape grammar" idea. If
+ * you want the theory:
+ *   Prusinkiewicz & Lindenmayer (1990), The Algorithmic Beauty of Plants
  *     https://algorithmicbotany.org/papers/abop/abop.pdf
- *   • Parish, Y. & Müller, P. (2001) — "Procedural Modeling of Cities",
- *     SIGGRAPH 2001. The CityEngine paper — L-system roads at scale.
- *     https://www.researchgate.net/publication/2557915
- *   • Müller, Wonka, Haegler, Ulmer & Van Gool (2006) — "Procedural
- *     Modeling of Buildings", SIGGRAPH 2006. CGA Shape grammar — the
- *     per-lot "what goes on this leaf" zoning/building-type step here.
- *   • Recursive rectangle subdivision (the BSP under the L-system framing):
- *     Wikipedia, "Binary space partitioning"
- *       https://en.wikipedia.org/wiki/Binary_space_partitioning
- *     Red Blob Games, "Dungeon generation with BSP trees" (practical)
- *       https://www.redblobgames.com/articles/dungeon-generation/
- *
- *   Rendering —
- *   • Auto-tiling by neighbour bitmask: the road glyph chooser reads
- *     N/S/E/W and draws the matching junction (+ - |) with no explicit
- *     case table. See boristhebrave.com's tileset / auto-tiling articles.
- *   • Bourke, P. (1997) — "Character representation of grey scale images".
- *     The density-ramp idea behind the h/H/#/@ building-height glyphs.
+ *   Parish & Müller (2001), "Procedural Modeling of Cities", SIGGRAPH
+ *   Bourke (1997), ASCII grey-scale ramp (the h/H/#/@ density glyphs)
  *     http://paulbourke.net/dataformats/asciiart/
  *
- * ─────────────────────────────────────────────────────────────────────── */
+ * Sister files: ../generational/bsp_dungeon_showcase.c (same slicing,
+ * dungeon rooms instead of lots) and ../worldgen/procedural_galaxy.c
+ * (a "world from a function" using circles instead of rectangles).
+ */
 
 
 #define _POSIX_C_SOURCE 200809L
@@ -172,80 +38,25 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ── ARCHITECTURE ─────────────────────────────────────────────────────── *
- *
- * Re-cut from first principles into separated concern-layers (a SEPARATION
- * pass: RELOCATE + LABEL only — every function body is byte-identical, nothing
- * renamed). Layer → section → what it mutates:
- *
- *   LAYER        §   MUTATES
- *   ─────────────────────────────────────────────────────────────────────
- *   CONFIG       §1  nothing — compile-time constants + const data tables
- *                    + the core state types (Cell/City/Car), relocated up so
- *                    the pure §3 helpers can see them.
- *   PERFORMANCE  §2  nothing — clock_ns / clock_sleep_ns are pure timers; the
- *                    frame cap + fixed-timestep accumulator are POLICY in main.
- *   LOGIC        §3  nothing — pure reads/decisions: the hash + index, the
- *                    GLYPH DECIDERS (road_glyph_at, building_glyph_at,
- *                    park_glyph, car_glyph, nb_visible, cell_appearance), and
- *                    the SUBDIVISION DECIDERS (choose_split_axis,
- *                    pick_split_pos, lot_color_idx, pattern_name). They only
- *                    READ (the City grid or plain args), so they live here, not
- *                    in §4/§7, and no RENDER/EFFECTS reordering can corrupt them.
- *   SIMULATION   §4  City.{map,max_step,build_step,hold_countdown,seed,
- *                    pattern_built} and Scene.{cars,car_step_count,time_secs,
- *                    paused,speed,current_theme,current_pattern}. Two advancing
- *                    sub-systems: the city build (subdivide → animate) and the
- *                    car traffic (a cosmetic-but-stateful sim). Only writers.
- *   EFFECTS      §5  (none) — no stored cosmetic buffer; the window twinkle is
- *                    render-derived. One-line section, not a real layer.
- *   DELAYS       §6  (none) — only City.hold_countdown + Scene.paused, handled
- *                    inside scene_tick (§4). One-line section.
- *   RENDER       §7  ncurses back buffer + colour-pair table only (theme_apply
- *                    / color_init, scene_draw + draw_traffic, and screen_draw
- *                    with its draw_status_line / draw_param_line / draw_swatch
- *                    / draw_hint helpers). Reads §4 state via the §3 deciders;
- *                    never writes simulation state.
- *   APP          §8  App.{running,need_resize,sim_fps}; drives Scene via the
- *                    combine + user events.
- *
- * PER-TICK COMBINE (the one place state advances — main(), §8):
- *
- *     while (sim_accum >= tick_ns)        // PERFORMANCE: fixed timestep
- *         scene_tick()                    //   SIMULATION (city + cars) + DELAYS
- *     screen_draw() ; screen_present()    // RENDER (reads only; twinkle derived)
- *     getch() → app_handle_key()          // USER EVENTS — see below
- *
- * Nothing other than scene_tick() advances simulation state. User events
- * (app_handle_key / app_do_resize) mutate Scene/Screen on a keypress or
- * SIGWINCH, but run once per frame OUTSIDE the accumulator loop.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ===================================================================== */
-/* §1  CONFIG  -- constants, data tables, core state types               */
-/* ===================================================================== */
+/* §1  CONFIG -- constants, data tables, core state types */
 
 enum {
-    /* Hard upper bound on the city grid. Anything larger is clipped. */
+    /* Biggest city we'll ever hold; a larger terminal just gets clipped. */
     MAP_W_MAX           = 240,
     MAP_H_MAX           =  80,
     CITY_CELLS_MAX      = MAP_W_MAX * MAP_H_MAX,
 
-    /* Subdivision controls. MAX_DEPTH bounds the recursion; the actual
-     * depth reached is usually less because MIN_LOT_W/H halts splitting
-     * sooner. With MIN_LOT 4×3, a 240×80 grid bottoms out around
-     * depth 8 — comfortable for visual reading. */
+    /* How far the slicing can go, and how small a lot is allowed to get.
+     * We usually stop short of MAX_DEPTH because a lot hits the minimum
+     * size first. */
     MAX_DEPTH           =   9,
     MIN_LOT_W           =   4,
     MIN_LOT_H           =   3,
 
-    /* Build animation pacing — how many step-units to advance per
-     * tick at default speed. ~28 steps/tick × 60 ticks/s × 6 s = 10 080,
-     * which matches max_step = (MAX_DEPTH+1) * 1000 = 10 000. */
+    /* How fast the city grows in: step-units added per tick at normal speed. */
     BUILD_RATE_DEFAULT  =  28,
 
-    /* Hold the finished city for ~6 s before tearing down. */
+    /* Show the finished city for ~6 seconds before tearing it down. */
     HOLD_TICKS_DEF      = 6 * 60,
 
     SIM_FPS_MIN         =  10,
@@ -260,17 +71,17 @@ enum {
     HUD_COLS            =  80,
     FPS_UPDATE_MS       = 500,
 
-    /* Color pair indices.  PAIR_HUD/PAIR_HINT reserved per CLAUDE.md. */
+    /* ncurses colour-pair slots. PAIR_HUD/PAIR_HINT are reserved across
+     * all demos in this project. The _BASE pairs each cover four slots. */
     PAIR_HUD            =   1,
     PAIR_HINT           =   2,
     PAIR_ROAD           =   3,
-    PAIR_BUILDING_BASE  =   4,    /* +0..+3 = 4 building tints       */
-    PAIR_PARK_BASE      =   8,    /* +0..+3 = 4 park tints           */
-    PAIR_CAR            =  13,    /* moving traffic dots             */
+    PAIR_BUILDING_BASE  =   4,    /* +0..+3 = the four building tints */
+    PAIR_PARK_BASE      =   8,    /* +0..+3 = the four park tints     */
+    PAIR_CAR            =  13,
 
-    /* Traffic.  N_CARS dots step every CAR_STEP_TICKS ticks during
-     * the BUILT phase — at 60 fps with CAR_STEP_TICKS=4 they move
-     * ~15 cells/sec, a comfortable scrolling-traffic feel. */
+    /* Traffic: this many cars, each moving once every CAR_STEP_TICKS ticks
+     * so they crawl like real traffic instead of teleporting. */
     N_CARS              =  28,
     CAR_STEP_TICKS      =   4,
 };
@@ -279,108 +90,77 @@ enum {
 #define NS_PER_MS          1000000LL
 #define TICK_NS(f)      (NS_PER_SEC / (f))
 
-/* Cell aspect — terminal cells are ~2× taller than wide, so we
- * multiply the row extent by this when comparing aspect ratios. */
+/* Terminal characters are about twice as tall as they are wide, so we
+ * stretch every vertical measurement by this to keep blocks looking square. */
 #define ASPECT_Y_F      2.0f
 
-/* Step-tag spacing per depth level. Roads at depth d occupy steps
- * [d·DEPTH_STEP, d·DEPTH_STEP + DEPTH_STEP/2); lots occupy the upper
- * half. With DEPTH_STEP = 1000 and MAX_DEPTH = 9, max_step ≈ 10 000. */
+/* Each slicing level gets its own band of "appear times" so deeper roads
+ * and lots show up after shallower ones during the grow-in animation. */
 #define DEPTH_STEP      1000
 
-/* ORGANIC / DISTRICTS / PARKS jitter — split position offset from
- * mid as a fraction of the half-extent. 0.33 = ±33 %. */
+/* How far a road can wander off-centre in the non-grid patterns: up to a
+ * third of the way toward either edge. */
 #define SPLIT_JITTER    0.33f
 
-/* Split-axis aspect thresholds (height·ASPECT_Y_F / width). Above HI the block
- * is clearly tall → split horizontally; below LO clearly wide → split
- * vertically; between, a hash bit breaks the tie. */
+/* When deciding which way to slice: clearly-tall blocks slice across,
+ * clearly-wide ones slice down, and anything in between flips a coin. */
 #define SPLIT_ASPECT_HI 1.4f
 #define SPLIT_ASPECT_LO 0.7f
 
-/* PARKS pattern: probability that a lot becomes a park rather than
- * a building, expressed as "1 in N". */
+/* PARKS pattern: roughly 1 lot in this many becomes a park... */
 #define PARK_DENOM      4
-/* …but never inside this radius of the centre (fraction of max radius) — keep
- * a built-up downtown. */
+/* ...but never this close to the centre, so downtown stays built up. */
 #define PARK_MIN_RADIUS 0.30f
 
-/* Roads at subdivision depth <= this are "major arteries", drawn bold. */
+/* The first few slicing levels are the big main roads; draw them bold. */
 #define MAJOR_ROAD_MAX_DEPTH 2
-/* Window-light twinkle: 1 in N lit windows flips bold on a per-second hash. */
+/* Twinkling windows: roughly 1 lit window in this many blinks each second. */
 #define TWINKLE_1_IN    30
-/* Car spawn: give up after this many random-cell tries (tiny maps). */
+/* Spawning a car: give up after this many random tries (matters on tiny maps). */
 #define CAR_SPAWN_TRIES 200
 
-/* ── Building glyph tables ─────────────────────────────────────────────── *
- * Buildings are drawn as FRAMED BOXES, not solid fills, so the eye reads
- * actual structures — side walls, a foundation, an interior dotted with lit
- * windows:
+/* The glyphs a building is drawn from. A building is a little framed box,
+ * not a solid blob, so it reads as a real structure:
  *
  *       _____
- *      |HH"H|     ← top row: just below the road
- *      |HHHH|     ← interior body, occasional '"' = lit window
- *      |____|     ← bottom row foundation, side walls '|'
+ *      |HH"H|     top
+ *      |HHHH|     interior body, with the odd '"' lit window
+ *      |____|     foundation row and '|' side walls
  *
- * KEY IDEA  These three arrays are PARALLEL and share ONE index: the building
- * "height tier" 0..3. That index is exactly Cell.color_idx — the same number
- * also picks the colour (Theme.building[i]). So one small int, stamped at
- * generation, drives the whole look: tier → {body, window, base} glyph + tint.
- * building_glyph_at (§3) reads neighbours to choose base vs side-wall vs
- * interior, then indexes these by tier; no per-cell role is stored.
+ * All four arrays line up by the same index 0..3 = the building's "size tier"
+ * (house, apartment, office, skyscraper). That tier is stored in
+ * Cell.color_idx and also picks the colour, so one small number per cell
+ * drives the whole look. building_glyph_at (§3) looks at neighbours to decide
+ * wall vs base vs interior, then picks from these by tier.
  *
- * VALUE LOGIC (per tier i):
- *   BODY    n < H < # < @  — a visual DENSITY ramp (sparse house → solid tower).
- *   WINDOW  the glyph used for a lit interior cell ('"' on apartments, '*' on
- *           the brighter office/skyscraper). BODY[0]/WINDOW[0] ('n'/'m') are the
- *           house mix — houses (tier 0) skip the frame entirely, so they render
- *           straight from BODY/('n'/'m'); WINDOW[0]='m' is therefore NEVER read
- *           (kept only to keep the arrays index-aligned).
- *   BASE    foundation row: '_' for everything except the skyscraper's heavier
- *           '=' — a tiny landmark cue that the tallest tier sits on a slab. */
+ *   BODY    the fill glyph: n / H / # / @, getting visually denser with size.
+ *   WINDOW  the glyph for a lit interior cell. Slot 0 ('m') is never used —
+ *           houses skip the frame entirely; it's only here to keep the four
+ *           arrays index-aligned.
+ *   BASE    the foundation row: '_', except the skyscraper sits on a heavier '='.
+ *   WINDOW_FREQ  how often an interior cell is a lit window, as "1 in N".
+ *           Smaller = more windows, so towers glitter and townhouses stay solid.
+ *           Slot 0 is unused for the same reason WINDOW[0] is. */
 static const char BUILDING_BODY  [4] = { 'n', 'H', '#', '@' };
 static const char BUILDING_WINDOW[4] = { 'm', '"', '*', '*' };
 static const char BUILDING_BASE  [4] = { 'n', '_', '_', '=' };
+static const int  WINDOW_FREQ    [4] = {   2,   8,   4,   3 };
 
-/* WINDOW_FREQ[i] — window density per tier: 1 interior cell in N becomes a lit
- * window. SMALLER N = MORE windows, so the values invert the build order on
- * purpose: skyscraper(3) and office(4) glitter, apartment(8) stays mostly
- * solid like a townhouse. Slot 0 (=2) is DEAD — houses never reach the window
- * branch (see BODY note above); it exists only to keep the index aligned. */
-static const int  WINDOW_FREQ   [4] = {   2,   8,   4,   3 };
-
-/* ── Park glyph palette ────────────────────────────────────────────────── *
- * Parks reuse the SAME tier index (0..3 = Cell.color_idx = Theme.park[i]) as
- * buildings, but here the index means a vegetation density, not a height. The
- * actual per-cell glyph is NOT a table lookup — park_glyph (§3) cycles a small
- * pool by a per-cell hash so a lot reads as a textured natural patch (grass +
- * flowers + trees) instead of a flat fill; the pools are, by tier:
- *
- *   0 light grass : ',' '.'
- *   1 garden      : ',' '.' '\''
- *   2 wooded park : ',' 'Y' '.'        (Y = stylised tree)
- *   3 dense forest: 'Y' 'T' '*'        (T = trunk)            sparser → denser
- *
- * PARK_HUD_GLYPH below holds just the single most-distinctive glyph per tier —
- * used ONLY for the HUD palette swatch, never for in-city rendering (that's
- * park_glyph's job). It exists so the legend shows one recognisable icon. */
+/* The one most recognisable glyph per park tier, used ONLY for the little HUD
+ * legend swatch. The actual park cells are drawn by park_glyph (§3), which
+ * mixes several glyphs per tier so a park reads as a textured patch of green
+ * rather than a flat fill. */
 static const char PARK_HUD_GLYPH[4] = { ',', '.', 'Y', 'T' };
 
-/* ── Pattern ───────────────────────────────────────────────────────────── *
- * The four city "styles". They are NOT four algorithms — they are four
- * parameter sets for the SAME recursive subdivision (subdivide, §4). Each one
- * flips a couple of knobs, so the enum value threads through subdivide() and
- * place_lot() as `p` and selects behaviour at the decision points:
- *   GRID      splits land at exact centre (split_pos = mid) → a strict
- *             Manhattan grid of equal blocks.
- *   ORGANIC   split position jitters ±SPLIT_JITTER from centre → irregular
- *             block sizes, an "old-European" feel; building tints are random.
- *   DISTRICTS ORGANIC layout, but building TYPE follows a zoning gradient
- *             (lot_color_idx maps distance-from-centre → skyscraper..house).
- *   PARKS     DISTRICTS layout, plus ~1/PARK_DENOM of the outer lots become
- *             green spaces instead of buildings.
- * The order is cumulative: each adds a rule on top of the previous, which is
- * why DISTRICTS/PARKS share code paths. REFS: file-header References block. */
+/* The four city "styles". These aren't four different algorithms — they're the
+ * same slicing with a couple of knobs turned, and each one builds on the one
+ * before it. The chosen style is passed around as `p`.
+ *   GRID      slices exactly down the middle every time -> a tidy Manhattan grid.
+ *   ORGANIC   lets each slice wander off-centre -> uneven, old-European blocks;
+ *             building colours are random.
+ *   DISTRICTS like ORGANIC, but now the building type depends on where the lot
+ *             is: skyscrapers downtown fading to houses at the edges.
+ *   PARKS     like DISTRICTS, plus some of the outer lots become green parks. */
 typedef enum {
     PATTERN_GRID      = 0,
     PATTERN_ORGANIC   = 1,
@@ -389,23 +169,15 @@ typedef enum {
     N_PATTERNS        = 4,
 } Pattern;
 
-/* ── Theme ─────────────────────────────────────────────────────────────── *
- * WHAT  One named colour palette (10 ship; t cycles). theme_apply() loads it
- *       into the ncurses pairs PAIR_ROAD / PAIR_BUILDING_BASE+i / PAIR_PARK_BASE+i.
- *       Same 10-name menu as the sibling procedural showcases, for muscle memory.
- *
- * VALUE LOGIC  building[0..3] is a RAMP ordered by building "height" (house →
- *       apartment → office → skyscraper), conventionally cool→warm/dim→bright so
- *       the skyline reads as density; the index i is exactly Cell.color_idx, so
- *       a denser lot picks a brighter tint automatically. park[0..3] is the
- *       parallel green/accent ramp for park types. road is a single gray-ish
- *       asphalt tint. All are 256-colour codes; background is the terminal
- *       default (-1). REFS: project palette notes — documentation/COLOR.md. */
+/* One named colour palette; the 't' key cycles through ten of them.
+ * The building colours run from house to skyscraper, usually dim-to-bright so
+ * the skyline reads as density at a glance; park colours are the green version
+ * of the same idea. All are 256-colour codes on the terminal's own background. */
 typedef struct {
-    const char *name;       /* HUD label (t cycles)                          */
-    short       road;       /* asphalt tint (one, shared by all roads)       */
-    short       building[4];/* tint per height tier, indexed by Cell.color_idx*/
-    short       park    [4];/* tint per park type, same indexing             */
+    const char *name;       /* shown in the HUD                     */
+    short       road;       /* the single asphalt colour            */
+    short       building[4];/* colour per size tier (house..tower)  */
+    short       park    [4];/* colour per park type                 */
 } Theme;
 
 #define N_THEMES 10
@@ -424,9 +196,8 @@ static const Theme themes[N_THEMES] = {
     { "ARCTIC",  240, {  19,  24, 110, 195 }, {  17,  18,  24,  31 } },
 };
 
-/* CellType — what a map cell IS. EMPTY is the pre-build / outside-the-city
- * default; the other three are the terminal-block interpretations the L-system
- * produces (a road line, or a lot filled with buildings or a park). */
+/* What a single map square is. EMPTY means "nothing here yet / outside the
+ * city"; the other three are what the slicing ends up producing. */
 typedef enum {
     CELL_EMPTY    = 0,
     CELL_ROAD     = 1,
@@ -434,100 +205,67 @@ typedef enum {
     CELL_PARK     = 3,
 } CellType;
 
-/* ── Cell ──────────────────────────────────────────────────────────────── *
- * WHAT  One map square — the leaf of the whole design. The subdivision writes
- *       Cells; render reads them. There is NO road graph and NO lot list: every
- *       per-cell question (road? what tint? when does it appear?) is answered
- *       by reading exactly one Cell, so the generator allocates nothing.
+/* One map square — the smallest piece of the city, and the only place we store
+ * anything. There's no separate list of roads or lots: every question about a
+ * spot (road? what colour? has it appeared yet?) is answered by reading just
+ * this one struct, which is why generation never needs to allocate memory.
+ * Kept to 4 bytes so the whole 240x80 map stays small and cache-friendly while
+ * the draw loop sweeps every square each frame.
  *
- * WHY 4 BYTES  Packed to type(1)+color_idx(1)+step(2) = 4 bytes so the full
- *       240×80 map is ~75 KB and stays in L2 cache — the render loop sweeps
- *       every cell each frame, so locality matters more than convenience.
- *
- * VALUE LOGIC
- *   type       a CellType (stored as uint8_t to keep the struct tight).
- *   color_idx  0..3 sub-tint, indexing Theme.building[] or Theme.park[]; for
- *              buildings it doubles as the height tier (house..skyscraper).
- *   step       the ANIMATION THRESHOLD — the cell is drawn iff step <=
- *              City.build_step. subdivide() stamps each cell with the build
- *              "time" at which it should appear (roads of depth d get the low
- *              half of [d·DEPTH_STEP, …], lots the upper half), so simply
- *              ramping build_step replays the L-system derivation as a growth
- *              animation — no frame buffer of past states needed. uint16_t
- *              holds the max ~10 000 comfortably. */
+ *   type       road, building, park, or empty.
+ *   color_idx  0..3 sub-shade into the theme; for buildings it's also the
+ *              size tier (house..skyscraper).
+ *   step       the "appear time". The cell is only drawn once City.build_step
+ *              has reached this value. Each square is stamped with a time during
+ *              slicing, so just ramping build_step up replays the whole build as
+ *              a grow-in animation, with no need to remember past frames. */
 typedef struct {
-    uint8_t  type;       /* CellType                                       */
-    uint8_t  color_idx;  /* 0..3 tint / building-height tier               */
-    uint16_t step;       /* visible iff step <= City.build_step (wavefront)*/
+    uint8_t  type;       /* CellType                              */
+    uint8_t  color_idx;  /* 0..3 shade / building size tier       */
+    uint16_t step;       /* drawn once build_step reaches this    */
 } Cell;
 
-/* ── City ──────────────────────────────────────────────────────────────── *
- * WHAT  The terrain: a w×h grid of Cells (row-major, index via cidx) PLUS the
- *       state of the build animation playing over it. This is the one domain
- *       object — SIMULATION (§4) is its only writer, LOGIC/RENDER read it.
+/* The whole city: a w*h grid of Cells (stored row by row) plus the bookkeeping
+ * for the grow-in animation. This is the one big piece of state; only §4 ever
+ * writes it. The grid is a fixed-size array, reused on every rebuild, so we
+ * never allocate while running.
  *
- * WHY A FLAT ARRAY  Static CITY_CELLS_MAX backing store, never malloc'd: the
- *       L-system writes into it and the next rebuild overwrites in place (the
- *       "no allocation in steady state" rule).
- *
- * VALUE LOGIC
- *   w, h            grid extent (cells); clamped to MAP_W_MAX×MAP_H_MAX.
- *   map[]           the cells (see Cell); the derivation tree's leaves.
- *   max_step        highest Cell.step any cell got — the finish line the build
- *                   animation ramps build_step up to.
- *   build_step      the animation wavefront: cells with step <= build_step are
- *                   "constructed" and drawn. 0 = blank, max_step = fully built.
- *   hold_countdown  ticks left to display the finished city before rebuilding
- *                   (DELAYS, §6); armed to HOLD_TICKS_DEF on completion.
- *   seed            the RNG seed this layout was grown from (also drives the
- *                   per-cell twinkle hash so it's stable within a generation).
- *   pattern_built   which Pattern produced THIS layout — recorded so a render
- *                   never disagrees with the geometry on screen.
- *
- * REFS  L-system framing — Lindenmayer (1968), Prusinkiewicz & Lindenmayer
- *       (1990); city road subdivision — Parish & Müller (2001). The geometry is
- *       a binary space partition (BSP) of the rectangle. See file-header refs. */
+ *   w, h            size in cells.
+ *   map[]           the cells themselves.
+ *   max_step        the largest appear-time any cell got — i.e. the finish line.
+ *   build_step      how far the grow-in animation has reached. 0 = blank,
+ *                   max_step = fully built.
+ *   hold_countdown  ticks left to admire the finished city before rebuilding.
+ *   seed            the random seed this layout grew from (also keeps the window
+ *                   twinkle stable for a given city).
+ *   pattern_built   which style produced THIS layout, so the drawing always
+ *                   matches the shape on screen. */
 typedef struct {
-    int   w, h;               /* grid extent (cells)                        */
-    Cell  map[CITY_CELLS_MAX];/* the cell grid, row-major                   */
-    int   max_step;           /* highest Cell.step — the build finish line  */
-    int   build_step;         /* animation wavefront; cells <= it are drawn */
-    int   hold_countdown;     /* ticks remaining once build completes       */
-    int   seed;               /* RNG seed this layout was grown from        */
-    Pattern pattern_built;    /* the pattern THIS layout was generated for  */
+    int   w, h;
+    Cell  map[CITY_CELLS_MAX];
+    int   max_step;
+    int   build_step;
+    int   hold_countdown;
+    int   seed;
+    Pattern pattern_built;
 } City;
 
-/* ── Car ───────────────────────────────────────────────────────────────── *
- * WHAT  One traffic dot — a minimal agent that walks the road network for
- *       decoration once the city is BUILT. N_CARS of them give the static plan
- *       a sense of life. They read the City (road_at) but never modify it; they
- *       are the cosmetic side of SIMULATION (§4), not part of the city geometry.
+/* One little car. Once the city is built, a handful of these wander the roads
+ * just to make the place feel alive. They only read the roads, never change
+ * them. Each car follows a simple local rule (see car_step): mostly drive
+ * straight, occasionally turn at a junction, and if it gets boxed in, it
+ * disappears and respawns somewhere else.
  *
- * BEHAVIOUR  Greedy road-follower (car_step): keep the current heading if the
- *       next cell is road; ~1/8 of the time take a perpendicular turn at an
- *       intersection; if blocked, pick any non-reversing road neighbour; if
- *       truly boxed in, deactivate and respawn elsewhere next tick. No global
- *       pathfinding — emergent traffic from a per-car local rule.
- *
- * VALUE LOGIC
- *   x, y    integer cell position on the City grid.
- *   dx, dy  heading: exactly one is ±1, the other 0 (a cardinal direction);
- *           car_glyph maps it to > < ^ v.
- *   active  true while on a valid road path; false marks "respawn me" so a
- *           stranded car never freezes a glyph on screen. */
+ *   x, y    where it is on the grid.
+ *   dx, dy  which way it's pointing — one of these is +/-1, the other 0.
+ *   active  false means "I'm stuck, respawn me next tick". */
 typedef struct {
-    int  x, y;     /* cell position                                 */
-    int  dx, dy;   /* cardinal heading (one is ±1, the other 0)     */
-    bool active;   /* false → stranded, respawn next tick           */
+    int  x, y;
+    int  dx, dy;
+    bool active;
 } Car;
 
-/* ===================================================================== */
-/* §2  PERFORMANCE  -- timing primitives (throttle policy in main, §8)   */
-/* ===================================================================== */
-
-/* Timing primitives only. The 60 fps frame cap and the fixed-timestep
- * accumulator that decides how many scene_tick()s run per frame are POLICY,
- * applied in main() (§8). */
+/* §2  PERFORMANCE -- the two clock helpers (the actual pacing lives in main) */
 
 static int64_t clock_ns(void)
 {
@@ -546,17 +284,9 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  LOGIC  -- pure decisions: no mutation, no I/O                     */
-/* ===================================================================== */
-
-/* Pure reads / decisions: each returns a value from its arguments (and the
- * read-only City grid + const tables) with NO mutation and NO I/O. Deleting
- * or reordering any RENDER/EFFECTS code cannot change what these return, so
- * they are corruption-proof by construction. Two families live here because
- * they only READ: the GLYPH deciders that §7 render uses (road_glyph_at,
- * building_glyph_at, cell_appearance, ...) and the SUBDIVISION deciders that
- * §4 generation uses (choose_split_axis, pick_split_pos, lot_color_idx). */
+/* §3  LOGIC -- pure look-it-up functions: they only read, never change anything.
+ * Two groups: the ones that pick a glyph/colour for drawing, and the ones that
+ * make slicing decisions for generation. */
 
 static const char *pattern_name(Pattern p)
 {
@@ -569,11 +299,9 @@ static const char *pattern_name(Pattern p)
     }
 }
 
-/*
- * hash3 — stateless 3-int avalanche hash. Same routine as the other
- * procedural showcases. Used to drive split-position jitter, building
- * tint selection, and the per-window twinkle.
- */
+/* Turns three numbers into one well-scrambled "random-looking" number. Same
+ * inputs always give the same output, so it's our source of stable randomness
+ * for jittered roads, building colours, and twinkling windows. */
 static inline uint32_t hash3(int wx, int wy, int wz)
 {
     uint32_t h = (uint32_t)wx * 73856093u
@@ -589,19 +317,9 @@ static inline uint32_t hash3(int wx, int wy, int wz)
 
 static inline int cidx(const City *c, int x, int y) { return y * c->w + x; }
 
-/*
- * lot_color_idx — pick a building tint for a lot.
- *
- *   GRID, ORGANIC : random tint via hash, no spatial structure.
- *   DISTRICTS     : zoning gradient — radius from city centre maps
- *                   to building "height". '@'/'#'/'H'/'h' from
- *                   downtown out to suburbs.
- *   PARKS         : same as DISTRICTS for buildings; parks pick
- *                   their own tint via the same hash for variety.
- *
- * lcx, lcy : lot centre in cell coords
- * cx,  cy  : city centre
- */
+/* Decides what kind of building goes on a lot. In GRID/ORGANIC it's just
+ * random. In DISTRICTS/PARKS it depends on how far the lot is from the city
+ * centre: towers downtown, houses at the edges. */
 static uint8_t lot_color_idx(int lcx, int lcy, int cx, int cy,
                              int max_dist, uint32_t lot_hash, Pattern p)
 {
@@ -609,14 +327,15 @@ static uint8_t lot_color_idx(int lcx, int lcy, int cx, int cy,
         return (uint8_t)((lot_hash >> 8) & 3u);
     }
 
-    /* Aspect-corrected radial distance from city centre. */
+    /* How far from centre, as a fraction (0 at the middle, 1 at the corner),
+     * stretching the vertical so distance feels even on screen. */
     float dx = (float)(lcx - cx);
     float dy = (float)(lcy - cy) * ASPECT_Y_F;
     float d  = sqrtf(dx * dx + dy * dy) / (float)max_dist;
-    if      (d < 0.25f) return 3;        /* skyscraper           */
-    else if (d < 0.50f) return 2;        /* office               */
-    else if (d < 0.75f) return 1;        /* apartment            */
-    else                return 0;        /* house                */
+    if      (d < 0.25f) return 3;        /* skyscraper */
+    else if (d < 0.50f) return 2;        /* office     */
+    else if (d < 0.75f) return 1;        /* apartment  */
+    else                return 0;        /* house      */
 }
 
 static inline bool road_at(const City *c, int x, int y)
@@ -625,11 +344,7 @@ static inline bool road_at(const City *c, int x, int y)
     return c->map[cidx(c, x, y)].type == CELL_ROAD;
 }
 
-/*
- * car_glyph — directional arrow that visibly indicates which way the
- * car is heading. Stationary cars (shouldn't really happen, but for
- * completeness) get 'o'.
- */
+/* An arrow pointing the way the car is going. */
 static inline char car_glyph(const Car *car)
 {
     if (car->dx > 0) return '>';
@@ -639,13 +354,10 @@ static inline char car_glyph(const Car *car)
     return 'o';
 }
 
-/*
- * road_glyph_at — pick '+' / '-' / '|' for a road cell from its
- * neighbours. Only neighbours that are ROAD AND ALREADY VISIBLE
- * (step ≤ build_step) count, so the road glyph correctly evolves
- * during the build animation: a fresh stub starts as '|' and "joins"
- * (turns to '+') once the perpendicular road catches up.
- */
+/* Picks the road character ('-', '|' or '+') by looking at the four
+ * neighbours: a '+' where vertical road meets horizontal. Only roads that have
+ * already grown in count, so a fresh road stub looks like a straight line and
+ * turns into a junction the moment the crossing road catches up. */
 static char road_glyph_at(const City *c, int x, int y, int build_step)
 {
     bool n_v = false, s_v = false, e_v = false, w_v = false;
@@ -670,16 +382,13 @@ static char road_glyph_at(const City *c, int x, int y, int build_step)
     if (vert && horiz) return '+';
     if (vert)          return '|';
     if (horiz)         return '-';
-    /* Solitary cell — happens at the very start of a road draw. */
+    /* No road neighbours yet — happens only at the very first cell of a road. */
     return '+';
 }
 
-/*
- * nb_visible — neighbour visibility check. The neighbour exists, has
- * the requested type, AND has step ≤ build_step (so it has already
- * been "built" in the animation). Used by edge detection so building
- * frames evolve correctly during the build wavefront.
- */
+/* True if the neighbour at (x,y) exists, is the type we want, and has already
+ * grown in. Building edges use this so the frame fills in correctly as the
+ * building appears. */
 static inline bool nb_visible(const City *c, int x, int y,
                               int build_step, CellType want)
 {
@@ -688,11 +397,8 @@ static inline bool nb_visible(const City *c, int x, int y,
     return n->type == want && n->step <= build_step;
 }
 
-/*
- * park_glyph — pick one of a small per-type glyph pool by hash, so
- * a park lot reads as a textured natural patch (grass / flowers /
- * trees) instead of a flat fill.
- */
+/* Picks one of a few green glyphs at random for a park cell, so a park looks
+ * like a speckled patch of grass and trees instead of a flat block. */
 static char park_glyph(int ci, uint32_t h)
 {
     int b = (h >> 4) & 7;
@@ -704,28 +410,19 @@ static char park_glyph(int ci, uint32_t h)
     }
 }
 
-/*
- * building_glyph_at — pick the glyph for ONE building cell from its
- * surroundings. The four edge bits drive the choice:
- *
- *   bot_edge          → BUILDING_BASE[ci]   ('_' / '_' / '_' / '=')
- *   side_edge & !bot  → '|'
- *   interior          → either body or window glyph (per WINDOW_FREQ)
- *
- * Type 0 (low-rise houses) is rendered as a flat mix of 'n' / 'm'
- * so it reads as a row of tiny dwellings, not a solid block. Bigger
- * buildings get the framed-box treatment.
- *
- * `*lit` is set to true when the chosen glyph is a window — the
- * caller upgrades to A_BOLD so windows visibly pop against walls.
- */
+/* Picks the character for one building cell by looking at where it sits in the
+ * building: the bottom row is the foundation, the left/right edges are walls,
+ * and the inside is body fill with the occasional lit window. Houses (the
+ * smallest tier) skip the frame entirely and are just a speckle of tiny
+ * dwellings. Sets *lit when this cell turned out to be a window, so the caller
+ * can make it glow. */
 static char building_glyph_at(const City *c, int x, int y,
                               int build_step, uint32_t h, bool *lit)
 {
     *lit = false;
     int ci = c->map[cidx(c, x, y)].color_idx & 3;
 
-    /* Houses (type 0) skip the frame — alternate two glyphs. */
+    /* Houses skip the frame — just alternate two little glyphs. */
     if (ci == 0) {
         return ((x + y) & 1) ? 'n' : 'm';
     }
@@ -737,15 +434,15 @@ static char building_glyph_at(const City *c, int x, int y,
 
     bool bot_edge  = !bot_v;
     bool side_edge = !lft_v || !rgt_v;
-    /* top_edge isn't drawn specially — letting the body glyph hit the
-     * road row above gives the building a clean top profile against
-     * the road. (top_v is read above for symmetry; unused otherwise.) */
+    /* We deliberately don't special-case the top edge: letting body fill run
+     * right up to the road above gives the building a clean rooftop line.
+     * (top_v is computed just for symmetry, otherwise unused.) */
     (void)top_v;
 
     if (bot_edge)  return BUILDING_BASE[ci];
     if (side_edge) return '|';
 
-    /* Interior — body or window. WINDOW_FREQ[ci] gives 1-in-N windows. */
+    /* Inside: usually body fill, occasionally a lit window. */
     int freq = WINDOW_FREQ[ci];
     if (freq > 0 && (int)((h >> 8) % (uint32_t)freq) == 0) {
         *lit = true;
@@ -754,22 +451,21 @@ static char building_glyph_at(const City *c, int x, int y,
     return BUILDING_BODY[ci];
 }
 
-/* Which axis to cut a block on: always split the LONGER side so sub-blocks stay
- * roughly square on the aspect-corrected grid; when neither side dominates, a
- * hash bit breaks the tie. Returns true to split horizontally (a road row). */
+/* Decides whether to slice a block across (true) or down (false). We slice the
+ * longer side so the two halves stay roughly square; if it's already about
+ * square, flip a coin. */
 static bool choose_split_axis(bool can_h, bool can_v, float aspect, uint32_t hash)
 {
     if (!can_h)                   return false;
     if (!can_v)                   return true;
-    if (aspect > SPLIT_ASPECT_HI) return true;    /* clearly tall → cut across */
-    if (aspect < SPLIT_ASPECT_LO) return false;   /* clearly wide → cut down   */
-    return (hash & 1u) != 0u;                      /* ~square → coin flip       */
+    if (aspect > SPLIT_ASPECT_HI) return true;    /* clearly tall -> cut across */
+    if (aspect < SPLIT_ASPECT_LO) return false;   /* clearly wide -> cut down   */
+    return (hash & 1u) != 0u;                      /* about square -> coin flip  */
 }
 
-/* Where along [lo,hi] to place the dividing road. Exact centre for GRID (and
- * whenever the band is too thin to jitter); otherwise offset from centre by a
- * hash-driven amount up to ±SPLIT_JITTER of the band, then clamped into [lo,hi]
- * so each half can still host a MIN_LOT. */
+/* Decides where to put the dividing road between lo and hi. GRID puts it dead
+ * centre; the other styles nudge it off-centre by a random amount, but never so
+ * far that a half gets too small for a lot. */
 static int pick_split_pos(int lo, int hi, int mid, Pattern p, uint32_t hash)
 {
     int split_pos;
@@ -786,10 +482,9 @@ static int pick_split_pos(int lo, int hi, int mid, Pattern p, uint32_t hash)
     return split_pos;
 }
 
-/* The glyph + colour pair + attribute for ONE already-built, non-empty cell,
- * decided purely from its type and neighbours. Returns the glyph and writes the
- * pair / attribute through *pair / *attr. Pure read — the per-cell appearance
- * rule, lifted out of the scene_draw loop so that loop reads as pseudocode. */
+/* Works out how to draw one already-grown, non-empty cell: returns its glyph
+ * and hands back the colour pair and bold/dim setting through *pair and *attr.
+ * Pulled out of the draw loop so that loop stays short and readable. */
 static chtype cell_appearance(const City *c, int x, int y, int build_step,
                               bool fully_built, int twinkle_t,
                               int *pair, int *attr)
@@ -802,7 +497,7 @@ static chtype cell_appearance(const City *c, int x, int y, int build_step,
     if (cell->type == CELL_ROAD) {
         glyph = road_glyph_at(c, x, y, build_step);
         *pair = PAIR_ROAD;
-        /* Bold the major arteries so the primary road structure reads. */
+        /* Make the big main roads bold so the layout reads at a glance. */
         int road_depth = cell->step / DEPTH_STEP;
         if (road_depth <= MAJOR_ROAD_MAX_DEPTH) *attr = A_BOLD;
     } else if (cell->type == CELL_BUILDING) {
@@ -811,7 +506,7 @@ static chtype cell_appearance(const City *c, int x, int y, int build_step,
         bool lit;
         glyph = building_glyph_at(c, x, y, build_step, cell_hash, &lit);
         if (ci >= 2 || lit) *attr = A_BOLD;
-        /* Window-light twinkle on lit windows only (sparse, localised). */
+        /* Once built, blink a few lit windows on and off each second. */
         if (fully_built && lit) {
             uint32_t h2 = hash3(x, y, twinkle_t);
             if ((h2 % TWINKLE_1_IN) == 0u) *attr |= A_BOLD;
@@ -825,21 +520,9 @@ static chtype cell_appearance(const City *c, int x, int y, int build_step,
     return (chtype)(unsigned char)glyph;
 }
 
-/* ===================================================================== */
-/* §4  SIMULATION  -- advances state (only writers of sim state)         */
-/* ===================================================================== */
-
-/* The ONLY writers of simulation state. Two sub-systems advance here:
- *  • the CITY build — city_build/subdivide/place_* write the Cell grid once,
- *    then scene_tick ramps City.build_step to animate it appearing;
- *  • the CARS — a cosmetic-but-STATEFUL traffic sim (car_step walks each car
- *    along the road graph). Cars are decorative, but they ADVANCE STATE, so
- *    they belong here, not in EFFECTS (§5).
- * Mutates: City.{map,max_step,build_step,hold_countdown,seed,pattern_built};
- * Scene.{cars,car_step_count,time_secs,paused,speed,current_theme,
- * current_pattern}. scene_tick() is the single per-tick entry point (called
- * only from main, §8); user events (key/resize) also mutate Scene but are NOT
- * part of the tick -- see §8. */
+/* §4  SIMULATION -- the only code that changes the city. Two things happen
+ * here: building the city (lay it out once, then animate it growing in) and
+ * moving the cars around once it's done. scene_tick() is the single heartbeat. */
 
 static void city_clear(City *c)
 {
@@ -854,11 +537,8 @@ static void city_clear(City *c)
     c->hold_countdown = 0;
 }
 
-/*
- * place_road_h — stamp a horizontal road across a row, between
- * inclusive x bounds. Step values increment along x so the road
- * "draws" left to right within its depth band.
- */
+/* Lays a horizontal road across one row. The appear-times step up along the
+ * road so it draws itself in left to right during the animation. */
 static void place_road_h(City *c, int row, int x0, int x1, int depth)
 {
     int span = x1 - x0 + 1;
@@ -889,15 +569,9 @@ static void place_road_v(City *c, int col, int y0, int y1, int depth)
     }
 }
 
-/*
- * place_lot — stamp every cell of an inclusive rectangle as a single
- * lot. In PARKS pattern, ~1/PARK_DENOM lots become parks (CELL_PARK)
- * — but only outside the densest centre zone, where downtown should
- * stay built up.
- *
- * The cells get a stepwise creation step so the lot "draws in"
- * diagonally during the build animation.
- */
+/* Fills one rectangle as a single lot — buildings, or (in PARKS) sometimes a
+ * park if it's far enough from downtown. Appear-times ramp diagonally so the
+ * lot draws itself in from one corner. */
 static void place_lot(City *c, int x0, int y0, int x1, int y1,
                       int depth, int seed, Pattern p)
 {
@@ -905,7 +579,7 @@ static void place_lot(City *c, int x0, int y0, int x1, int y1,
     int lcy = (y0 + y1) / 2;
     int cx  = c->w / 2;
     int cy  = c->h / 2;
-    /* Aspect-corrected max distance — corner of city. */
+    /* Distance from the centre out to a corner — our "1.0" yardstick. */
     float mdx = (float)cx;
     float mdy = (float)cy * ASPECT_Y_F;
     int max_dist = (int)sqrtf(mdx * mdx + mdy * mdy);
@@ -914,8 +588,7 @@ static void place_lot(City *c, int x0, int y0, int x1, int y1,
     uint32_t lot_hash = hash3(x0 ^ (x1 << 8), y0 ^ (y1 << 8), seed + depth);
     uint8_t  ci = lot_color_idx(lcx, lcy, cx, cy, max_dist, lot_hash, p);
 
-    /* PARKS pattern — drop a park here if hash says so, but never in
-     * the central skyscraper zone (we want a downtown). */
+    /* In PARKS, randomly make this a park instead — but keep downtown built up. */
     bool is_park = false;
     if (p == PATTERN_PARKS) {
         float dx = (float)(lcx - cx);
@@ -942,36 +615,25 @@ static void place_lot(City *c, int x0, int y0, int x1, int y1,
     }
 }
 
-/*
- * subdivide — the L-system production step.
- *
- *   B(x0,y0,x1,y1) →  HSplit(row)  B(x0,y0,x1,row-1)  B(x0,row+1,x1,y1)
- *                  |  VSplit(col)  B(x0,y0,col-1,y1)  B(col+1,y0,x1,y1)
- *                  |  Lot(rect)
- *
- * The third rule fires when (a) recursion depth has hit MAX_DEPTH or
- * (b) neither axis can host two sub-blocks of MIN_LOT size plus a road.
- *
- * Split-axis choice is biased by aspect (always cut the longer side);
- * a hash low-bit picks when the block is roughly square. Split position
- * is exact-centre under PATTERN_GRID, otherwise jittered by ±SPLIT_JITTER.
- */
+/* The heart of generation, called on itself. Take a rectangle: if it's small
+ * enough (or we've recursed too deep), turn it into a lot and stop. Otherwise
+ * lay one road through it, splitting it into two smaller rectangles, and do the
+ * same thing to each half. */
 static void subdivide(City *c, int x0, int y0, int x1, int y1,
                       int depth, int seed, Pattern p)
 {
     int w = x1 - x0 + 1;
     int h = y1 - y0 + 1;
-    bool can_split_h = (h >= 2 * MIN_LOT_H + 1);   /* two lots + 1 road row */
+    bool can_split_h = (h >= 2 * MIN_LOT_H + 1);   /* room for 2 lots + a road */
     bool can_split_v = (w >= 2 * MIN_LOT_W + 1);
 
-    /* Terminal production  B → Lot:  too deep, or too small to split. */
+    /* Too deep, or too small to split again -> this is a lot. */
     if (depth >= MAX_DEPTH || (!can_split_h && !can_split_v)) {
         place_lot(c, x0, y0, x1, y1, depth, seed, p);
         return;
     }
 
-    /* Split production  B → road + two sub-blocks: choose the axis (longer
-     * side; aspect corrected for tall cells), then the road position. */
+    /* Otherwise: pick which way to slice and where, lay the road, recurse. */
     uint32_t hh     = hash3(x0 + (x1 << 4), y0 + (y1 << 4), depth + seed);
     float    aspect = ((float)h * ASPECT_Y_F) / (float)w;
     bool     split_h = choose_split_axis(can_split_h, can_split_v, aspect, hh);
@@ -989,12 +651,8 @@ static void subdivide(City *c, int x0, int y0, int x1, int y1,
     }
 }
 
-/*
- * city_build — the entry point. Clears the map, runs subdivision,
- * remembers the seed and pattern. After returning, max_step holds the
- * highest step value any cell received, which the animation will ramp
- * to.
- */
+/* Builds a fresh city: wipe the grid, slice it all up, remember the seed and
+ * style. When this returns, max_step is the animation's finish line. */
 static void city_build(City *c, int seed, Pattern p)
 {
     city_clear(c);
@@ -1003,11 +661,9 @@ static void city_build(City *c, int seed, Pattern p)
     subdivide(c, 0, 0, c->w - 1, c->h - 1, 0, seed, p);
 }
 
-/*
- * car_spawn — place a car at a random road cell with a random
- * direction. If no road cell is found in CAR_SPAWN_TRIES tries (very small
- * map), the car is left inactive — it will respawn next tick.
- */
+/* Drops a car on a random road, facing a random way. If it can't find a road
+ * in a reasonable number of tries (a nearly road-less map), it leaves the car
+ * inactive to try again next tick. */
 static void car_spawn(const City *c, Car *car)
 {
     for (int t = 0; t < CAR_SPAWN_TRIES; t++) {
@@ -1029,19 +685,15 @@ static void cars_spawn_all(const City *c, Car *cars)
     for (int i = 0; i < N_CARS; i++) car_spawn(c, &cars[i]);
 }
 
-/*
- * car_step — advance one car along the road network. The driver
- * prefers to keep going forward; at intersections it occasionally
- * turns; at dead ends it picks any valid neighbour. Stranded cars
- * (no road neighbour at all) deactivate and respawn next tick.
- */
+/* Moves one car a step. It likes to keep going straight, turns now and then at
+ * junctions, and if the road ahead ends it takes any other road it can find. A
+ * car with no road around it at all gives up and respawns elsewhere. */
 static void car_step(const City *c, Car *car)
 {
     int nx = car->x + car->dx;          /* the cell straight ahead */
     int ny = car->y + car->dy;
 
-    /* 1. At an intersection, occasionally turn (1 in 8). The two candidates
-     *    are the left/right perpendiculars to the current heading. */
+    /* Now and then, if there's road ahead, turn left or right instead. */
     if (road_at(c, nx, ny) && (rand() & 7) == 0) {
         int turn_dx[2] = { -car->dy,  car->dy };   /* left, right turn */
         int turn_dy[2] = {  car->dx, -car->dx };
@@ -1054,14 +706,14 @@ static void car_step(const City *c, Car *car)
         }
     }
 
-    /* 2. Drive straight if the road continues. */
+    /* Keep driving straight if the road continues. */
     if (road_at(c, nx, ny)) {
         car->x = nx; car->y = ny;
         return;
     }
 
-    /* 3. Forward blocked → take any road neighbour, preferring not to reverse
-     *    (yo-yoing cars look bad); if none exists, mark stranded to respawn. */
+    /* Road ahead is blocked: take any other road, but avoid an ugly U-turn.
+     * If there's truly nowhere to go, mark the car for respawn. */
     static const int dirs[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
     int order = rand() & 3;
     for (int i = 0; i < 4; i++) {

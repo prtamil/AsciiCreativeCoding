@@ -1,187 +1,20 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * cellular_automata_1d.c — Wolfram 1-D Elementary Cellular Automaton
+ * cellular_automata_1d.c — Wolfram 1-D elementary cellular automata.
  *
- * The pattern builds row-by-row from the top of the screen downward.
- * When the screen fills it holds for 3 seconds then loads the next preset.
+ * Start with one row of cells, each on or off. A "rule" (a number 0-255)
+ * decides each cell's next state from itself and its two neighbours. Stack
+ * the rows down the screen and famous patterns appear: Sierpinski triangles
+ * (rule 90), noise (rule 30), gliders (rule 110). Each rule is colour-coded
+ * by its Wolfram behaviour class (fixed / periodic / chaotic / complex /
+ * fractal). The action bar at the bottom lists every key.
  *
- * Layout:
- *   Row 0          — data bar: rule, name, class, preset, speed, state
- *                    (coloured by the rule's Wolfram class)
- *   Rows 1 … n-2   — CA area, filling top-down one row at a time
- *   Row n-1        — action bar: the interactive keys
- *
- * Each rule has a Wolfram class, colour-coded:
- *   Class 1 (Fixed)    — grey    — converges to uniform state
- *   Class 2 (Periodic) — cyan    — stable repeating patterns
- *   Class 3 (Chaotic)  — orange  — random-looking, sensitive to seed
- *   Class 4 (Complex)  — green   — localised glider-like structures
- *   Class 5 (Fractal)  — yellow  — Sierpinski / self-similar triangles
- *
- * Keys:
- *   n / p         next / previous preset
- *   t / T         next / previous colour theme
- *   a             toggle auto-advance (on by default)
- *   r             reseed — single cell at centre
- *   R             reseed — random initial row
- *   + / =         faster (fewer ticks between rows)
- *   - / _         slower (more ticks between rows)
- *   space         pause / resume
- *   q / Q         quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra procedural/generational/cellular_automata_1d.c \
- *       -o cellular_automata_1d -lncurses
- *
- * Sections: §1 config  §2 clock  §3 color  §4 model  §5 simulation
- *           §6 render   §7 app
+ * Background reading the code can't give you:
+ *   Wolfram (1983) Rev. Mod. Phys. 55:601 — the 0-255 rule numbering.
+ *   Wolfram (1984) Physica D 10:1         — the four behaviour classes.
+ *   Cook   (2004) Complex Systems 15:1    — proof rule 110 is Turing-complete.
+ *   Wolfram (2002) A New Kind of Science  — the big reference, free online.
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Wolfram Elementary Cellular Automaton (ECA).
- *                  A 1-D binary row evolves by applying an 8-bit lookup
- *                  table (the rule): each cell's new state depends on
- *                  itself and its two neighbours → 2³=8 neighbourhood
- *                  configurations → 256 possible rules (Wolfram 1983).
- *
- * Math           : Rule encoding: the 3-bit neighbourhood (left, center,
- *                  right) is treated as a binary number 0–7; the rule's
- *                  n-th bit gives the new center state for neighbourhood n.
- *                  Example: Rule 110 = 0b01101110 → bit[n] = (110>>n)&1.
- *
- * Physics        : Wolfram classes:
- *                  Class 1 (Fixed)    — all initial conditions → same state
- *                  Class 2 (Periodic) — stable or periodic patterns
- *                  Class 3 (Chaotic)  — pseudo-random, sensitive to init
- *                  Class 4 (Complex)  — localised propagating structures
- *                  Class 5 (Fractal)  — Sierpinski-like self-similarity
- *                  Rule 110 is Class 4 and is Turing-complete (Cook 2004).
- *
- * Performance    : Each row update is O(cols) — single pass with bitwise
- *                  neighbourhood extraction.  No double buffer needed since
- *                  rows are computed top-to-bottom from the previous row only.
- *
- * References     :
- *
- *   CONCEPTS — elementary cellular automata
- *   • Wolfram, S. (1983) — "Statistical mechanics of cellular automata",
- *     *Reviews of Modern Physics* 55:601-644.  The foundational paper: the
- *     2³→256 rule numbering and the rule-as-lookup-table scheme used here.
- *   • Wolfram, S. (1984) — "Universality and complexity in cellular
- *     automata", *Physica D* 10:1-35.  The four behaviour classes
- *     (fixed / periodic / chaotic / complex) this demo colour-codes
- *     (we add a 5th "fractal" bucket for Sierpinski-type rules).
- *   • Cook, M. (2004) — "Universality in Elementary Cellular Automata",
- *     *Complex Systems* 15(1):1-40.  Proof that Rule 110 is Turing-complete.
- *   • Wolfram, S. (2002) — *A New Kind of Science*, Wolfram Media.  The
- *     comprehensive reference; Rule 30 as an RNG, Rule 90 → Sierpinski,
- *     Rule 110 gliders.  Browseable free at wolframscience.com.
- *
- *   RENDERING — terminal output
- *   • Padala, P. (2005) — "NCURSES Programming HOWTO", TLDP
- *     (tldp.org/HOWTO/NCURSES-Programming-HOWTO/).  The colour-pair,
- *     attribute, and double-buffered (wnoutrefresh/doupdate) model used
- *     in §3/§6.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * A whole universe of one-dimensional patterns lives inside a single byte.
- * Take any 8-bit number 0-255, treat its bits as a tiny truth-table indexed
- * by the three cells above (left, centre, right), and you have a complete
- * deterministic rule for evolving an infinite row of cells. The screen is
- * just that row stamped over and over, one generation per terminal line.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine a row of dominoes, each either standing or fallen. To produce the
- * next row, every domino looks at itself and its two neighbours, finds that
- * 3-bit pattern (one of 8 possibilities) on a small lookup card, and sets
- * its successor accordingly. The "card" is the rule number printed in
- * binary. Stack 100 such rows and you get either Sierpinski triangles
- * (rule 90), pseudo-random noise (rule 30), or gliders (rule 110).
- *
- * ALGORITHM IN STEPS
- * ──────────────────
- *  1. Seed generation 0: usually a single live cell at the centre column.
- *  2. To compute generation g+1 from g, for each column c:
- *       a. Read l = row[c-1], m = row[c], rv = row[c+1] (wrap toroidally).
- *       b. Form the 3-bit index n = (l<<2)|(m<<1)|rv  ∈ [0,7].
- *       c. New cell = (rule >> n) & 1.              ← cell_next()
- *  3. Each tick adds one generation (every ctl.delay ticks).
- *  4. When the last generation is reached, freeze, hold for PAUSE_TICKS,
- *     then auto-advance to the next preset (if auto is on).
- *  5. Render: generation g maps to terminal row 1+g; the class colour comes
- *     from ca_classify().
- *
- * KEY FORMULAS
- * ────────────
- *  n = (l<<2)|(m<<1)|r          neighbourhood → 3-bit index 0..7
- *  next = (rule >> n) & 1       Wolfram lookup: rule's n-th bit
- *  rule 110 = 0b01101110        bit pattern that yields Turing-completeness
- *  wrap: src[(c-1+cols) % cols] toroidal boundary, no edge artefacts
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Rule 0 and 255 are degenerate (all-dead / all-alive after one step) —
- *    kept in the preset list as visual sanity checks.
- *  • Toroidal wrap means a "centre" seed is only centred for ONE row;
- *    after a few generations the pattern can re-enter from the opposite edge.
- *  • Each generation is computed top-down once; resizing the terminal re-fits
- *    the grid and re-centres the seed (app_fit → scene_reseed).
- *  • Random seed (R) populates row 0 with rand()&1 — chaotic rules look
- *    drastically different from centre seed, fixed/fractal ones may not.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • Rule 90 must show a Sierpinski triangle from a centre seed —
- *    canonical fractal sanity check.
- *  • Rule 30's centre column should look statistically random (Wolfram
- *    used it as the Mathematica RNG until 2002).
- *  • Rule 0 collapses to all-zero on row 1; rule 255 to all-ones.
- *  • The classification colour at the top must match the visual character
- *    of the pattern (chaotic-orange for rule 30, fractal-yellow for 90).
- *  • Pressing + halves the rows-per-row delay; the bottom of the screen
- *    should fill in roughly half the time.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── ARCHITECTURE — SIMULATION / LOGIC / EFFECTS / DELAYS / RENDER ─────── *
- *
- * One rule keeps the layers clear: a function's SIGNATURE says whether it
- * can change the world.
- *   • non-const pointer (Automaton*, Scene*, App*) → an EFFECT; may mutate.
- *   • const pointer / by-value                     → a pure read / render.
- *
- * SIMULATION — the automaton itself (§5):
- *   ca_step         compute one generation from the row above (the effect)
- *   ca_seed_center / ca_seed_random   lay down generation 0
- *
- * LOGIC — stateless rules (§4), no mutation:
- *   cell_next       the Wolfram lookup: 3-cell neighbourhood → next state
- *   ca_classify     rule number → Wolfram behaviour class (1..5)
- *
- * EFFECTS — everything that mutates state, behind non-const pointers:
- *   the cell grid + generation counter (ca_step / seeds), and the control
- *   knobs (scene_set_preset / scene_set_theme / scene_reseed / scene_tick).
- *
- * DELAYS — the only time-bending, in the control + main loop:
- *   row pacing   one new generation every ctl.delay ticks
- *   hold         freeze a finished pattern for PAUSE_TICKS, then advance
- *   frame cap    main() sleeps to a fixed TICK_NS (~30 fps)
- *
- * RENDERING (§6) is PURE: render_* read a const Scene and write only the
- * terminal — the data bar (row 0), the CA grid (rows 1..n-2), and the
- * action bar (row n-1) are three independent draws that mutate nothing.
- *
- * PERFORMANCE — modest by design: each generation is O(cols), a single
- * bitwise pass; no double buffer is needed because every generation is kept
- * (the grid is the history) and each row is computed once from the one above.
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -194,43 +27,40 @@
 #include <stdio.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  config — tunables, presets, colour-pair IDs                        */
-/* ===================================================================== */
+/* ── §1  config — tunables, presets, colour-pair IDs ──────────────────── */
 
-#define TICKS_PER_SEC 30                             /* sim/render tick rate */
-#define TICK_NS      (1000000000LL / TICKS_PER_SEC)  /* ~30 fps frame cap    */
-#define MAX_ROWS     128         /* grid depth; ≥ any terminal height     */
-#define MAX_COLS     320         /* grid width; ≥ any terminal width      */
-#define DELAY_DEF    3           /* ticks between rows (~10 rows/sec)     */
-#define DELAY_MIN    1           /* fastest: 1 tick / row                 */
-#define DELAY_MAX    30          /* slowest: 30 ticks / row               */
-#define PAUSE_TICKS  (3 * TICKS_PER_SEC)  /* hold a finished pattern ~3 s */
+#define TICKS_PER_SEC 30                             /* sim + render tick rate */
+#define TICK_NS      (1000000000LL / TICKS_PER_SEC)  /* one frame in nanosecs  */
+#define MAX_ROWS     128         /* grid depth; bigger than any terminal     */
+#define MAX_COLS     320         /* grid width; bigger than any terminal     */
+#define DELAY_DEF    3           /* ticks between rows at startup (~10 rows/s)*/
+#define DELAY_MIN    1           /* fastest: a new row every tick            */
+#define DELAY_MAX    30          /* slowest: a new row every 30 ticks        */
+#define PAUSE_TICKS  (3 * TICKS_PER_SEC)  /* how long a finished pattern holds */
 #define LIVE_CHAR    '#'
 
-/* HUD reserves the top row (data bar) and the bottom row (action bar);
- * the CA fills the rows between. */
+/* The top row is the data bar and the bottom row is the action bar; the CA
+ * gets everything in between. */
 #define HUD_TOP_ROWS 1
 #define HUD_BOT_ROWS 1
 #define HUD_ROWS     (HUD_TOP_ROWS + HUD_BOT_ROWS)
 
-/* element count of a fixed array. */
 #define COUNT_OF(a)  ((int)(sizeof (a) / sizeof (a)[0]))
 
-/* color-pair IDs: CP_CL1..5 = the five Wolfram classes (data bar + grid);
- * CP_HINT = the action bar. */
+/* Colour-pair IDs: one per Wolfram class (used on the data bar and grid),
+ * plus one for the action bar. */
 enum { CP_CL1 = 1, CP_CL2, CP_CL3, CP_CL4, CP_CL5, CP_HINT };
 
 /*
- * Preset bank — a curated tour of 17 of the 256 rules.  Most rules are
- * visually dull; these are the famous / striking ones.  n/p step through
- * this list and auto-advance cycles it; the order is a deliberate tour, not
- * numeric.  A "preset" is just a rule with a name — see scene_set_preset.
+ * Preset bank — a hand-picked tour of 17 of the 256 rules. Most rules look
+ * dull, so this is just the famous, good-looking ones. The order is a
+ * deliberate tour, not numeric; n/p step through it and auto-advance cycles
+ * it. A "preset" is simply a rule plus a short caption.
  */
 #define N_PRESETS 17
 static const struct {
-    int         rule;   /* the Wolfram rule number 0..255 */
-    const char *desc;   /* short HUD caption              */
+    int         rule;   /* the Wolfram rule number, 0..255 */
+    const char *desc;   /* short caption shown on the data bar */
 } PRESETS[N_PRESETS] = {
     {  30, "Chaos / RNG"       },
     {  90, "Sierpinski"        },
@@ -251,9 +81,7 @@ static const struct {
     { 255, "All ones"          },
 };
 
-/* ===================================================================== */
-/* §2  clock — the program's frame DELAY lives behind these               */
-/* ===================================================================== */
+/* ── §2  clock — read the time, sleep for a while ─────────────────────── */
 
 static long long clock_ns(void)
 {
@@ -268,21 +96,20 @@ static void clock_sleep_ns(long long ns)
     nanosleep(&ts, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color — theme → ncurses pairs (a terminal effect)                  */
-/* ===================================================================== */
+/* ── §3  color — pick a palette, hand it to ncurses ───────────────────── */
 
 /*
- * Theme — a palette for the five Wolfram classes plus the action bar.  The
- * colour ENCODES the class (fixed/periodic/chaotic/complex/fractal), so every
- * theme keeps five distinct entries; cycling t/T changes the mood, not the
- * meaning.  All entries sit in the bright half of the 256-cube.
+ * Theme — one palette: a colour for each of the five Wolfram classes plus a
+ * colour for the action bar. The colour itself tells you the class, so every
+ * theme keeps the five distinct — cycling t/T changes the mood, not the
+ * meaning. All colours sit in the bright half of the palette so they stay
+ * legible against a dark terminal.
  */
 #define N_THEMES 5
 typedef struct {
     const char *name;
-    short cls[5];     /* classes 1..5: fixed, periodic, chaotic, complex, fractal */
-    short hint;       /* action-bar colour                                        */
+    short cls[5];     /* one colour per class: fixed, periodic, chaotic, complex, fractal */
+    short hint;       /* the action-bar colour */
 } Theme;
 
 static const Theme THEMES[N_THEMES] = {
@@ -293,7 +120,6 @@ static const Theme THEMES[N_THEMES] = {
     { "MONO   ", { 242, 246, 250, 253, 255 }, 248 },  /* greyscale tiers               */
 };
 
-/* bind the five class pairs + the hint pair from a 256-colour theme. */
 static void theme_bind_256(const Theme *t)
 {
     init_pair(CP_CL1, t->cls[0], -1);
@@ -304,7 +130,7 @@ static void theme_bind_256(const Theme *t)
     init_pair(CP_HINT, t->hint, -1);
 }
 
-/* 8-colour fallback: fixed class hues, theme-independent. */
+/* Fallback for old 8-colour terminals: fixed hues, ignores the theme. */
 static void theme_bind_8(void)
 {
     init_pair(CP_CL1, COLOR_WHITE,  -1);
@@ -315,7 +141,6 @@ static void theme_bind_8(void)
     init_pair(CP_HINT, COLOR_CYAN,  -1);
 }
 
-/* apply theme `idx` to the colour pairs (a terminal effect). */
 static void theme_apply(int idx)
 {
     if (idx < 0 || idx >= N_THEMES) idx = 0;
@@ -330,83 +155,88 @@ static void color_init(void)
     theme_apply(0);
 }
 
-/* ===================================================================== */
-/* §4  model — STATE (Automaton + Control + Scene) and pure reads         */
-/* ===================================================================== */
+/* ── §4  model — the data (Automaton + Control + Scene) and pure reads ── */
 
-/* Wolfram's behaviour classes (Wolfram 1984) — what a rule does over time. */
+/*
+ * WolframClass — the five buckets a rule's long-term behaviour falls into
+ * (Wolfram 1984). We colour the pattern by its class so you can spot the
+ * family at a glance.
+ */
 typedef enum {
-    CLASS_FIXED    = 1,   /* converges to a uniform state         */
+    CLASS_FIXED    = 1,   /* settles to one solid state           */
     CLASS_PERIODIC = 2,   /* stable or repeating patterns         */
-    CLASS_CHAOTIC  = 3,   /* pseudo-random, sensitive to the seed */
-    CLASS_COMPLEX  = 4,   /* localised propagating structures     */
-    CLASS_FRACTAL  = 5,   /* Sierpinski-like self-similarity      */
+    CLASS_CHAOTIC  = 3,   /* looks random, very sensitive to seed */
+    CLASS_COMPLEX  = 4,   /* little structures that move around    */
+    CLASS_FRACTAL  = 5,   /* self-similar triangles (Sierpinski)  */
 } WolframClass;
 
-/* how generation 0 is laid down — the initial condition the rule evolves. */
+/*
+ * SeedKind — how we fill the very first row, which is all that decides what
+ * grows below it.
+ */
 typedef enum {
-    SEED_CENTER,   /* one live cell at the centre column (the canonical seed) */
-    SEED_RANDOM,   /* every cell a coin-flip (chaotic rules diverge wildly)   */
+    SEED_CENTER,   /* one live cell dead centre (the classic seed) */
+    SEED_RANDOM,   /* every cell a coin flip (chaotic rules look wildly different) */
 } SeedKind;
 
 /*
- * Automaton — the elementary cellular automaton's state (Wolfram 1983).
- * `cells` stores the WHOLE run, not just the live row: row g is generation
- * g.  That doubles as the on-screen image AND removes the need for a double
- * buffer — each generation is read from the row above and written exactly
- * once, top to bottom (see ca_step).  Static, sized for the largest terminal.
+ * Automaton — the cellular automaton itself (Wolfram 1983). `cells` keeps the
+ * ENTIRE run, not just the latest row: row g is generation g. That serves two
+ * jobs at once — it's the picture on screen AND it means we never need a
+ * second buffer, since each row is read from the one above and written once,
+ * top to bottom (see ca_step). Sized for the biggest possible terminal.
  */
 typedef struct {
-    uint8_t cells[MAX_ROWS][MAX_COLS]; /* cells[gen][col] ∈ {0,1}; gen 0 = seed */
-    int     w;     /* live row width = terminal columns (≤ MAX_COLS)         */
-    int     gens;  /* generations that fit = CA area height (≤ MAX_ROWS)     */
-    int     gen;   /* highest generation computed so far (0 right after seed)*/
-    int          rule; /* the active Wolfram rule, 0..255 (the lookup table) */
-    WolframClass cls;  /* its behaviour class, cached so colour is an O(1) lookup */
+    uint8_t cells[MAX_ROWS][MAX_COLS]; /* cells[gen][col] is 0 or 1; gen 0 is the seed */
+    int     w;     /* live row width = terminal columns (at most MAX_COLS)  */
+    int     gens;  /* rows that fit between the two bars (at most MAX_ROWS)  */
+    int     gen;   /* the latest generation computed (0 right after seeding) */
+    int          rule; /* the rule in play, 0..255 — the whole behaviour      */
+    WolframClass cls;  /* its class, worked out once so colouring is instant  */
 } Automaton;
 
 /*
- * Phase — the two-state run cycle.  BUILD adds one generation per delay
- * window until the screen fills; HOLD then freezes the finished pattern for
- * PAUSE_TICKS before the next preset (or a redraw).  scene_tick switches them.
+ * Phase — the run has two stages. BUILD keeps adding rows until the screen is
+ * full; HOLD freezes the finished picture for a few seconds before moving on.
+ * scene_tick flips between them.
  */
 typedef enum { PHASE_BUILD, PHASE_HOLD } Phase;
 
 /*
- * Control — the UI knobs and the phase state machine.  Kept apart from the
- * Automaton so input mutates THESE while the simulation mutates the grid.
+ * Control — everything the user can tweak, plus where we are in the build/hold
+ * cycle. Kept separate from the Automaton so keypresses touch these knobs
+ * while the simulation touches the grid.
  */
 typedef struct {
-    int   preset;       /* index into PRESETS                              */
-    int   theme;        /* index into THEMES                               */
-    int   delay;        /* ticks between rows (speed; DELAY_MIN..MAX)       */
-    bool  paused;       /* freeze stepping; render keeps running           */
-    bool  auto_advance; /* on completion: next preset (vs. redraw same)    */
-    Phase phase;        /* BUILD = filling; HOLD = done, counting down     */
-    int   delay_ctr;    /* ticks since the last row was added              */
-    int   hold_ctr;     /* ticks held since the pattern completed          */
+    int   preset;       /* which entry of PRESETS is showing               */
+    int   theme;        /* which entry of THEMES is active                 */
+    int   delay;        /* ticks between rows — bigger is slower (MIN..MAX) */
+    bool  paused;       /* stop stepping, but keep drawing                 */
+    bool  auto_advance; /* when a pattern finishes: next preset, or redraw  */
+    Phase phase;        /* BUILD = still filling; HOLD = done, waiting      */
+    int   delay_ctr;    /* ticks since we last added a row                 */
+    int   hold_ctr;     /* ticks elapsed since the pattern finished         */
 } Control;
 
 /*
- * Scene — one running instance: the simulated automaton plus the control
- * that steers it.  This is the unit the effects mutate (Scene*) and the
- * renderer reads (const Scene*); App wraps it with the terminal/loop state.
+ * Scene — one running show: the automaton plus the knobs that steer it. This
+ * is the bundle the effects change (Scene*) and the renderer reads
+ * (const Scene*); App adds the terminal and loop state around it.
  */
 typedef struct {
-    Automaton ca;    /* the simulation (§5 advances it)  */
-    Control   ctl;   /* the UI knobs + phase machine     */
+    Automaton ca;    /* the simulation (§5 advances it) */
+    Control   ctl;   /* the user knobs + build/hold stage */
 } Scene;
 
 /* ── pure reads / logic ──────────────────────────────────────────────── */
 
-/* is rule `r` listed in the class-membership table `set`? */
 static bool rule_in_set(int r, const int *set, int n)
 {
     for (int i = 0; i < n; i++) if (set[i] == r) return true;
     return false;
 }
 
-/* Wolfram class of a rule — first matching membership table wins, else periodic. */
+/* Look up a rule's behaviour class; rules not in any table count as periodic. */
 static WolframClass ca_classify(int r)
 {
     static const int cl5[] = { 18, 60, 90, 105, 150 };
@@ -432,7 +262,7 @@ static const char *class_name(WolframClass cls)
     return "Unknown";
 }
 
-/* the colour pair that encodes a class on the data bar + grid. */
+/* The colour pair that stands for a class on the data bar and the grid. */
 static int class_cp(WolframClass cls)
 {
     switch (cls) {
@@ -445,30 +275,30 @@ static int class_cp(WolframClass cls)
     return CP_CL2;
 }
 
-/* pack a left/centre/right neighbourhood into its 3-bit code 0..7. */
+/* Turn the three cells above (left, middle, right) into a number 0..7. */
 static int neighbourhood_code(uint8_t l, uint8_t m, uint8_t r)
 {
     return (l << 2) | (m << 1) | r;
 }
 
-/* read bit `code` of the rule's 8-bit lookup table → the new centre state. */
+/* The rule is 8 bits; that 0..7 number picks which bit, and that bit is the
+ * cell's new value. This single step is the whole rule. */
 static uint8_t rule_bit(int rule, int code)
 {
     return (uint8_t)((rule >> code) & 1);
 }
 
-/* the Wolfram update for one cell: index the rule by the neighbourhood code. */
+/* One cell's next value: look up the rule by the three cells above it. */
 static uint8_t cell_next(uint8_t l, uint8_t m, uint8_t r, int rule)
 {
     return rule_bit(rule, neighbourhood_code(l, m, r));
 }
 
-/* fold a column index onto the toroidal row — the wrap-around boundary. */
+/* Wrap a column back onto the row, so the left edge meets the right (a loop,
+ * no special handling at the ends). */
 static int wrap_col(int c, int w) { return (c % w + w) % w; }
 
-/* ===================================================================== */
-/* §5  simulation — EFFECTS that advance the automaton + control          */
-/* ===================================================================== */
+/* ── §5  simulation — the steps that change the automaton + knobs ─────── */
 
 static void ca_clear(Automaton *a)
 {
@@ -476,24 +306,24 @@ static void ca_clear(Automaton *a)
     a->gen = 0;
 }
 
-/* generation 0 = a single live cell at the centre column. */
+/* First row: one live cell in the middle. */
 static void ca_seed_center(Automaton *a)
 {
     ca_clear(a);
     if (a->w > 0) a->cells[0][a->w / 2] = 1;
 }
 
-/* generation 0 = a random row (chaotic rules diverge wildly from centre). */
+/* First row: random on/off (chaotic rules look very different from this). */
 static void ca_seed_random(Automaton *a)
 {
     ca_clear(a);
     for (int c = 0; c < a->w; c++) a->cells[0][c] = (uint8_t)(rand() & 1);
 }
 
-/* ca_step — compute the next generation from the current top row (toroidal). */
+/* Grow one new row from the row above; the edges wrap around. */
 static void ca_step(Automaton *a)
 {
-    if (a->gen >= a->gens - 1) return;             /* screen full */
+    if (a->gen >= a->gens - 1) return;             /* screen is full */
     const uint8_t *src = a->cells[a->gen];
     uint8_t       *dst = a->cells[a->gen + 1];
     int w = a->w;
@@ -506,7 +336,7 @@ static void ca_step(Automaton *a)
     a->gen++;
 }
 
-/* (re)seed generation 0 and restart the build phase. */
+/* Lay down a fresh first row and start building from the top again. */
 static void scene_reseed(Scene *s, SeedKind kind)
 {
     if (kind == SEED_RANDOM) ca_seed_random(&s->ca);
@@ -516,7 +346,7 @@ static void scene_reseed(Scene *s, SeedKind kind)
     s->ctl.hold_ctr  = 0;
 }
 
-/* select a preset: set its rule + class, then reseed from the centre. */
+/* Switch to a preset: take its rule, work out its class, start fresh. */
 static void scene_set_preset(Scene *s, int idx)
 {
     s->ctl.preset = ((idx % N_PRESETS) + N_PRESETS) % N_PRESETS;
@@ -525,14 +355,14 @@ static void scene_set_preset(Scene *s, int idx)
     scene_reseed(s, SEED_CENTER);
 }
 
-/* recolour to theme `idx` (does not touch the pattern). */
+/* Switch colour theme; the pattern itself is left alone. */
 static void scene_set_theme(Scene *s, int idx)
 {
     s->ctl.theme = ((idx % N_THEMES) + N_THEMES) % N_THEMES;
     theme_apply(s->ctl.theme);
 }
 
-/* one simulation tick: pace the build, or count down the hold. */
+/* One tick: either add a row (build) or wait out the hold timer. */
 static void scene_tick(Scene *s)
 {
     Control *c = &s->ctl;
@@ -540,14 +370,14 @@ static void scene_tick(Scene *s)
 
     if (c->phase == PHASE_HOLD) {
         if (++c->hold_ctr >= PAUSE_TICKS) {
-            /* Auto on → next preset; off → redraw this same rule. */
+            /* Auto on: move to the next preset. Off: redraw this same one. */
             if (c->auto_advance) scene_set_preset(s, c->preset + 1);
             else                 scene_reseed(s, SEED_CENTER);
         }
         return;
     }
 
-    /* BUILD: add one generation every `delay` ticks. */
+    /* Building: add a row once every `delay` ticks. */
     if (++c->delay_ctr >= c->delay) {
         c->delay_ctr = 0;
         ca_step(&s->ca);
@@ -565,21 +395,19 @@ static void scene_init(Scene *s)
     s->ctl.delay        = DELAY_DEF;
     s->ctl.paused       = false;
     s->ctl.auto_advance = true;
-    scene_set_preset(s, 0);      /* sets rule/class + seeds + resets phase */
+    scene_set_preset(s, 0);      /* picks rule + class, seeds, resets the stage */
 }
 
-/* speed = rows per second: fewer ticks/row is faster, more is slower. */
+/* Fewer ticks per row means a new row sooner, so it builds faster. */
 static void ctl_speed_up  (Control *c) { if (c->delay > DELAY_MIN) c->delay--; }
 static void ctl_speed_down(Control *c) { if (c->delay < DELAY_MAX) c->delay++; }
 
-/* ===================================================================== */
-/* §6  render — PURE: const Scene → screen                                */
-/* ===================================================================== */
+/* ── §6  render — read the scene, paint the screen, change nothing ────── */
 
 /*
- * hud_bar — draw one full-width bar on `row`, filled in `attr`, with the
- * text clipped so it can never wrap onto the CA area.  Leaves the last
- * column untouched (avoids the bottom-right corner scroll quirk).
+ * Draw a full-width coloured bar across one row, clipping the text so it can
+ * never spill into the CA area. We skip the very last column on purpose:
+ * writing the bottom-right corner makes some terminals scroll.
  */
 static void hud_bar(int row, int cols, chtype attr, const char *buf)
 {
@@ -591,9 +419,8 @@ static void hud_bar(int row, int cols, chtype attr, const char *buf)
     attroff(attr);
 }
 
-/* the status tail on the data bar: paused, or the hold countdown in seconds
- * (empty while building).  hold_ctr counts up in ticks; convert with a
- * ceil-division to whole seconds. */
+/* The little status note at the end of the data bar: "paused", or the
+ * countdown to the next preset, or nothing while it's still building. */
 static void phase_status(char *buf, size_t n, const Control *c)
 {
     if (c->paused) {
@@ -606,7 +433,7 @@ static void phase_status(char *buf, size_t n, const Control *c)
     }
 }
 
-/* Top DATA bar (row 0), coloured by the rule's Wolfram class. */
+/* Top data bar (row 0), coloured by the rule's class. */
 static void render_data_bar(const Scene *s, int cols)
 {
     const Automaton *a = &s->ca;
@@ -626,7 +453,7 @@ static void render_data_bar(const Scene *s, int cols)
     hud_bar(0, cols, COLOR_PAIR(class_cp(a->cls)) | A_BOLD | A_REVERSE, buf);
 }
 
-/* The CA grid: generation g → terminal row 1+g, drawn in the class colour. */
+/* The pattern: generation g goes on screen row 1+g, in the class colour. */
 static void render_grid(const Scene *s, int cols)
 {
     const Automaton *a = &s->ca;
@@ -642,7 +469,7 @@ static void render_grid(const Scene *s, int cols)
     attroff(attr);
 }
 
-/* Bottom ACTION bar (row n-1): every interactive key. */
+/* Bottom action bar (last row): the list of keys you can press. */
 static void render_action_bar(int cols, int rows)
 {
     static const char *keys =
@@ -650,7 +477,7 @@ static void render_action_bar(int cols, int rows)
     hud_bar(rows - 1, cols, COLOR_PAIR(CP_HINT) | A_BOLD, keys);
 }
 
-/* one frame: erase → data bar → grid → action bar → flush (one diff write). */
+/* Paint one whole frame: clear, then the two bars and the grid, then flush. */
 static void render_frame(const Scene *s, int cols, int rows)
 {
     erase();
@@ -661,22 +488,19 @@ static void render_frame(const Scene *s, int cols, int rows)
     doupdate();
 }
 
-/* ===================================================================== */
-/* §7  app — orchestration: input → effects → delay → render              */
-/* ===================================================================== */
+/* ── §7  app — tie it together: input, then tick, then draw, then wait ── */
 
 /*
- * App — the running PROCESS around the Scene: the terminal size and the
- * loop's flags.  Split from Scene because these describe the program, not
- * the automaton.  One file-scope instance (g_app) so the signal handler can
- * reach the flags.
+ * App — everything around the Scene that's about the program rather than the
+ * automaton: how big the terminal is and the flags the main loop watches.
+ * There's one global copy (g_app) so the signal handler can reach the flags;
+ * the handler can only touch sig_atomic_t values safely.
  */
 typedef struct {
     Scene scene;               /* the running automaton (§4-§6)              */
-    int   rows, cols;          /* terminal size in character cells           */
-    volatile sig_atomic_t running;     /* main-loop flag, 0 = quit; written by
-                                        * SIGINT/SIGTERM (async-signal-safe)   */
-    volatile sig_atomic_t need_resize; /* set by SIGWINCH, drained atop loop   */
+    int   rows, cols;          /* terminal size, in character cells          */
+    volatile sig_atomic_t running;     /* 0 means quit; set by Ctrl-C / kill  */
+    volatile sig_atomic_t need_resize; /* set when the window changed size    */
 } App;
 
 static App g_app;
@@ -700,8 +524,8 @@ static void screen_init(void)
     color_init();
 }
 
-/* read the terminal size and size the CA grid to fit: row width = cols,
- * generations = the rows between the two HUD bars. */
+/* Re-measure the terminal and size the grid to it: width = columns,
+ * number of rows = whatever sits between the two bars. */
 static void app_fit(App *app)
 {
     int rows, cols;
@@ -712,7 +536,7 @@ static void app_fit(App *app)
     app->scene.ca.gens = (app->rows - HUD_ROWS < 1) ? 1 : app->rows - HUD_ROWS;
 }
 
-/* map a keypress to an intent; some fire §5 effects. */
+/* Turn a keypress into an action. */
 static void app_handle_key(App *app, int ch)
 {
     Scene   *s = &app->scene;
@@ -745,18 +569,16 @@ int main(void)
     app->running = 1;
 
     screen_init();
-    app_fit(app);                /* terminal size → CA dims (before seeding) */
-    scene_init(&app->scene);     /* control defaults + preset 0 + centre seed */
+    app_fit(app);                /* size the grid before we seed it */
+    scene_init(&app->scene);     /* defaults, first preset, centre seed */
 
     long long next = clock_ns();
 
     /*
-     * Fixed-step main loop — each iteration reads as four named steps:
-     *   INPUT   drain getch() → app_handle_key (may fire §5 effects)
-     *   EFFECTS scene_tick — pace one generation / count the hold
-     *   RENDER  render_frame — pure paint
-     *   DELAY   sleep to the next TICK_NS (~30 fps)
-     * On SIGWINCH the grid is re-fitted and re-centred.
+     * Main loop, one steady beat per frame:
+     *   read any keys, advance the simulation by a tick, draw, then sleep
+     *   until the next ~30th of a second. If the window was resized, re-fit
+     *   the grid and start the pattern over.
      */
     while (app->running) {
         if (app->need_resize) {

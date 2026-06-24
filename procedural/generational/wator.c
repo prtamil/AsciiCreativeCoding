@@ -1,259 +1,18 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * wator.c — Wa-Tor Predator-Prey World
+ * wator.c — Wa-Tor, a little ocean where fish breed and sharks hunt them.
  *
- * Fish (o) swim and breed; sharks (X) hunt fish, breed, and starve.
- * A. K. Dewdney's Wa-Tor simulation (Scientific American, December 1984).
+ * Fish ('o') swim, age, and breed; sharks ('X') chase fish, breed, and
+ * starve if they go too long without eating. Out of these tiny per-creature
+ * rules the two populations rise and fall in waves (classic predator-prey).
  *
- * Rules (each tick, in randomly shuffled cell order):
+ * From A. K. Dewdney's "Wa-Tor", Scientific American 251(6), Dec 1984.
+ * Below the ocean is a strip showing the recent fish/shark counts over time.
  *
- *   Fish:
- *     1. age++
- *     2. Move to a random adjacent empty cell (toroidal wrap).
- *        If no empty cell exists: stay put.
- *     3. If age ≥ fish_breed: leave a new fish (age=0) at old cell; reset age.
- *
- *   Shark:
- *     1. breed_age++, hunger++
- *     2. If hunger ≥ shark_starve: die (cell → empty).
- *     3. Look for adjacent fish first.  If found: eat one, move there, hunger=0.
- *        Otherwise: move to a random adjacent empty cell.
- *        If no move possible: stay put.
- *     4. If breed_age ≥ shark_breed: leave a new shark at old cell; reset breed_age.
- *
- * Shuffled update prevents directional bias — all live cells are collected into
- * an array, Fisher-Yates shuffled, then processed in that order.  A moved[]
- * flag prevents any cell being processed twice per tick.
- *
- * Layout:
- *   Row  0                      — data HUD (tick, populations, speed, state)
- *   Rows 1 … ocean.rows         — ocean grid
- *   next 4 rows                 — dual population history graph
- *   bottom row                  — action HUD (interactive keys)
- *
- * Population graph:
- *   Upper 2 rows — fish count (cyan bars, grow downward)
- *   Lower 2 rows — shark count (red bars, grow upward)
- *   Each column = one past tick from a HIST_LEN-entry ring buffer.
- *
- * Keys:
- *   r         reseed (fresh random ocean)
- *   space     pause / resume
- *   + / =     more steps per frame  (up to 20)
- *   - / _     fewer steps per frame
- *   n / p     next / previous ecological regime preset (reseeds)
- *   q / Q     quit
- *
- * Presets (n/p):  STABLE · BLOOM · BOOM-BUST · FRAGILE
- *   Each sets fish/shark breed rates, shark starve time, and initial
- *   densities to a different point in Wa-Tor's parameter space — from
- *   steady oscillation to shark boom-and-collapse to extinction.
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra wator.c -o wator -lncurses
- *
- * Sections (layers — see ARCHITECTURE block below):
+ * Sections:
  *   §1 config  §2 performance  §3 simulation-data  §4 simulation-step
  *   §5 render  §6 app
  */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Wa-Tor predator-prey cellular automaton (Dewdney 1984).
- *                  Fish and sharks are simulated on a toroidal grid with
- *                  age-based breeding and hunger-based shark death.
- *                  Shuffled update (Fisher-Yates on active cell list) removes
- *                  directional bias — equivalent to random-order asynchronous
- *                  update, which better models spatial competition.
- *
- * Physics        : Lotka-Volterra dynamics emerge: fish and shark populations
- *                  oscillate with a phase lag (fish peak before shark peak).
- *                  Parameter space: low fish_breed + high shark_breed →
- *                  shark overpopulation and collapse; opposite → shark
- *                  starvation.  Stable cycles exist in a narrow parameter band.
- *
- * Data-structure : Grid of uint16_t cells encoding (type, age, hunger) in
- *                  bitfields.  Active cell array rebuilt each tick by scanning
- *                  the grid O(rows×cols); Fisher-Yates shuffle is O(N_active).
- *                  moved[] flag (parallel uint8 grid) prevents double-processing.
- *
- * Rendering      : Population history ring buffer (HIST_LEN entries); drawn
- *                  as a 4-row dual bar chart: fish above, sharks below.
- *
- * References     : Concept —
- *                  • Dewdney, A. K. (1984) — "Computer Recreations: Sharks
- *                    and fish wage an ecological war on the toroidal planet
- *                    Wa-Tor", Scientific American 251(6), Dec 1984. The
- *                    original specification of this exact simulation.
- *                  • Lotka (1925) / Volterra (1926) — the predator-prey
- *                    equations whose oscillations Wa-Tor reproduces from
- *                    purely local rules (the emergent dynamics in Physics).
- *                  • Grimm & Railsback (2005) — "Individual-based Modeling
- *                    and Ecology". Why per-agent rules (not population ODEs)
- *                    are the right model, and what emerges from them.
- *                  • Knuth, TAOCP vol. 2, §3.4.2 — Fisher-Yates shuffle
- *                    (Algorithm P): the unbiased shuffle behind the random
- *                    cell-update order and the per-cell direction picks.
- *                  • Wikipedia — "Wa-Tor": parameter tables and the rule
- *                    variants. https://en.wikipedia.org/wiki/Wa-Tor
- *                  Rendering —
- *                  • Tufte — "Beautiful Evidence" (2006), ch. on sparklines:
- *                    the dense, axis-free history strip the dual bar chart is.
- *                  • Padala — "NCURSES Programming HOWTO", TLDP: colour pairs,
- *                    glyph output, non-blocking input, resize handling.
- *                  • xterm 256-colour palette — the indices the fish / shark /
- *                    HUD pairs draw from: https://jonasjacek.github.io/colors/
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Each cell of the toroidal ocean owns three numbers — type (empty,
- * fish, shark), breed counter, hunger counter.  Each tick, every live
- * cell is awakened in random order and runs a tiny three-rule script:
- * "did I starve?", "is there food / open water adjacent?", "have I bred
- * yet?".  No global step, no neighbour count — just per-cell lottery
- * draws against a randomly-shuffled neighbour list.  Lotka-Volterra
- * oscillations EMERGE from this micro-rule, they aren't programmed in.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Picture a chess board where every fish and shark gets one ticket per
- * tick.  The tickets are drawn from a hat in random order.  When your
- * ticket is called, you look in the four cardinal directions: a shark
- * checks for fish first, then for empty water; a fish checks for empty
- * water; both then check whether they've bred enough times to leave a
- * baby behind.  Sharks that haven't eaten in shark_starve turns leave
- * the board.  No central referee — the only synchronization is the
- * "moved" flag that prevents re-drawing the same ticket twice.
- *
- * ALGORITHM IN STEPS  (per sim_step)
- * ──────────────────
- *  1. Clear ocean.moved.  collect_live_cells fills ocean.order with every
- *     live cell index; Fisher-Yates shuffle it (random asynchronous order).
- *  2. For each cell index in shuffled order:
- *        if ocean.moved[r][c] continue.  (cell already acted this tick)
- *        if FISH  → fish_step
- *        if SHARK → shark_step
- *  3. fish_step:
- *        a. age++.
- *        b. find_neighbour for the first EMPTY of 4 shuffled directions.
- *        c. if breed_age >= fish_breed, leave new fish at old cell, reset.
- *        d. cell_set fish at new cell, mark moved.
- *  4. shark_step:
- *        a. breed++, hunger++.
- *        b. if hunger >= shark_starve → die, return.
- *        c. find_neighbour FISH first (eat, hunger=0); else EMPTY; else stay.
- *        d. if breed >= shark_breed, leave offspring at old cell.
- *        e. cell_set shark at new cell, mark moved.
- *  5. census recounts fish_pop/shark_pop; history_push records them, advancing
- *     PopulationHistory.head modulo HIST_LEN.
- *  6. Render: data HUD (row 0), ocean rows, 4-row dual histogram,
- *     action HUD (bottom row).
- *
- * KEY FORMULAS
- * ────────────
- *  Toroidal wrap   :  nr = (r + dr + R) mod R,   nc = (c + dc + C) mod C
- *  Histogram index :  idx = (head − (cols−1−col) + 2·HIST_LEN) mod HIST_LEN
- *  Bar height      :  fl = pop · bar_rows / scale,
- *                     scale_fish  = R·C / HIST_FISH_FULL_DIV,
- *                     scale_shark = R·C / HIST_SHARK_FULL_DIV  (sharks scaled
- *                     brighter because they're rarer)
- *  Visual age cue  :  fish "old"   when breed_age >= fish_breed − 1
- *                     shark "hungry" when hunger >= shark_starve − 1
- *  Population
- *    oscillation   :  steady-state cycle requires
- *                     fish births ≈ shark predation rate;
- *                     phase lag arises because sharks reproduce slower
- *                     than fish.  At the STABLE preset
- *                     (fish_breed=3, shark_breed=10, shark_starve=4)
- *                     the system shows visible Lotka–Volterra waves.
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • A shark that just bred AND ate — the offspring at the OLD cell
- *    inherits hunger from after the meal (zero), not the parent's
- *    pre-meal hunger.  This is the classic Wa-Tor convention.
- *  • moved guard: when shark eats fish, the eaten fish's slot becomes
- *    SHARK with moved=1, so when the fish's own ticket is later drawn,
- *    the cell is no longer FISH and the if-chain falls through.
- *  • Total extinction is a stable fixed point — when sharks eat all
- *    fish, they then starve out; ocean ends empty.  Press `r` to reseed.
- *  • Histogram scale is fixed; if fish exceed 50 % of grid the bars
- *    saturate (always full); below scale they fall to 0 (empty bar).
- *  • HIST_LEN = 512 is a ring; older history scrolls off the left edge
- *    silently when the terminal is wider than 512 columns (rare).
- *  • breed and hunger are uint8_t and saturate at 255 — fish that
- *    sit trapped in a corner forever stop counting at 255 instead of
- *    overflowing.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • Press `r`: ocean reseeds; fish density ≈30 %, sharks ≈5 %.
- *    Count by sampling 100 random cells.
- *  • Watch the histogram: fish bars (cyan, top) and shark bars (red,
- *    bottom) should oscillate roughly out of phase — fish peak comes
- *    several ticks before shark peak.
- *  • Hold `+` to crank steps/frame to 20: oscillation period clearly
- *    visible across the screen width within seconds.
- *  • Pause (space): tick counter freezes; populations shown stay fixed.
- *  • A fully starved ocean (everything gone) should show empty bars
- *    sliding rightward as new zero-pop ticks accumulate.
- *  • A fish-only ocean (a preset with shark_pct=0) saturates with fish
- *    within ~10 ticks at fish_breed=3.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── ARCHITECTURE (layer separation) ──────────────────────────────────── *
- *
- * State lives on one Scene (§3): the Ocean (the world), its PopulationHistory,
- * the user knobs, and the terminal size.  Each layer owns one concern; this
- * table says what each mutates:
- *
- *   Layer        Section  Mutates
- *   ─────────────────────────────────────────────────────────────────────
- *   PERFORMANCE  §2       nothing — reads the clock / sleeps
- *   SIMULATION   §3,§4    the Ocean (type / breed / hunger / moved grids, the
- *                         shuffle order, the census fish_pop/shark_pop, tick)
- *                         and the PopulationHistory ring.  The rule params are
- *                         NOT copied — they are read straight from the active
- *                         regime PRESETS[Scene.preset].
- *   RENDER       §5       the terminal only — reads Ocean + history, never
- *                         writes them; screen_resize also re-fits Ocean.rows /
- *                         .cols + Scene.term_rows/.term_cols (a USER EVENT).
- *   APP          §6       run knobs (Scene.steps / .paused / .preset) + the
- *                         signal flags (g_running / g_need_resize)
- *
- *   No LOGIC layer — the pure decisions are small named helpers within §4
- *     (wrap, find_neighbour) called by fish_step / shark_step, not a separate
- *     layer; likewise ishuffle transforms only its array argument (no global
- *     state, no I/O).  All sit with SIMULATION.
- *   No EFFECTS — nothing cosmetic is stored.  The "old fish" / "hungry shark"
- *     colour cues are derived at render time from the breed / hunger counters;
- *     the population history is real census data, not a decorative trail.
- *   No DELAYS — 'space' sets Scene.paused (sim_tick early-returns); the only
- *     wait is the PERFORMANCE frame cap (TICK_NS).
- *
- *   Signatures land the narrowest type: fish_step/shark_step/sim_step take
- *   Ocean* (+ const Preset*); the renderers take const Ocean* / const
- *   PopulationHistory*; only the tick/reset orchestrators (sim_tick,
- *   scene_reset, screen_resize) take Scene*.
- *
- * PER-TICK COMBINE — sim_tick (§4) is the ONE place state advances.  It runs
- * Scene.steps × sim_step, and each sim_step in fixed order:
- *     1. clear moved; collect live cells into order[]; Fisher-Yates shuffle.
- *     2. process each live cell in shuffled order (fish_step / shark_step).
- *     3. census fish_pop / shark_pop; push into the history ring; tick++.
- *   RENDER (scene_ocean + scene_histogram + scene_hud) then PERFORMANCE (frame
- *   cap) run once per frame in main, OUTSIDE the tick.
- *
- * USER EVENTS are NOT the tick: keys (reseed / pause / speed / preset) and
- * resize mutate state directly in §6 — reseed and preset switching call
- * scene_reset; resize re-fits the layout and reseeds — but only sim_tick
- * advances the simulation per frame.
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -274,45 +33,45 @@
 #define HUD_TOP         1            /* row 0: data HUD                      */
 #define HUD_BOT         1            /* bottom row: action HUD               */
 
-/* Histogram full-scale: a bar reaches full height when its population hits
- * 1/DIV of the grid.  Sharks use a smaller divisor (fill at ~1/10) because
- * they are far rarer than fish, so their bar stays visible. */
+/* A history bar reaches full height when that population hits 1/DIV of the
+ * grid. Sharks use a smaller divisor (they fill at a lower count) because
+ * there are far fewer of them, so their bar still reads clearly. */
 #define HIST_FISH_FULL_DIV    2
 #define HIST_SHARK_FULL_DIV   10
 
 /*
- * Preset — one named ecological regime.  Wa-Tor's behaviour is governed
- * entirely by three rate parameters and two initial densities, and that
- * parameter space splits into qualitatively distinct regions (Dewdney 1984;
- * the underlying Lotka-Volterra balance, see CONCEPTS): a narrow band of stable
- * oscillation, flanked by shark boom-and-collapse (sharks breed faster than
- * they starve → eat everything → crash) and shark starvation (they starve
- * faster than they breed → die out, fish saturate).  Each preset is one
- * labelled point in that space; n/p cycle through them (reseeding the ocean).
+ * Preset — one named "what kind of ocean" setting. The whole feel of Wa-Tor
+ * comes from just three breeding/starving rates plus how crowded the ocean
+ * starts. Different settings give very different stories: a calm one where
+ * both keep cycling forever, a shark boom that eats everything then crashes,
+ * or a fragile one where sharks starve out and fish take over. Each preset is
+ * one such story; n/p cycle through them (and reseed the ocean).
  *
- * VALUE LOGIC (each "every N ticks" counter compares against an entity's age):
- *   fish_breed   : lower → fish reproduce faster → more prey → more sharks.
- *   shark_breed  : lower → sharks reproduce faster → heavier predation.
- *   shark_starve : higher → sharks survive longer between meals → overrun.
+ *   fish_breed   : a fish breeds every N ticks. Smaller = fish multiply faster
+ *                  = more food = more sharks.
+ *   shark_breed  : a shark breeds every N ticks. Smaller = more sharks, more
+ *                  hunting pressure on the fish.
+ *   shark_starve : a shark dies if it goes this many ticks without eating.
+ *                  Larger = sharks survive longer between meals = can overrun.
  *   fish_pct,
- *   shark_pct    : starting densities — the basin the dynamics settle from.
+ *   shark_pct    : how crowded the ocean is at the start (% of cells filled).
  */
 typedef struct {
     const char *name;
-    int fish_breed;     /* fish reproduces every N ticks               */
-    int shark_breed;    /* shark reproduces every N ticks              */
+    int fish_breed;     /* fish breeds every N ticks                   */
+    int shark_breed;    /* shark breeds every N ticks                  */
     int shark_starve;   /* shark dies after N ticks without food       */
-    int fish_pct;       /* initial fish density  (% of cells)          */
-    int shark_pct;      /* initial shark density (% of cells)          */
+    int fish_pct;       /* starting fish density  (% of cells)         */
+    int shark_pct;      /* starting shark density (% of cells)         */
 } Preset;
 
 #define N_PRESETS 4
 static const Preset PRESETS[N_PRESETS] = {
-    /* name          Fbr  Sbr  Sstv   F%  S%    behaviour                    */
-    { "STABLE",        3,  10,    4,  30,  5 },/* steady Lotka-Volterra waves */
-    { "BLOOM",         2,  15,    3,  25,  3 },/* fish-dominant, sharks scarce*/
+    /* name          Fbr  Sbr  Sstv   F%  S%    what you'll see              */
+    { "STABLE",        3,  10,    4,  30,  5 },/* calm, steady up-and-down    */
+    { "BLOOM",         2,  15,    3,  25,  3 },/* fish everywhere, few sharks */
     { "BOOM-BUST",     4,   6,    8,  35,  8 },/* sharks overrun, then crash  */
-    { "FRAGILE",       5,  12,    2,  20,  6 },/* sharks starve, extinction   */
+    { "FRAGILE",       5,  12,    2,  20,  6 },/* sharks starve, ocean empties*/
 };
 
 #define STEPS_DEF       1
@@ -322,19 +81,20 @@ static const Preset PRESETS[N_PRESETS] = {
 #define FISH   1
 #define SHARK  2
 
-/* direction vectors: N E S W */
+/* the four steps to a neighbour: north, east, south, west */
 static const int DR[4] = {-1,  0, 1, 0};
 static const int DC[4] = { 0,  1, 0,-1};
 
+/* colour-pair slots, used below in color_init */
 enum {
-    CP_FISH_Y = 1,   /* young fish (bright cyan)   */
-    CP_FISH_O,       /* old fish   (dim teal)       */
-    CP_SHARK_F,      /* fed shark  (bright red)     */
-    CP_SHARK_H,      /* hungry shark (orange)       */
-    CP_HIST_F,       /* histogram — fish            */
-    CP_HIST_S,       /* histogram — shark           */
-    CP_HUD,          /* top data row (bright yellow)*/
-    CP_HINT          /* bottom action row (cyan)    */
+    CP_FISH_Y = 1,   /* young fish    */
+    CP_FISH_O,       /* old fish      */
+    CP_SHARK_F,      /* fed shark     */
+    CP_SHARK_H,      /* hungry shark  */
+    CP_HIST_F,       /* fish history bar  */
+    CP_HIST_S,       /* shark history bar */
+    CP_HUD,          /* top data row     */
+    CP_HINT          /* bottom key hints */
 };
 
 /* ── §2 performance — monotonic clock + sleep (the frame-cap helpers) ─────── */
@@ -355,71 +115,73 @@ static void clock_sleep_ns(long long ns)
 /* ── §3 simulation-data — grid state, live params, reset/seed setup ───────── */
 
 /*
- * Ocean — Dewdney's toroidal planet Wa-Tor (Dewdney 1984): a wrap-around grid
- * where every cell is empty, a fish, or a shark.  "Toroidal" means the edges
- * connect (top↔bottom, left↔right), so there is no boundary to distort the
- * dynamics — every cell has the same four von-Neumann neighbours.
+ * Ocean — the wrap-around grid the creatures live on. Every cell is empty, a
+ * fish, or a shark. "Wrap-around" means the edges connect: walk off the top
+ * and you come out the bottom, off the right and you come out the left. So
+ * there's no wall anywhere, and every cell has the same four neighbours.
  *
- * WHY struct-of-arrays: the four per-cell attributes are kept as separate
- * parallel grids rather than an array of Cell structs because the hot paths
- * sweep one attribute at a time — sim_step memset's `moved` wholesale and
- * scans `type` to list live cells — so contiguous same-field arrays stay
- * cache-warm.  All four share the same [r][c]; together they ARE one cell.
+ * The cell's data is split into separate same-sized grids (one for type, one
+ * for breed, etc.) instead of one grid of little cell-structs. It's just
+ * faster: the busy code touches one of these at a time — it wipes the whole
+ * `moved` grid in one go and scans `type` to find the living cells — so
+ * keeping each kind of value packed together is friendlier to the CPU cache.
+ * The four grids share the same [r][c]; together they ARE one cell.
  *
- * VALUE LOGIC:
- *   rows, cols : live grid size in cells.  cols == terminal width; rows ==
- *                terminal height minus the HUD + histogram rows, so the grid
- *                fills exactly the band between the two HUD bars.
- *   type       : EMPTY / FISH / SHARK — the cell's occupant.
- *   breed      : dual-use age counter — a fish's age, a shark's breed timer.
- *                At >= the regime's *_breed the entity spawns offspring and
- *                resets.  uint8_t, saturated at 255 by the ++ guards, so an
- *                entity trapped forever stops counting instead of wrapping to 0
- *                (which would make it spuriously "young" again).
- *   hunger     : shark only — ticks since its last meal; at >= shark_starve the
- *                shark dies.  Also uint8_t-saturated.
- *   moved      : per-tick guard.  Cells update asynchronously in random order,
- *                so when an entity moves into a not-yet-processed cell it must
- *                not act twice this tick — `moved` marks the destination, and
- *                the later draw of that cell's ticket falls through.
- *   order      : the work-list — indices of all live cells, Fisher-Yates
- *                shuffled (Knuth TAOCP §3.4.2) so update order is unbiased
- *                (random asynchronous update; a fixed raster scan would bias
- *                motion in the scan direction).  Each entry packs (r,c) as
- *                r*MAX_COLS + c — the fixed array stride MAX_COLS, not the live
- *                `cols`, so packing/unpacking is stable across resizes.
+ *   rows, cols : grid size in cells. cols == terminal width; rows == terminal
+ *                height minus the HUD + history rows, so the grid fills the
+ *                band between the top and bottom bars.
+ *   type       : EMPTY / FISH / SHARK — who's in the cell.
+ *   breed      : a count-up timer that means two things. For a fish it's its
+ *                age; for a shark it's "ticks since I last bred". When it
+ *                reaches the preset's breed number, the creature leaves a baby
+ *                and resets to 0. It's a uint8_t and stops at 255 rather than
+ *                wrapping to 0 (wrapping would make a long-trapped creature
+ *                look newborn again).
+ *   hunger     : sharks only — ticks since the shark last ate. At shark_starve
+ *                it dies. Also stops at 255.
+ *   moved      : "already acted this tick" flag. Creatures take their turns in
+ *                random order, so when one moves into a cell that hasn't had
+ *                its turn yet, we mark the cell `moved` — when that cell's turn
+ *                comes up we skip it, so nothing acts twice in one tick.
+ *   order      : the to-do list — the positions of all living cells, shuffled
+ *                so they take turns in a random order (a fixed left-to-right
+ *                scan would nudge everything to drift the same way). Each entry
+ *                packs (r,c) as r*MAX_COLS + c, using the fixed array width
+ *                MAX_COLS (not the live `cols`) so the packing still unpacks
+ *                correctly after a resize.
  *   fish_pop,
- *   shark_pop  : census recomputed each tick — the two counts whose ratio
- *                oscillates (Lotka-Volterra) and that feed the HUD + history.
- *   tick       : ticks elapsed since the last reset (the world's age).
+ *   shark_pop  : how many of each are alive right now, recounted every tick;
+ *                these feed the HUD and the history graph.
+ *   tick       : how many ticks since the last reset (the world's age).
  */
 typedef struct {
-    int       rows, cols;                  /* grid dimensions (cells)        */
+    int       rows, cols;                  /* grid size in cells             */
     uint8_t   type  [MAX_ROWS][MAX_COLS];  /* EMPTY / FISH / SHARK           */
-    uint8_t   breed [MAX_ROWS][MAX_COLS];  /* fish: age; shark: breed_age    */
+    uint8_t   breed [MAX_ROWS][MAX_COLS];  /* fish: age; shark: breed timer  */
     uint8_t   hunger[MAX_ROWS][MAX_COLS];  /* shark: ticks since last meal   */
-    uint8_t   moved [MAX_ROWS][MAX_COLS];  /* set after entity moves/dies    */
-    int       order [MAX_ROWS * MAX_COLS]; /* shuffled processing indices    */
-    long      fish_pop, shark_pop;         /* current census                 */
+    uint8_t   moved [MAX_ROWS][MAX_COLS];  /* "already acted this tick"      */
+    int       order [MAX_ROWS * MAX_COLS]; /* shuffled to-do list of cells   */
+    long      fish_pop, shark_pop;         /* current counts                 */
     long long tick;                        /* ticks since last reset         */
 } Ocean;
 
 /*
- * PopulationHistory — a ring buffer of the last HIST_LEN censuses, one fish and
- * one shark count per past tick.  WHY it exists: the whole point of Wa-Tor is
- * that the two populations trace coupled Lotka-Volterra oscillations (the fish
- * peak leads the shark peak); a single live count can't show that, so we retain
- * the recent time series and draw it as a dual sparkline (Tufte) — the bar
- * chart under the ocean.  It is real recorded data, not a cosmetic trail.
+ * PopulationHistory — a rolling record of the last HIST_LEN ticks: how many
+ * fish and how many sharks there were each tick. The fun of Wa-Tor is watching
+ * the two counts rise and fall in waves (fish peak first, then sharks a few
+ * ticks later) — a single live number can't show that, so we keep the recent
+ * counts and draw them as the little graph under the ocean. This is real
+ * recorded data, not just a decorative trail.
  *
- * VALUE LOGIC:
- *   fish[], shark[] : parallel ring buffers; fish[i]/shark[i] is the census in
- *                     slot i.  HIST_LEN (512) exceeds any real terminal width,
- *                     so the visible chart never runs out of history — old
- *                     entries are simply overwritten.
- *   head            : next write slot, advanced (head+1) % HIST_LEN each tick.
- *                     The renderer walks backwards from head so the newest tick
- *                     maps to the rightmost column.
+ * It's a "ring": writes loop back to the start and overwrite the oldest entry,
+ * so we never run off the end.
+ *
+ *   fish[], shark[] : the two count tracks; fish[i]/shark[i] is one tick's
+ *                     pair. HIST_LEN (512) is wider than any real terminal, so
+ *                     the on-screen graph always has enough history to fill it.
+ *   head            : where the next write goes; advances (head+1) % HIST_LEN
+ *                     each tick. The drawing code walks back from here so the
+ *                     newest tick lands in the rightmost column.
  */
 typedef struct {
     long fish [HIST_LEN];
@@ -428,19 +190,23 @@ typedef struct {
 } PopulationHistory;
 
 /*
- * Scene — the running showcase, read top-to-bottom as a table of contents.
- * It aggregates the data so the layers stay decoupled: simulation functions
- * take Ocean* / const Preset*, renderers take const sub-types, and only the
- * tick/reset orchestrators take Scene* — so nothing re-couples through this
- * one struct.
- *   WHAT  — ocean: the simulated world; history: its census over time.
- *   HOW   — steps: sim_steps run per frame (the +/- speed knob, 1..STEPS_MAX);
- *           paused: freezes the tick; preset: index into PRESETS.  Storing the
- *           INDEX, not a copy of the rate params, keeps ONE source of truth —
- *           the active regime is always PRESETS[preset], read where needed.
- *   WHERE — term_rows/term_cols: terminal size.  Kept distinct from
- *           ocean.rows/cols (which exclude the HUD + histogram rows): used to
- *           place the bottom HUD (term_rows-1) and clip HUD text to width.
+ * Scene — everything the program is currently holding, in one place. Bundling
+ * it here keeps the parts loosely tied: the simulation functions take an
+ * Ocean*, the drawing functions take const pieces, and only the few "do a
+ * whole turn / reset" functions take the whole Scene*.
+ *
+ *   ocean      : the world being simulated.
+ *   history    : its fish/shark counts over time (for the graph).
+ *   steps      : how many simulation steps to run per drawn frame (the +/-
+ *                speed knob, 1..STEPS_MAX).
+ *   paused     : when set, the simulation holds still.
+ *   preset     : which entry of PRESETS is active. We store just the index, not
+ *                a copy of the numbers, so there's one source of truth — the
+ *                live settings are always PRESETS[preset].
+ *   term_rows,
+ *   term_cols  : the terminal's size. Different from ocean.rows/cols (those
+ *                leave room for the HUD + graph); used to place the bottom HUD
+ *                and to trim HUD text to the screen width.
  */
 typedef struct {
     Ocean             ocean;
@@ -451,9 +217,9 @@ typedef struct {
     int  term_rows, term_cols;
 } Scene;
 
-static Scene g_scene;   /* the single Scene instance (~340 KB, lives in BSS) */
+static Scene g_scene;   /* the one and only world (~340 KB, lives in BSS) */
 
-/* Seed the ocean grid for a fresh run, using the active regime's densities. */
+/* Fill the grid with a fresh random ocean at the current preset's densities. */
 static void ocean_seed(Ocean *oc, const Preset *p)
 {
     memset(oc->type,   0, sizeof oc->type);
@@ -483,7 +249,7 @@ static void history_clear(PopulationHistory *h)
     h->head = 0;
 }
 
-/* Reset everything for a fresh run under the current preset (a USER EVENT). */
+/* Wipe the ocean and the graph and start over with the current preset. */
 static void scene_reset(Scene *s)
 {
     ocean_seed(&s->ocean, &PRESETS[s->preset]);
@@ -492,7 +258,8 @@ static void scene_reset(Scene *s)
 
 /* ── §4 simulation-step — the tick: shuffle, fish/shark step, census ──────── */
 
-/* Fisher-Yates shuffle */
+/* Shuffle an array into a random order, each ordering equally likely
+ * (Fisher-Yates; Knuth TAOCP vol. 2, §3.4.2). */
 static void ishuffle(int *arr, int n)
 {
     for (int i = n - 1; i > 0; i--) {
@@ -501,16 +268,16 @@ static void ishuffle(int *arr, int n)
     }
 }
 
-/* Toroidal wrap: step `coord` by `delta` on an axis of `extent` cells, wrapping
- * around the edge (the +extent keeps the result non-negative before the mod). */
+/* Step a coordinate by `delta`, wrapping around the edge (off one side comes
+ * back the other). The +extent just keeps it positive before the remainder. */
 static int wrap(int coord, int delta, int extent)
 {
     return (coord + delta + extent) % extent;
 }
 
-/* Scan the four neighbours of (r,c) in the given (shuffled) direction order;
- * write the first one holding `want` to the nr,nc out-params and return 1, else 0.
- * Pure read — the shuffled order makes the choice unbiased among matches. */
+/* Look at the four neighbours of (r,c) in the given order and report the first
+ * one that holds `want` (its position goes in nr,nc). Returns 1 if found, 0 if
+ * not. Reads only; the shuffled order makes the pick unbiased among matches. */
 static int find_neighbour(const Ocean *oc, int r, int c, const int dirs[4],
                           uint8_t want, int *nr, int *nc)
 {
@@ -522,7 +289,7 @@ static int find_neighbour(const Ocean *oc, int r, int c, const int dirs[4],
     return 0;
 }
 
-/* Put an entity (with its counters) into a cell. */
+/* Put a creature, with its counters, into a cell. */
 static void cell_set(Ocean *oc, int r, int c, uint8_t type, uint8_t breed, uint8_t hunger)
 {
     oc->type  [r][c] = type;
@@ -530,7 +297,7 @@ static void cell_set(Ocean *oc, int r, int c, uint8_t type, uint8_t breed, uint8
     oc->hunger[r][c] = hunger;
 }
 
-/* Empty a cell (entity moved away or died). */
+/* Empty a cell (its creature moved away or died). */
 static void cell_clear(Ocean *oc, int r, int c)
 {
     oc->type  [r][c] = EMPTY;
@@ -540,30 +307,30 @@ static void cell_clear(Ocean *oc, int r, int c)
 
 static void fish_step(Ocean *oc, const Preset *p, int r, int c)
 {
-    if (oc->breed[r][c] < 255) oc->breed[r][c]++;          /* age one tick */
+    if (oc->breed[r][c] < 255) oc->breed[r][c]++;          /* grow one tick older */
 
     int dirs[4] = {0, 1, 2, 3};
     ishuffle(dirs, 4);
     int nr, nc;
     if (!find_neighbour(oc, r, c, dirs, EMPTY, &nr, &nc))
-        return;                                            /* boxed in — stay put */
+        return;                                            /* no open water — stay put */
 
     int     breed_now   = (oc->breed[r][c] >= p->fish_breed);
     uint8_t carry_breed = breed_now ? 0 : oc->breed[r][c];
 
-    cell_set(oc, nr, nc, FISH, carry_breed, 0);            /* swim to the open cell */
+    cell_set(oc, nr, nc, FISH, carry_breed, 0);            /* swim into the open cell */
     oc->moved[nr][nc] = 1;
 
-    if (breed_now) cell_set(oc, r, c, FISH, 0, 0);         /* leave a fledgling behind */
-    else           cell_clear(oc, r, c);                   /* else vacate the old cell */
+    if (breed_now) cell_set(oc, r, c, FISH, 0, 0);         /* old enough: leave a baby */
+    else           cell_clear(oc, r, c);                   /* else the old cell empties */
 }
 
 static void shark_step(Ocean *oc, const Preset *p, int r, int c)
 {
-    if (oc->breed [r][c] < 255) oc->breed [r][c]++;        /* age breed timer */
-    if (oc->hunger[r][c] < 255) oc->hunger[r][c]++;        /* hunger since last meal */
+    if (oc->breed [r][c] < 255) oc->breed [r][c]++;        /* tick toward breeding */
+    if (oc->hunger[r][c] < 255) oc->hunger[r][c]++;        /* tick toward starving */
 
-    if (oc->hunger[r][c] >= p->shark_starve) {             /* starved → die */
+    if (oc->hunger[r][c] >= p->shark_starve) {             /* hasn't eaten in too long */
         cell_clear(oc, r, c);
         return;
     }
@@ -571,22 +338,22 @@ static void shark_step(Ocean *oc, const Preset *p, int r, int c)
     int dirs[4] = {0, 1, 2, 3};
     ishuffle(dirs, 4);
     int nr, nc, ate = 0;
-    if      (find_neighbour(oc, r, c, dirs, FISH,  &nr, &nc)) ate = 1;  /* hunt: eat */
-    else if (!find_neighbour(oc, r, c, dirs, EMPTY, &nr, &nc)) return;  /* trapped — stay */
+    if      (find_neighbour(oc, r, c, dirs, FISH,  &nr, &nc)) ate = 1;  /* fish nearby: eat it */
+    else if (!find_neighbour(oc, r, c, dirs, EMPTY, &nr, &nc)) return;  /* no fish, no gap: stay */
 
-    uint8_t new_hunger  = ate ? 0 : oc->hunger[r][c];      /* a meal resets hunger */
+    uint8_t new_hunger  = ate ? 0 : oc->hunger[r][c];      /* eating resets hunger to 0 */
     int     breed_now   = (oc->breed[r][c] >= p->shark_breed);
     uint8_t carry_breed = breed_now ? 0 : oc->breed[r][c];
 
     cell_set(oc, nr, nc, SHARK, carry_breed, new_hunger);  /* move to the chosen cell */
     oc->moved[nr][nc] = 1;
 
-    /* offspring inherits the parent's post-meal hunger (the Wa-Tor convention) */
+    /* the baby starts with the parent's hunger AFTER the meal (the Wa-Tor rule) */
     if (breed_now) cell_set(oc, r, c, SHARK, 0, new_hunger);
     else           cell_clear(oc, r, c);
 }
 
-/* List every live cell into oc->order (packed r*MAX_COLS + c); return count. */
+/* Fill oc->order with the positions of all living cells; return how many. */
 static int collect_live_cells(Ocean *oc)
 {
     int n = 0;
@@ -597,7 +364,7 @@ static int collect_live_cells(Ocean *oc)
     return n;
 }
 
-/* Recount the living populations into the Ocean's census fields. */
+/* Recount how many fish and sharks are alive right now. */
 static void census(Ocean *oc)
 {
     oc->fish_pop = 0; oc->shark_pop = 0;
@@ -608,7 +375,7 @@ static void census(Ocean *oc)
         }
 }
 
-/* Append one tick's populations to the ring buffer. */
+/* Record this tick's two counts into the rolling history. */
 static void history_push(PopulationHistory *h, long fish, long shark)
 {
     h->fish [h->head] = fish;
@@ -621,12 +388,12 @@ static void sim_step(Ocean *oc, PopulationHistory *h, const Preset *p)
     memset(oc->moved, 0, sizeof oc->moved);
 
     int n = collect_live_cells(oc);
-    ishuffle(oc->order, n);            /* random asynchronous update order */
+    ishuffle(oc->order, n);            /* everyone takes their turn in random order */
 
     for (int i = 0; i < n; i++) {
-        int r = oc->order[i] / MAX_COLS;   /* unpack the packed cell index */
+        int r = oc->order[i] / MAX_COLS;   /* unpack (r,c) from the stored number */
         int c = oc->order[i] % MAX_COLS;
-        if (oc->moved[r][c]) continue;     /* already acted this tick */
+        if (oc->moved[r][c]) continue;     /* this cell already had its turn */
         if      (oc->type[r][c] == FISH)  fish_step(oc, p, r, c);
         else if (oc->type[r][c] == SHARK) shark_step(oc, p, r, c);
     }
@@ -651,14 +418,14 @@ static void color_init(void)
     start_color();
     use_default_colors();
     if (COLORS >= 256) {
-        init_pair(CP_FISH_Y,  51,  -1);  /* bright cyan — young fish         */
-        init_pair(CP_FISH_O,  37,  -1);  /* dim teal    — old fish           */
-        init_pair(CP_SHARK_F, 196, -1);  /* bright red  — fed shark          */
-        init_pair(CP_SHARK_H, 202, -1);  /* orange      — hungry shark       */
-        init_pair(CP_HIST_F,  45,  -1);  /* cyan histogram bar               */
-        init_pair(CP_HIST_S,  160, -1);  /* dark red histogram bar           */
-        init_pair(CP_HUD,     226, -1);  /* bright yellow — top data row     */
-        init_pair(CP_HINT,    51,  -1);  /* bright cyan   — bottom action row*/
+        init_pair(CP_FISH_Y,  51,  -1);  /* bright cyan — young fish     */
+        init_pair(CP_FISH_O,  37,  -1);  /* teal        — old fish       */
+        init_pair(CP_SHARK_F, 196, -1);  /* bright red  — fed shark      */
+        init_pair(CP_SHARK_H, 202, -1);  /* orange      — hungry shark   */
+        init_pair(CP_HIST_F,  45,  -1);  /* cyan        — fish bar       */
+        init_pair(CP_HIST_S,  160, -1);  /* dark red    — shark bar      */
+        init_pair(CP_HUD,     226, -1);  /* bright yellow — top row      */
+        init_pair(CP_HINT,    51,  -1);  /* bright cyan   — key hints    */
     } else {
         init_pair(CP_FISH_Y,  COLOR_CYAN,   -1);
         init_pair(CP_FISH_O,  COLOR_CYAN,   -1);
@@ -679,14 +446,14 @@ static void scene_ocean(const Ocean *oc, const Preset *p)
             uint8_t t = oc->type[r][c];
             if (t == EMPTY) { mvaddch(sr, c, ' '); continue; }
             if (t == FISH) {
-                int old    = (oc->breed[r][c] >= p->fish_breed - 1);   /* one tick from breeding */
+                int old    = (oc->breed[r][c] >= p->fish_breed - 1);   /* about to breed: dim it */
                 attr_t at  = COLOR_PAIR(old ? CP_FISH_O : CP_FISH_Y);
                 if (!old) at |= A_BOLD;
                 attron(at);
                 mvaddch(sr, c, 'o');
                 attroff(at);
             } else {
-                int hungry = (oc->hunger[r][c] >= p->shark_starve - 1);/* one tick from starving */
+                int hungry = (oc->hunger[r][c] >= p->shark_starve - 1);/* about to starve: colour it */
                 attr_t at  = COLOR_PAIR(hungry ? CP_SHARK_H : CP_SHARK_F) | A_BOLD;
                 attron(at);
                 mvaddch(sr, c, 'X');
@@ -696,14 +463,14 @@ static void scene_ocean(const Ocean *oc, const Preset *p)
     }
 }
 
-/* Map chart column c to its history slot: the newest tick (head-1) sits at the
- * rightmost column, older ticks to the left.  (+2·HIST_LEN keeps it positive.) */
+/* Which history entry belongs in chart column c: newest tick on the right,
+ * older ticks to the left. (The +2*HIST_LEN just keeps the number positive.) */
 static int history_slot(const PopulationHistory *h, int cols, int c)
 {
     return (h->head - (cols - 1 - c) + HIST_LEN * 2) % HIST_LEN;
 }
 
-/* Bar height in rows for a population, clamped to the band height. */
+/* How many rows tall this population's bar should be, never taller than the band. */
 static int bar_height(long pop, long scale, int rows)
 {
     int h = (int)((float)pop / (float)scale * rows);
@@ -715,18 +482,19 @@ static void scene_histogram(const PopulationHistory *h, const Ocean *oc)
     long max_pop = (long)oc->rows * (oc->cols - 1);
     if (max_pop == 0) return;
 
-    /* full-scale populations (see HIST_*_FULL_DIV): fish bar fills at ~1/2 the
-     * grid, shark bar at ~1/10 — sharks are rarer, so their bar reads brighter */
+    /* the count at which each bar hits full height (see HIST_*_FULL_DIV):
+     * fish at about half the grid, sharks at a tenth — sharks are rarer, so a
+     * lower count already fills their bar and it stays easy to see */
     long fish_scale  = max_pop / HIST_FISH_FULL_DIV;  if (fish_scale  < 1) fish_scale  = 1;
     long shark_scale = max_pop / HIST_SHARK_FULL_DIV; if (shark_scale < 1) shark_scale = 1;
 
-    int fish_rows  = HIST_ROWS / 2;  /* upper 2 rows for fish   */
-    int shark_rows = HIST_ROWS / 2;  /* lower 2 rows for sharks */
+    int fish_rows  = HIST_ROWS / 2;  /* top 2 rows: fish    */
+    int shark_rows = HIST_ROWS / 2;  /* bottom 2 rows: sharks */
 
     for (int c = 0; c < oc->cols - 1; c++) {
         int idx = history_slot(h, oc->cols, c);
 
-        /* fish bars — upper rows, grow downward from the top */
+        /* fish bar — in the top rows, hanging down from the top edge */
         int fl = bar_height(h->fish[idx], fish_scale, fish_rows);
         attron(COLOR_PAIR(CP_HIST_F));
         for (int hr = 0; hr < fish_rows; hr++) {
@@ -735,12 +503,11 @@ static void scene_histogram(const PopulationHistory *h, const Ocean *oc)
         }
         attroff(COLOR_PAIR(CP_HIST_F));
 
-        /* shark bars — lower rows, grow upward from the bottom */
+        /* shark bar — in the bottom rows, rising up from the bottom edge */
         int sl = bar_height(h->shark[idx], shark_scale, shark_rows);
         attron(COLOR_PAIR(CP_HIST_S));
         for (int hr = 0; hr < shark_rows; hr++) {
             int sr = HUD_TOP + oc->rows + fish_rows + hr;
-            /* hr=0 is top of shark area; fill from bottom (hr=shark_rows-1) up */
             mvaddch(sr, c, (sl >= shark_rows - hr) ? '#' : '.');
         }
         attroff(COLOR_PAIR(CP_HIST_S));
@@ -751,7 +518,7 @@ static void scene_hud(const Scene *s)
 {
     char buf[MAX_COLS + 1];
 
-    /* top row: data — preset, tick, populations, speed, run state */
+    /* top row: preset, tick count, populations, speed, paused/running */
     snprintf(buf, sizeof buf,
              " Wa-Tor  preset:%s %d/%d  tick:%lld  fish:%ld  sharks:%ld  spd:%d/f  %s",
              PRESETS[s->preset].name, s->preset + 1, N_PRESETS,
@@ -762,7 +529,7 @@ static void scene_hud(const Scene *s)
     mvprintw(0, 0, "%s", buf);
     attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 
-    /* bottom row: actions — every interactive key */
+    /* bottom row: the keys you can press */
     snprintf(buf, sizeof buf,
              " q:quit  spc:pause  r:reseed  +/-:speed  n/p:preset ");
     if ((int)strlen(buf) > s->term_cols) buf[s->term_cols] = '\0';
@@ -771,7 +538,7 @@ static void scene_hud(const Scene *s)
     attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 }
 
-/* terminal lifecycle — screen_resize re-fits the layout and reseeds (USER EVENT) */
+/* terminal setup and teardown; screen_resize re-fits to the new size and reseeds */
 
 static void screen_init(void)
 {
@@ -822,7 +589,7 @@ int main(void)
     screen_init();
     g_scene.steps  = STEPS_DEF;
     g_scene.paused = 0;
-    g_scene.preset = 0;              /* default regime before first seed */
+    g_scene.preset = 0;              /* start on the first preset */
     srand((unsigned)(clock_ns() & 0xFFFFFFFFu));
     screen_resize(&g_scene);
 
@@ -847,11 +614,11 @@ int main(void)
             case '-': case '_':
                 if (g_scene.steps > 1) g_scene.steps--;
                 break;
-            case 'n': case 'N':     /* next regime preset (reseeds) */
+            case 'n': case 'N':     /* next preset (starts a fresh ocean) */
                 g_scene.preset = (g_scene.preset + 1) % N_PRESETS;
                 scene_reset(&g_scene); erase();
                 break;
-            case 'p': case 'P':     /* previous regime preset (reseeds) */
+            case 'p': case 'P':     /* previous preset (starts a fresh ocean) */
                 g_scene.preset = (g_scene.preset + N_PRESETS - 1) % N_PRESETS;
                 scene_reset(&g_scene); erase();
                 break;

@@ -1,374 +1,26 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * hydraulic.c
- *   — Hydraulic erosion on a procedural heightmap. Generate fractal
- *     terrain with Perlin fBm; let thousands of water droplets flow
- *     down it, eroding the ground where they accelerate and
- *     depositing sediment where they slow. Watch the smooth Perlin
- *     hills sprout valleys, deltas, and river networks in real time.
+ * hydraulic.c — carve a landscape by letting water do the work.
  *
- * DEMO: A fresh, smooth heightmap appears — rolling Perlin hills with
- *       no rivers and no detail. Within a second, water droplets
- *       start flowing across it. As they fall through the height
- *       field they pick up sediment from steep slopes and drop it
- *       on flat ground; as more droplets follow the same path the
- *       slope deepens and a CHANNEL forms. After ~10 seconds the
- *       initial blobby hills have been carved into a recognisable
- *       fluvial landscape: dendritic river networks running down
- *       to broad, silt-filled deltas. Cycle fifteen views with n / p;
- *       the four analytic ones:
+ * Start from smooth fractal hills, drop thousands of tiny water droplets
+ * on them, and let each one run downhill: it digs dirt out of steep slopes
+ * and drops it back on flat ground. Rivers, valleys and deltas appear on
+ * their own — nobody draws them. Fifteen views (n/p) show the same terrain
+ * different ways: plain biome map, glowing water trails, where it was cut
+ * vs filled, slope arrows, hillshade, contours, and so on.
  *
- *         TERRAIN    biome map of the current heightmap (deep ocean
- *                    → sea → coast → plains → hills → mountains →
- *                    highlands → peaks)
- *         DROPLETS   recent water-flow visualisation: cells that a
- *                    droplet visited recently glow bright cyan,
- *                    fading over ~1 second.  Reveals the
- *                    self-organising drainage network in real time.
- *         EROSION    cut/fill diff vs the original heightmap — red
- *                    '-' where the ground was lowered, blue '+'
- *                    where sediment was deposited.
- *         SLOPE      gradient-magnitude heatmap with arrow glyphs
- *                    pointing downhill (the direction water flows).
- *
- *       The other eleven (RELIEF, CONTOUR, HYPSO, ASPECT, RIDGES,
- *       CANYONS, BATHY, PLASMA, NIGHT, FLOW, HEAT) layer hillshading,
- *       contours, structure detection and animation on the SAME three
- *       arrays — see the Pattern enum in §1 for a one-line each.
- *
- *       After ~8 000 droplets the simulation holds for a few
- *       seconds, then regenerates on a fresh map and the cycle
- *       repeats.
- *
- * Study alongside:
- *   ../worldgen/tectonic.c
- *      — same biome ramp and HUD scaffolding, but generates terrain
- *        from plate-tectonic CONSTRAINTS rather than from
- *        post-process erosion of noise. Tectonic builds geology
- *        upward; this file carves it downward.
- *   ../fields/perin_noise_flow_showcase.c
- *      — particles being steered by a noise field. Same particle-
- *        in-a-field idea; here the field is the heightmap gradient
- *        rather than a Perlin angle.
- *
- * Section map (re-cut by CONCERN — see ARCHITECTURE block below):
- *   §1 CONFIG       — constants, data tables, core state types
- *   §2 PERFORMANCE  — timing primitives (throttle policy lives in main)
- *   §3 LOGIC        — pure decisions: no mutation, no I/O
- *   §4 SIMULATION   — advances state (the only writers of sim state)
- *   §5 EFFECTS      — cosmetic-only state (one-line note: it's woven in)
- *   §6 DELAYS       — pauses, holds, timers (one-line note: woven in)
- *   §7 RENDER       — state → screen; reads only, never mutates
- *   §8 APP          — user events + per-tick combine + main loop
- *
- * Keys:
- *   q / ESC    quit
- *   space      pause / resume
- *   r          regenerate fresh terrain + restart erosion
- *   n / N      next pattern  (cycles all 15: TERRAIN, DROPLETS,
- *              EROSION, SLOPE, RELIEF, CONTOUR, HYPSO, ASPECT,
- *              RIDGES, CANYONS, BATHY, PLASMA, NIGHT, FLOW, HEAT)
- *   p / P      previous pattern
- *   t / T      next / previous theme
- *   + / =      more droplets per tick (faster erosion)
- *   -          fewer droplets
- *   ] / [      raise / lower tick Hz
+ * The droplet model is from Beyer's thesis (TU München, 2015) and Sebastian
+ * Lague's "Coding Adventure: Hydraulic Erosion" (2019). Base terrain is
+ * Perlin fBm noise. The cartographic views (hillshade, hypsometric tint,
+ * contours) follow Imhof, "Cartographic Relief Presentation" (1982).
+ * Sister file: ../worldgen/tectonic.c builds the same kind of terrain from
+ * plate tectonics instead of by eroding noise.
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra \
  *     procedural/worldgen/hydraulic.c \
  *     -o hydraulic -lncurses -lm
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Particle-based hydraulic erosion (Beyer 2015 / the
- *                  Sebastian Lague tutorial implementation). Each
- *                  droplet is a tiny Lagrangian particle that walks
- *                  the heightmap one cell at a time, carrying a
- *                  scalar SEDIMENT load. At every step:
- *
- *                  (1) GRADIENT — bilinear-sample the four corners of
- *                      the current cell to compute (∂h/∂x, ∂h/∂y).
- *                      The droplet's velocity vector is:
- *                          v ← inertia·v_old − (1−inertia)·∇h
- *                      then normalised to unit length. This makes
- *                      droplets prefer to keep going in the direction
- *                      they were already going (so they cut straight
- *                      channels, not chaotic zig-zags) while still
- *                      following the terrain's local slope.
- *
- *                  (2) STEP — advance one cell in the velocity
- *                      direction; bilinear-sample the new height;
- *                      compute Δh = h_new − h_old.
- *
- *                  (3) CARRYING CAPACITY — a droplet moving fast
- *                      down a steep slope can carry more sediment
- *                      than one trickling across a plain:
- *                          C = max(−Δh · speed · water · K,  C_min)
- *
- *                  (4) ERODE / DEPOSIT — compare carried sediment to
- *                      capacity:
- *                        if (sed > C  ||  Δh > 0):
- *                          DEPOSIT — drop (sed − C)·rate at the
- *                          current cell (split bilinearly across
- *                          the four-corner footprint). Going UPHILL
- *                          (Δh > 0) always deposits, capped by Δh.
- *                        else:
- *                          ERODE — pull up (C − sed)·rate, capped
- *                          by |Δh|, distributed across a small disc
- *                          (BRUSH) of cells around the droplet so
- *                          the carving is smooth, not pixel-wide.
- *
- *                  (5) ENERGETICS — a droplet going downhill
- *                      gains kinetic energy:
- *                          v² ← max(0, v² − Δh·g)
- *                      and water evaporates a little each step:
- *                          water ← water · (1 − e_rate)
- *
- *                  (6) TERMINATE after MAX_STEPS or when the droplet
- *                      walks off the map. Spawn a new one. Repeat
- *                      thousands of times.
- *
- *                  The erosion BRUSH (a disc of weighted cells, not a
- *                  single point) is what makes this method look so
- *                  good — a single-cell erosion produces 1-pixel
- *                  zig-zag canyons; a disc-weighted erosion produces
- *                  smoothly-rounded valleys.
- *
- * Data-structure : Three flat float arrays per cell —
- *                    height[]     current eroded heightmap
- *                    initial[]    pre-erosion copy (for cut/fill diff)
- *                    water_trail[] decaying counter; raised to 1.0
- *                                  every time a droplet visits a cell;
- *                                  multiplied by WATER_TRAIL_DECAY
- *                                  each tick. Drives the DROPLETS
- *                                  pattern's flow visualisation.
- *                  Plus a single transient Droplet struct per
- *                  simulated droplet — created on the stack, run to
- *                  completion, discarded. No per-droplet allocation.
- *
- * Rendering      : ASCII only.  Each pattern dispatches per cell:
- *                    TERRAIN   biome glyph by elevation bucket.
- *                    DROPLETS  terrain dimmed + bright '~' wherever
- *                              water_trail > threshold; trails fade
- *                              over ~1 s exposing the drainage net.
- *                    EROSION   '-' (red) where height < initial,
- *                              '+' (blue) where height > initial,
- *                              dim biome where unchanged.
- *                    SLOPE     gradient magnitude → ramp index;
- *                              direction of -∇h → arrow glyph.
- *
- * Performance    : Per droplet: MAX_STEPS = 32 iterations, each doing
- *                  ~30 ops (gradient + brush + bookkeeping). 32 ×
- *                  30 = ~1 K ops. At default speed ~12 droplets/tick
- *                  × 60 ticks = 720/sec ≈ 720 K ops/sec — under 1 %
- *                  of a current CPU. Per-frame render is O(W·H).
- *
- * References     :
- *
- *   Erosion algorithm —
- *   • Beyer, H. (2015) — "Implementation of a method for hydraulic
- *     erosion", Bachelor thesis (TU München). The exact droplet model
- *     this file implements (capacity, erode/deposit, brush).
- *     https://www.firespark.de/resources/downloads/implementation%20of%20a%20methode%20for%20hydraulic%20erosion.pdf
- *   • Lague, S. (2019) — "Coding Adventure: Hydraulic Erosion".
- *     The 20-minute video walkthrough of the same model.
- *     https://www.youtube.com/watch?v=eaXk97ujbPQ
- *   • Mei, X., Decaudin, P., Hu, B-G. (2007) — "Fast Hydraulic
- *     Erosion Simulation and Visualization on GPU", Pacific Graphics.
- *     The grid-based "virtual pipes" alternative.
- *   • Perlin, K. (2002) — "Improving Noise" (the fBm scaffold in §5).
- *     https://mrl.cs.nyu.edu/~perlin/paper445.pdf
- *
- *   Rendering & cartographic visualization (§7 presets) —
- *   • Imhof, E. (1982) — "Cartographic Relief Presentation" (ESRI Press
- *     reprint 2007). The canonical book on hillshading, hypsometric
- *     tints and contour lines → RELIEF, HYPSO, CONTOUR, FLOW.
- *   • Horn, B.K.P. (1981) — "Hill Shading and the Reflectance Map",
- *     Proc. IEEE 69(1):14-47. The Lambert-from-gradient hillshade in
- *     cell_shade() → RELIEF, CANYONS, BATHY, NIGHT.
- *     https://doi.org/10.1109/PROC.1981.11918
- *   • Wilson, J.P. & Gallant, J.C. (2000) — "Terrain Analysis:
- *     Principles and Applications" (Wiley). Slope, aspect and
- *     curvature from a DEM → SLOPE, ASPECT, RIDGES.
- *   • Bourke, P. (1997) — "Character representation of grey scale
- *     images". The luminance→ASCII density ramp behind ELEV_RAMP.
- *     http://paulbourke.net/dataformats/asciiart/
- *   • Vandevenne, L. — "Lode's Computer Graphics Tutorial: Plasma".
- *     Sum-of-sines colour/height fields → PLASMA, BATHY caustics.
- *     https://lodev.org/cgtutor/plasma.html
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * To carve a realistic landscape, do not draw the rivers — let them
- * draw themselves. Drop a tiny pebble of water onto a smooth height
- * field; gravity pulls it downhill; whenever the slope steepens it
- * digs out a bit of dirt; whenever the slope flattens it drops the
- * dirt back. Repeat with thousands of pebbles. The first ones cut
- * shallow scratches; later ones, biased to follow the existing
- * scratches because those are the steepest paths, deepen them into
- * channels. The channels merge into rivers, the rivers carve valleys,
- * the valleys break into deltas at the lowlands. Nobody designed
- * any of it — every feature is a consequence of "water flows down
- * and carries dirt".
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Picture a sheet of putty. Sprinkle marbles on top. Each marble:
- *   - Rolls in the direction of steepest descent (gravity).
- *   - Has a little scoop attached underneath.
- *   - When rolling fast (steep slope), the scoop digs a little
- *     groove into the putty.
- *   - When rolling slow (flat), the scoop is full and dribbles its
- *     load back out, raising the putty.
- *   - When it leaves the table, it disappears and a new marble is
- *     placed somewhere random.
- *
- * That is the algorithm. The putty is the heightmap, the marbles are
- * the droplets, the scoop is the carrying capacity formula, and the
- * grooves are the rivers. The marbles do not know about each other,
- * but they collectively build the drainage network because each
- * marble is steered by the grooves left by previous marbles.
- *
- * ALGORITHM IN STEPS
- * ──────────────────
- *  1. INITIALISE the heightmap with Perlin fBm (4 octaves of noise
- *     summed at halved amplitude / doubled frequency). Save a copy
- *     into initial[] for the cut/fill diff later.
- *
- *  2. SPAWN a droplet at a random cell with:
- *       v = (0, 0)           — direction
- *       speed = 1
- *       water = 1
- *       sediment = 0
- *
- *  3. STEP the droplet up to MAX_STEPS times:
- *     a. xi, yi = floor(droplet.x, droplet.y)
- *     b. h00, h10, h01, h11 = height of 4 surrounding cells
- *     c. ∇h = ((h10 − h00)(1 − fy) + (h11 − h01)·fy,
- *              (h01 − h00)(1 − fx) + (h11 − h10)·fx)
- *     d. v ← inertia·v − (1 − inertia)·∇h    [steering]
- *     e. v ← v / |v|                          [unit length]
- *     f. new_pos ← pos + v.  Sample h_new bilinearly.
- *     g. Δh = h_new − h_old.
- *     h. C = max(−Δh·speed·water·K, C_min).
- *     i. if (sediment > C || Δh > 0):
- *          DEPOSIT  — split (sediment−C)·rate over the four corners
- *                     of the current cell.
- *        else:
- *          ERODE    — pull up min((C−sediment)·rate, |Δh|) using a
- *                     disc-weighted brush of radius BRUSH_R.
- *     j. v² ← max(0, v² − Δh·g);  water ← water·(1 − e_rate).
- *     k. pos ← new_pos.
- *
- *  4. After a budget DROPLETS_PER_GEN of droplets, hold for
- *     HOLD_SECONDS and then go back to step 1 with a new seed.
- *
- * KEY FORMULAS
- * ────────────
- *  Bilinear height at fractional (x, y):
- *    fx, fy = x − ⌊x⌋, y − ⌊y⌋
- *    h = (h00·(1−fx) + h10·fx)·(1−fy) + (h01·(1−fx) + h11·fx)·fy
- *
- *  Bilinear gradient at the same point:
- *    ∂h/∂x = (h10 − h00)·(1 − fy) + (h11 − h01)·fy
- *    ∂h/∂y = (h01 − h00)·(1 − fx) + (h11 − h10)·fx
- *
- *  Carrying capacity (sediment a droplet CAN hold):
- *    C = max(−Δh · speed · water · CAPACITY_K,  C_min)
- *
- *  Erosion brush (disc-weighted; ω(d) = 1 − d/R for d ≤ R):
- *    total_w = Σ_disc ω(d_i)
- *    height_i ← height_i − amount · ω(d_i) / total_w     for i in disc
- *
- *  Energetics:
- *    speed² ← max(0, speed² − Δh · gravity)
- *    water  ← water · (1 − evaporate_rate)
- *
- *  Biome buckets (same as ../worldgen/tectonic.c):
- *    e<0.15 DEEP_OCEAN  | <0.30 OCEAN   | <0.40 COAST
- *    | <0.50 PLAINS     | <0.62 HILLS   | <0.75 MOUNTAINS
- *    | <0.85 HIGHLANDS  | else PEAKS
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • SINGLE-CELL EROSION = ZIG-ZAGS. If you erode JUST the cell the
- *    droplet is in, every droplet cuts a 1-pixel channel and the
- *    terrain develops a stripey checkerboard look. Always erode
- *    over a SMALL DISC (BRUSH_R = 2 cells) — the resulting valleys
- *    are smoothly rounded.
- *
- *  • UNNORMALISED VELOCITY. After v ← inertia·v − (1−inertia)·∇h
- *    the magnitude drifts; un-normalised, droplets in flat regions
- *    crawl to a halt and never leave. Always normalise to unit
- *    length so the droplet keeps moving until it walks off the map.
- *
- *  • UPHILL SAFETY. If a droplet steers uphill (Δh > 0) it must
- *    always deposit, capped at Δh, even if the capacity test would
- *    say "erode" — otherwise droplets dig holes UPHILL of where
- *    they came from, which is unphysical and visually awful.
- *
- *  • LIMIT EROSION TO Δh. Without this guard, a steep cell + a
- *    near-empty droplet can pull up more height than the slope
- *    actually offers, producing pits that water can never escape.
- *    Cap erode_amount at |Δh|.
- *
- *  • EVAPORATION VS CAPACITY. As water evaporates the carrying
- *    capacity drops; eventually the droplet must deposit anything
- *    it's carrying. This is what produces deltas at the foot of
- *    rivers — the slow, low-water section drops every grain it had.
- *    Don't make EVAPORATE_RATE too small or droplets carry sediment
- *    to the edge of the map; don't make it too large or rivers
- *    deposit before they reach the lowlands.
- *
- *  • BOUNDARY HANDLING. Bilinear sampling reads four corners
- *    (xi, yi)..(xi+1, yi+1). On the right and bottom edges the
- *    +1 index is out of bounds; terminate the droplet rather than
- *    reading garbage. The simulation still produces erosion all the
- *    way to the edge because earlier steps reach there.
- *
- *  • TRAIL DECAY. WATER_TRAIL_DECAY is per-TICK, not per-second; if
- *    you raise the sim_fps, decay-per-second changes proportionally.
- *    For a fixed visual decay length, multiply by exp(-K·dt) instead
- *    of a constant. Here we accept the tick-coupling for simplicity.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • Pause (space). Heightmap and trails freeze. Resume: simulation
- *    continues from exactly where it stopped. Verifies the fixed-
- *    step accumulator.
- *
- *  • Switch to EROSION on a FRESH world. The map is uniform "no
- *    change" (no red, no blue) — initial == current. Watch for a
- *    few seconds; red lines appear (erosion in valleys) and blue
- *    blobs appear at the lowlands (deposition in deltas). The two
- *    should roughly balance — total cut ≈ total fill.
- *
- *  • Switch to DROPLETS during active erosion. You should see a
- *    glowing dendritic NETWORK of channels — recently-walked cells
- *    light up and fade. The network should match the valleys
- *    visible in TERRAIN — the channels follow the same valleys
- *    that have eroded.
- *
- *  • Switch to SLOPE. Steep cells (along ridges and valley walls)
- *    are bright; flat cells (plains and lake bottoms) are dim.
- *    Arrow glyphs at every cell point downhill — water flows from
- *    high to low.
- *
- *  • Press 'r'. The terrain regenerates: the HUD's "droplets" counter
- *    resets to 0, the world is fresh, and erosion starts over.
- *
- *  • Run with 'speed' = 64 (much faster); the simulation reaches
- *    8 000 droplets in a couple of seconds and holds. Drop speed to
- *    1 — droplets crawl and you can WATCH each erosion step
- *    individually as a single bright water trail.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -386,83 +38,35 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ── ARCHITECTURE ─────────────────────────────────────────────────────── *
- *
- * This file was re-cut from first principles into separated concern-layers
- * (a SEPARATION pass: RELOCATE + LABEL only — every function body is
- * byte-identical to before, nothing renamed). Layer → section → what it
- * mutates:
- *
- *   LAYER        §   MUTATES
- *   ─────────────────────────────────────────────────────────────────────
- *   CONFIG       §1  nothing — compile-time constants + const data tables
- *                    + the Heightmap struct (core state type, relocated up
- *                    so the pure §3 helpers can see it).
- *   PERFORMANCE  §2  nothing — clock_ns / clock_sleep_ns are pure timers.
- *                    The frame cap + fixed-timestep accumulator are POLICY
- *                    and live in main() (§8), not here.
- *   LOGIC        §3  nothing — pure reads. Given their args (+ the read-only
- *                    perm[] / PATTERN_NAMES tables) they return a value with
- *                    no mutation and no I/O, so no RENDER/EFFECTS reordering
- *                    can corrupt them: the noise stack, the grid samplers
- *                    (hidx, h_bilinear, h_at, bed_sample, cell_gradient,
- *                    cell_shade, cell_laplacian) and the classifiers/mappers
- *                    (height_to_biome, shade_to_level, sediment_capacity,
- *                    erosion_complete, brush_weight, flow_arrow, contour_glyph,
- *                    downhill_sector, pattern_name).
- *   SIMULATION   §4  Heightmap.{height,initial,water_trail,seed,droplets_done}
- *                    and perm[]; Scene.{time_secs,hold_countdown}. The ONLY
- *                    writers of simulation state.
- *   EFFECTS      §5  (none of its own) — water_trail[] is written/decayed in
- *                    §4; every other glow is derived at render time. One-line
- *                    section; not a real layer here.
- *   DELAYS       §6  (none of its own) — hold_countdown / paused are handled
- *                    inside scene_tick (§4). One-line section.
- *   RENDER       §7  ncurses back buffer + colour-pair table only. Reads
- *                    Scene/Heightmap; never writes simulation state.
- *   APP          §8  App.{running,need_resize,sim_fps}; drives Scene via the
- *                    combine + user events.
- *
- * PER-TICK COMBINE (the one place state advances — main(), §8):
- *
- *     sim_accum += dt                     // PERFORMANCE: bank elapsed time
- *     run_pending_ticks(...)              //   scene_tick() ×N (SIM+EFFECTS+DELAYS)
- *     screen_draw() ; screen_present()    // RENDER (reads only)
- *     getch() → app_handle_key()          // USER EVENTS — see below
- *
- * Nothing other than scene_tick() advances simulation state. User events
- * (app_handle_key / app_do_resize) may mutate Scene/Screen in response to a
- * keypress or SIGWINCH, but they are NOT part of the tick — they run once
- * per frame, outside the accumulator loop.
- *
- * ─────────────────────────────────────────────────────────────────────── */
+/* The file is split into concern-layers, one per §-section. The rule that
+ * keeps it sane: only §4 (SIMULATION) ever writes the terrain. Everything in
+ * §3 just reads and returns a value; §7 only draws; user keypresses (§8) run
+ * once a frame, outside the simulation step. */
 
-/* ===================================================================== */
-/* §1  CONFIG  -- constants, data tables, core state types               */
-/* ===================================================================== */
+/* ===================================================================== *
+ * §1  CONFIG  -- constants, data tables, core state types               *
+ * ===================================================================== */
 
 enum {
     MAP_W_MAX           = 240,
     MAP_H_MAX           =  80,
     CELLS_MAX           = MAP_W_MAX * MAP_H_MAX,
 
-    /* Smallest usable map — floor so a tiny terminal still gets a field. */
+    /* Smallest map we'll draw, so a tiny terminal still shows something. */
     MAP_W_MIN           =  16,
     MAP_H_MIN           =   8,
-    HUD_TOP_ROWS        =   2,    /* rows 0–1 reserved for the HUD     */
+    HUD_TOP_ROWS        =   2,    /* rows 0–1 belong to the HUD        */
 
-    /* Droplet physics. */
-    DROPLET_MAX_STEPS   =  32,
-    EROSION_BRUSH_R     =   2,
+    DROPLET_MAX_STEPS   =  32,    /* how far one droplet walks before it dies */
+    EROSION_BRUSH_R     =   2,    /* a droplet's bite spreads over a 2-cell disc */
 
-    /* How many droplets to spawn per simulation tick at SPEED_DEF.
-     * Scales linearly with the speed knob. */
+    /* Droplets to release each step at the default speed; scales with speed. */
     DROPLETS_PER_TICK_DEF =  12,
 
-    /* Total budget per generation cycle. After this many droplets
-     * the simulation enters HOLD; once HOLD elapses, regenerate. */
+    /* Once this many droplets have run on one terrain, pause and then start
+     * a fresh terrain. */
     DROPLETS_PER_GEN    = 8000,
-    HOLD_TICKS          = 6 * 60,    /* ~6 s @ 60 fps                  */
+    HOLD_TICKS          = 6 * 60,    /* the pause length, ~6 s at 60 fps  */
 
     SIM_FPS_MIN         =  10,
     SIM_FPS_DEFAULT     =  60,
@@ -476,40 +80,39 @@ enum {
     HUD_COLS            =  80,
     FPS_UPDATE_MS       = 500,
 
-    /* Color pair indices.  PAIR_HUD/PAIR_HINT reserved per CLAUDE.md. */
+    /* Colour-pair slot numbers. */
     PAIR_HUD            =   1,
     PAIR_HINT           =   2,
-    PAIR_RAMP_BASE      =   3,    /* +0..+7 = 8 elevation tints       */
-    PAIR_HOT            =  11,    /* eroded / convergent accent       */
-    PAIR_COLD           =  12,    /* deposited / divergent accent     */
-    PAIR_WATER          =  13,    /* live water trail                 */
+    PAIR_RAMP_BASE      =   3,    /* +0..+7 = the 8 elevation colours  */
+    PAIR_HOT            =  11,    /* warm accent: cuts / peaks         */
+    PAIR_COLD           =  12,    /* cool accent: fills / water        */
+    PAIR_WATER          =  13,    /* the live water trail              */
 };
 
 #define NS_PER_SEC      1000000000LL
 #define NS_PER_MS          1000000LL
 #define TICK_NS(f)      (NS_PER_SEC / (f))
 
-/* Render frame-rate cap (Hz) — the present rate; the SIMULATION rate is
- * separate (SIM_FPS_*). */
+/* How often we redraw the screen. The simulation runs at its own rate
+ * (SIM_FPS_*), separate from drawing. */
 #define FRAME_CAP_FPS   60
-/* Clamp one frame's dt so a long stall (process suspended, terminal blocked)
- * can't make the accumulator simulate a huge burst at once — the classic
- * "spiral of death" guard. */
+/* If a frame ever takes longer than this (process paused, terminal blocked),
+ * pretend only this much time passed — otherwise we'd try to catch up by
+ * running a huge burst of steps at once and stall the program. */
 #define MAX_FRAME_NS    (100 * NS_PER_MS)
 
-/* Cell aspect — y in noise / gradient sampling is multiplied by this
- * so terrain features look right on terminals where cells are 2x
- * taller than wide. */
+/* Terminal cells are about twice as tall as they are wide. We stretch the
+ * vertical direction by this when sampling so hills look round, not squashed. */
 #define ASPECT_Y_F           2.0f
 
-/* fBm — initial heightmap. Lower scale = larger features. */
+/* Settings for the starting fractal terrain. Smaller scale = bigger hills. */
 #define FBM_SCALE_X          0.045f
 #define FBM_SCALE_Y          0.090f
 #define FBM_OCTAVES          5
-/* Apply gamma to fBm output so peaks/valleys are sharper. */
+/* Pushes high spots higher and low spots lower so peaks and valleys stand out. */
 #define FBM_GAMMA            1.30f
 
-/* Droplet physics constants — tuned to the Lague defaults. */
+/* Droplet behaviour, using Sebastian Lague's default numbers. */
 #define INERTIA              0.05f
 #define SEDIMENT_CAPACITY_K  4.0f
 #define MIN_CAPACITY         0.01f
@@ -519,45 +122,47 @@ enum {
 #define GRAVITY              4.0f
 #define INITIAL_WATER        1.0f
 #define INITIAL_SPEED        1.0f
-/* Below this steering-vector length the droplet has stalled on a flat and
- * its path ends (avoids a divide-by-~0 when normalising the heading). */
+/* If a droplet's heading gets this short it has stalled on flat ground, so we
+ * stop it (also dodges a divide-by-almost-zero when we rescale the heading). */
 #define DROPLET_STALL_LEN    1e-4f
 
-/* Water trail decay per tick (DROPLETS pattern). 0.92 → ~30 ticks ≈
- * 0.5 s visible after a single visit. */
+/* How the glowing droplet trails fade. 0.92 per step keeps a single visit
+ * visible for about half a second. The two thresholds split the glow into
+ * bright / medium / faint. */
 #define WATER_TRAIL_DECAY     0.92f
 #define WATER_TRAIL_HIGH      0.55f
 #define WATER_TRAIL_MID       0.20f
 
-/* EROSION pattern — minimum |height − initial| to colour a cell. */
+/* EROSION view: how far a cell must differ from its starting height before we
+ * paint it as cut or filled. */
 #define EROSION_THRESH_LOW    0.012f
 #define EROSION_THRESH_HIGH   0.05f
 
-/* SLOPE pattern — slope magnitude to ramp-level mapping factor. */
+/* SLOPE view: multiplies steepness to pick a brightness level. */
 #define SLOPE_SCALE           18.0f
 
-/* RELIEF / CANYONS / BATHY / NIGHT — Lambert hillshade. Fixed top-left
- * light; gradient is exaggerated so even gentle relief reads as 3-D. */
+/* Hillshade (RELIEF / CANYONS / BATHY / NIGHT): a fixed light in the top-left,
+ * with the slope exaggerated so even gentle ground looks three-dimensional. */
 #define RELIEF_LIGHT_X       -0.55f
 #define RELIEF_LIGHT_Y       -0.55f
 #define RELIEF_LIGHT_Z        0.63f
 #define RELIEF_EXAGGERATE     7.0f
 
-/* CONTOUR / FLOW — elevation quantised into this many height bands; a
- * cell sits on a contour where its band differs from a neighbour. */
+/* CONTOUR / FLOW: round elevation into this many bands; a contour line is drawn
+ * wherever a cell's band differs from a neighbour's. */
 #define CONTOUR_LEVELS        16
 
-/* RIDGES — |Laplacian| above this marks a ridge (peak side) or valley. */
+/* RIDGES: curvature past this much marks a ridge crest or a valley floor. */
 #define RIDGE_THRESH          0.006f
 
 /* ── Biome ─────────────────────────────────────────────────────────────── *
- * Eight elevation bands, deep ocean (0) → peaks (7), assigned by
- * height_to_biome() from fixed thresholds on the [0,1] elevation (≈0.30 sea
- * level/coast, ≈0.85 snow line). Intent: a single ordinal that DOUBLES AS AN
- * INDEX — the same biome value offsets into Theme.ramp[], BIOME_GLYPHS[] and
- * the PAIR_RAMP_BASE colour pairs, so buckets, ramp colours and glyph pairs
- * always stay aligned. N_BIOMES (8) is therefore the shared length of all
- * three tables; changing it means re-tuning every one of them. */
+ * Eight elevation bands, from deep ocean (0) up to snowy peaks (7). A cell's
+ * height (0..1) decides its band in height_to_biome(): roughly, below 0.30 is
+ * sea, above 0.85 is snow. The clever bit: this same 0..7 number is also the
+ * row to use in the colour table, the glyph table and the colour-pair list,
+ * so colours, characters and bands can never drift apart. That's why all
+ * three tables are exactly N_BIOMES (8) long — change 8 and you must retune
+ * all of them. */
 typedef enum {
     BIOME_DEEP_OCEAN = 0,
     BIOME_OCEAN      = 1,
@@ -570,10 +175,8 @@ typedef enum {
     N_BIOMES         = 8,
 } Biome;
 
-/*
- * BIOME_GLYPHS[biome][0..1] — two glyphs per biome; per-cell hash
- * picks one for textural variation.
- */
+/* Two characters per band; a per-cell hash picks one of the pair so the
+ * ground looks textured instead of a flat field of one symbol. */
 static const char BIOME_GLYPHS[N_BIOMES][2] = {
     { '~', ',' },     /* DEEP_OCEAN */
     { '~', '_' },     /* OCEAN      */
@@ -585,14 +188,14 @@ static const char BIOME_GLYPHS[N_BIOMES][2] = {
     { '#', '@' },     /* PEAKS      */
 };
 
-/* Density ramp for SLOPE / ELEVATION-style readouts. */
+/* Characters from faint to dense, used wherever a view wants "darker = lower /
+ * flatter, brighter = higher / steeper". */
 static const char ELEV_RAMP[N_BIOMES] = {
     '`', '.', ',', ':', '-', '^', '#', '@'
 };
 
-/* Pattern — fifteen ways to render the same heightmap. The first four
- * are the original analytic views; the rest layer shading, contours,
- * structure detection and animation on the same three float arrays. */
+/* Pattern — the fifteen ways the same terrain can be drawn. The n/p keys
+ * cycle through them; each entry's comment is its one-line job. */
 typedef enum {
     PATTERN_TERRAIN  = 0,   /* biome glyph map                         */
     PATTERN_DROPLETS,       /* live water trails over dim terrain      */
@@ -612,7 +215,7 @@ typedef enum {
     N_PATTERNS,
 } Pattern;
 
-/* 8-char padded names so the HUD field width stays fixed. */
+/* Names padded to 8 characters so the HUD label stays the same width. */
 static const char *PATTERN_NAMES[N_PATTERNS] = {
     "TERRAIN ", "DROPLETS", "EROSION ", "SLOPE   ", "RELIEF  ",
     "CONTOUR ", "HYPSO   ", "ASPECT  ", "RIDGES  ", "CANYONS ",
@@ -620,36 +223,31 @@ static const char *PATTERN_NAMES[N_PATTERNS] = {
 };
 
 /* ── Theme ─────────────────────────────────────────────────────────────── *
- * WHAT  One named colour palette (10 ship; t/T cycles). A theme maps the
- *       abstract elevation/erosion quantities onto concrete 256-colour codes;
- *       theme_apply() loads those into ncurses colour pairs. Same 10-name
- *       menu as the sibling procedural showcases, for muscle memory.
+ * One named colour scheme; the t/T keys cycle the ten of them. A theme just
+ * says which terminal colours stand for low/high ground and for cut/fill, and
+ * theme_apply() loads them into ncurses.
  *
- * VALUE LOGIC  ramp[] is a hypsometric tint — a MONOTONIC gradient from the
- *       deepest/coldest (index 0) to the highest/brightest (7), one entry per
- *       Biome bucket; renderers index it by biome or by a derived 0..7 level.
- *       hot/cold are a DIVERGENT accent pair straddling the no-change point:
- *       hot = eroded cuts & peaks, cold = deposits & water. Every code sits in
- *       the BRIGHT half of the cube (≥24 / ≥244, per CLAUDE.md "Theme Palette
- *       Brightness") so even A_DIM cells stay legible on default-black.
+ * ramp[] is a low-to-high colour run, one colour per elevation band (index 0
+ * = deepest, 7 = highest) — like the colours on a relief map, blue seas up
+ * through green plains to white peaks. hot and cold are the two accent
+ * colours for the "what changed" views: hot marks ground that was cut away
+ * (and peaks), cold marks ground that was filled in (and water). Every colour
+ * is from the bright half of the palette so dimmed cells still show up on a
+ * black terminal (see CLAUDE.md "Theme Palette Brightness").
  *
- * REFS  Hypsometric tinting + divergent relief palettes — Imhof,
- *       "Cartographic Relief Presentation" (1982). Project palette notes —
- *       documentation/COLOR.md. */
+ * Map-colour idea from Imhof, "Cartographic Relief Presentation" (1982);
+ * palette notes in documentation/COLOR.md. */
 typedef struct {
-    const char *name;            /* HUD label (t/T cycles)                   */
-    short       ramp[N_BIOMES];  /* hypsometric tint, low→high (256-colour)  */
-    short       hot;             /* divergent accent: cuts / peaks           */
-    short       cold;            /* divergent accent: deposits / water       */
+    const char *name;            /* shown in the HUD                          */
+    short       ramp[N_BIOMES];  /* low→high terrain colours                  */
+    short       hot;             /* accent for cuts / peaks                   */
+    short       cold;            /* accent for fills / water                  */
 } Theme;
 
 #define N_THEMES 10
 
-/*
- * All ramp entries sit in the bright half of the 256-colour space so
- * even A_DIM cells stay legible against a default-black terminal.
- * See "Theme Palette Brightness" in /CLAUDE.md.
- */
+/* Every colour here is kept in the bright half of the palette so even dimmed
+ * cells stay readable on a black terminal (see /CLAUDE.md). */
 static const Theme themes[N_THEMES] = {
     /* name       0    1    2    3    4    5    6    7   hot cold */
     { "DEFAULT",{ 24,  31,  39,  70,  76, 137, 215, 230 }, 196,  39 },
@@ -665,59 +263,47 @@ static const Theme themes[N_THEMES] = {
 };
 
 /* ── Heightmap ─────────────────────────────────────────────────────────── *
- * WHAT  The terrain under simulation: a w×h grid of scalar elevations, stored
- *       row-major in flat arrays (cell (x,y) at index y*w+x — always via
- *       hidx() so the stride is never hand-rolled). It is the single domain
- *       object — each of the 15 views is just a different READING of these
- *       arrays — and SIMULATION (§4) is its ONLY writer.
+ * The terrain itself: a w-by-h grid of heights, kept in flat arrays (cell
+ * (x,y) lives at y*w+x — always reached through hidx() so the row math is in
+ * one place). This is the one thing the whole program is about; all 15 views
+ * are just different ways of reading it, and only §4 ever writes to it.
  *
- * WHY STRUCT-OF-ARRAYS  One array per quantity (not an array of per-cell
- *       structs): the hot loops (erode_brush, every renderer) sweep ONE
- *       quantity at a time, so contiguous height[] / initial[] keep the cache
- *       warm. Sizes are static (CELLS_MAX) — nothing is malloc'd on the hot
- *       path (project "Memory Allocation" rule).
- *
- * REFS  Droplet erosion model — Beyer, "Implementation of a method for
- *       hydraulic erosion" (TU München, 2015); Lague, "Coding Adventure:
- *       Hydraulic Erosion" (2019). Base terrain — Perlin fBm (Perlin,
- *       "Improving Noise", 2002). Full citations in the file-header block. */
+ * We keep one array per kind of value (rather than a struct per cell) because
+ * the busy loops sweep one value across the whole grid at a time, and packing
+ * that value together makes those sweeps fast. The arrays are fixed-size, so
+ * nothing is allocated while the program runs. */
 typedef struct {
-    /* ── grid extent (cells); clamped to ≤ MAP_W_MAX × MAP_H_MAX at layout ─ */
+    /* Grid size in cells; capped at MAP_W_MAX × MAP_H_MAX. */
     int    w, h;
 
-    /* ── elevation: TWO snapshots, both [0,1] (fBm output, gamma-sharpened) ─
-     * height[] is mutated as droplets cut and fill; initial[] is the frozen
-     * pre-erosion copy taken at generation. Keeping both lets render_erosion /
-     * canyons / deltas show the SIGNED difference (height − initial) as a
-     * cut(−)/fill(+) map — the actual subject of an erosion demo, not just the
-     * terrain. EROSION_THRESH_LOW/HIGH pick where that diff starts colouring. */
-    float  height     [CELLS_MAX];   /* current eroded elevation [0,1]   */
-    float  initial    [CELLS_MAX];   /* pre-erosion copy (for cut/fill)  */
+    /* Two copies of the heights, both 0..1. height[] is the live terrain that
+     * droplets keep changing; initial[] is a frozen snapshot of how it looked
+     * before any erosion. Keeping both lets the "what changed" views show
+     * height minus initial — where ground was cut away vs piled up — which is
+     * really the point of an erosion demo. */
+    float  height     [CELLS_MAX];   /* current terrain                  */
+    float  initial    [CELLS_MAX];   /* original, for the cut/fill view  */
 
-    /* ── cosmetic EFFECTS overlay (§5) — NOT physics ──────────────────────
-     * Stamped to 1.0 by droplet_simulate() at each visited cell, then decayed
-     * ×WATER_TRAIL_DECAY (0.92) per tick → a fading "a droplet just passed
-     * here" glow (~30 ticks ≈ 0.5 s). Read ONLY by render_droplets; deleting
-     * it changes no elevation. WATER_TRAIL_HIGH/MID slice it into brightness
-     * tiers. */
-    float  water_trail[CELLS_MAX];   /* decaying recent-visit indicator  */
+    /* The fading droplet trails — purely for looks, not physics. Set to 1.0
+     * wherever a droplet steps, then multiplied down a little each step so a
+     * single visit glows for about half a second. Only the DROPLETS view
+     * reads it; deleting it would change nothing about the terrain. */
+    float  water_trail[CELLS_MAX];   /* recent-visit glow, fades over time */
 
-    /* ── this generation's erosion run ────────────────────────────────────
-     * seed selects which fBm terrain (feeds perm_shuffle, re-hashed from the
-     * clock at each regen so worlds differ). droplets_done counts particles
-     * simulated and drives the phase machine: < DROPLETS_PER_GEN = ERODING,
-     * == = SETTLED → arm HOLD (see Scene.hold_countdown / §4 scene_tick). */
-    int    seed;                     /* which terrain (fBm permutation)  */
-    int    droplets_done;            /* run progress [0 .. DROPLETS_PER_GEN] */
+    /* Bookkeeping for the current terrain. seed picks which random terrain we
+     * grew (it's re-rolled from the clock each time, so every world differs).
+     * droplets_done counts how many droplets have run; once it reaches
+     * DROPLETS_PER_GEN the run is finished and the pause begins. */
+    int    seed;                     /* which random terrain             */
+    int    droplets_done;            /* droplets run so far this terrain */
 } Heightmap;
 
-/* ===================================================================== */
-/* §2  PERFORMANCE  -- timing primitives (throttle policy in main, §8)   */
-/* ===================================================================== */
+/* ===================================================================== *
+ * §2  PERFORMANCE  -- timing primitives                                 *
+ * ===================================================================== */
 
-/* Timing primitives only. The 60 fps frame cap and the fixed-timestep
- * accumulator that decides how many scene_tick()s run per frame are
- * POLICY -- they live in main() (§8), the single per-tick combine point. */
+/* Just the two clock helpers. How fast we run (the frame cap and the
+ * fixed-step loop) is decided in main(), §8. */
 
 static int64_t clock_ns(void)
 {
@@ -736,15 +322,13 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  LOGIC  -- pure decisions: no mutation, no I/O                     */
-/* ===================================================================== */
+/* ===================================================================== *
+ * §3  LOGIC  -- pure decisions: no mutation, no I/O                     *
+ * ===================================================================== */
 
-/* Every function below is a pure read: it takes its inputs as parameters
- * (or the read-only perm[] / PATTERN_NAMES tables) and returns a value
- * with NO mutation and NO I/O. Deleting or reordering any RENDER / EFFECTS
- * code cannot change what these return -- corruption-proof by construction.
- * Shared by SIMULATION (§4) and RENDER (§7). */
+/* Every function here just takes its inputs and hands back an answer — it
+ * never changes the terrain or touches the screen. That makes it safe to
+ * call from anywhere. Shared by the simulation (§4) and the renderers (§7). */
 
 static const char *pattern_name(Pattern p)
 {
@@ -752,7 +336,8 @@ static const char *pattern_name(Pattern p)
                                                 : "?       ";
 }
 
-/* hash3 — same as other showcases. */
+/* Turns three integers into one well-scrambled number — handy for "pick
+ * something that looks random but stays the same for this cell". */
 static inline uint32_t hash3(int wx, int wy, int wz)
 {
     uint32_t h = (uint32_t)wx * 73856093u
@@ -766,7 +351,8 @@ static inline uint32_t hash3(int wx, int wy, int wz)
     return h;
 }
 
-/* Perlin scaffold — copied inline per the self-contained-file rule. */
+/* Perlin noise, the source of the starting hills. Copied in whole so this
+ * file needs no shared headers. The next few helpers are its plumbing. */
 static uint8_t perm[512];
 
 static inline float fade_q(float t)
@@ -797,6 +383,8 @@ static float perlin2d(float x, float y)
     return lerp_f(lerp_f(n00, n10, u), lerp_f(n01, n11, u), v);
 }
 
+/* Stacks several layers of Perlin noise — each one finer and fainter than the
+ * last — to get natural-looking lumpy terrain. Result is rescaled to 0..1. */
 static float fbm2(float x, float y)
 {
     float total = 0.0f, amp = 1.0f, freq = 1.0f, max_amp = 0.0f;
@@ -806,14 +394,14 @@ static float fbm2(float x, float y)
         amp     *= 0.5f;
         freq    *= 2.0f;
     }
-    return (total / max_amp) * 0.5f + 0.5f;     /* → [0, 1] */
+    return (total / max_amp) * 0.5f + 0.5f;
 }
 
 static inline int hidx(const Heightmap *hm, int x, int y) { return y * hm->w + x; }
 
-/* Bilinear height sample at fractional (x, y). Caller must guarantee
- * 0 ≤ xi+1 < w and 0 ≤ yi+1 < h — we don't bounds-check here because
- * the droplet step does it once per iteration. */
+/* Height at a point between cells, blended smoothly from the four cells
+ * around it. No edge checks here — the caller (the droplet step) already made
+ * sure (x,y) isn't right at the far edge. */
 static inline float h_bilinear(const Heightmap *hm, float x, float y)
 {
     int xi = (int)x, yi = (int)y;
@@ -827,8 +415,9 @@ static inline float h_bilinear(const Heightmap *hm, float x, float y)
          + (h01 * (1.0f - fx) + h11 * fx) * fy;
 }
 
-/* Height at an integer cell with edges clamped — for contour / ridge
- * renderers that sample neighbours right at the map border. */
+/* Height of a whole cell, with out-of-range coordinates pulled back to the
+ * nearest edge — so renderers that peek at neighbours can do so safely even at
+ * the very border of the map. */
 static inline float h_at(const Heightmap *hm, int x, int y)
 {
     if (x < 0) x = 0; else if (x >= hm->w) x = hm->w - 1;
@@ -836,12 +425,7 @@ static inline float h_at(const Heightmap *hm, int x, int y)
     return hm->height[hidx(hm, x, y)];
 }
 
-/* ----------------------------------------------------------------------- *
- * Helpers used by the renderers.                                          *
- * ----------------------------------------------------------------------- */
-
-/* Map elevation [0, 1] (with some headroom either side) into one of
- * eight biome buckets. */
+/* Sorts a height (0..1) into one of the eight elevation bands. */
 static inline int height_to_biome(float e)
 {
     if (e < 0.18f) return BIOME_DEEP_OCEAN;
@@ -854,8 +438,9 @@ static inline int height_to_biome(float e)
     return BIOME_PEAKS;
 }
 
-/* Central-difference gradient at integer cell. y-difference divided
- * by ASPECT_Y_F to reflect physical-distance per cell. */
+/* Which way the ground slopes at a cell, found by comparing the cells on
+ * either side. The up/down result is divided by ASPECT_Y_F because cells are
+ * taller than wide, so a vertical step covers more ground. */
 static inline void cell_gradient(const Heightmap *hm, int x, int y,
                                   float *gx, float *gy)
 {
@@ -867,9 +452,10 @@ static inline void cell_gradient(const Heightmap *hm, int x, int y,
     *gy = (hm->height[hidx(hm, x, yp)] - hm->height[hidx(hm, x, ym)]) * 0.5f / ASPECT_Y_F;
 }
 
-/* Lambert hillshade in [0, 1]: surface normal (−gx, −gy, 1) dotted with
- * a fixed top-left light. Gradient is exaggerated first so subtle relief
- * still casts visible shading. Shared by RELIEF/CANYONS/BATHY/NIGHT. */
+/* How brightly a cell would catch the light (0 = shadow, 1 = full glare),
+ * based on which way the ground faces relative to a fixed top-left light. The
+ * slope is exaggerated first so even gentle ground shows some shading. Used by
+ * all the hillshade views (RELIEF/CANYONS/BATHY/NIGHT). */
 static inline float cell_shade(const Heightmap *hm, int x, int y)
 {
     float gx, gy;
@@ -884,17 +470,17 @@ static inline float cell_shade(const Heightmap *hm, int x, int y)
     return s;
 }
 
-/* Shade level 0..7 from a Lambert value — index into ELEV_RAMP. */
+/* Turns a brightness (0..1) into a 0..7 step for picking a ramp character. */
 static inline int shade_to_level(float sh)
 {
     int l = (int)(sh * 7.0f + 0.5f);
     return l < 0 ? 0 : l > 7 ? 7 : l;
 }
 
-/* Disc-falloff weight of a brush cell at offset (dx,dy): 1 at the centre,
- * linearly to 0 at radius EROSION_BRUSH_R, exactly 0 outside. The erosion
- * brush spreads a droplet's bite over this disc so cuts aren't single-cell
- * spikes (Beyer 2015, "radius" brush). */
+/* How much of a droplet's bite a nearby cell gets: full strength at the
+ * droplet's own cell, tapering to nothing at the edge of the brush disc, zero
+ * beyond it. Spreading the bite this way carves rounded valleys instead of
+ * jagged single-cell scratches. */
 static inline float brush_weight(int dx, int dy)
 {
     float d = sqrtf((float)(dx * dx + dy * dy));
@@ -902,21 +488,20 @@ static inline float brush_weight(int dx, int dy)
                                         : 1.0f - d / (float)EROSION_BRUSH_R;
 }
 
-/* Sediment carrying capacity of a droplet on a step of height change dh<0
- * (descending). Proportional to drop steepness × speed × water (Lague 2019;
- * Beyer 2015, eq. "c = ..."), floored at MIN_CAPACITY so a near-flat step
- * still lets a trickle of erosion happen. */
+/* How much dirt a droplet is allowed to carry right now. The faster it's
+ * moving, the more water it still has, and the steeper its drop, the more it
+ * can hold — but never less than a tiny floor, so even a near-flat step can
+ * still erode a little. */
 static inline float sediment_capacity(float dh, float speed, float water)
 {
     float cap = (-dh) * speed * water * SEDIMENT_CAPACITY_K;
     return (cap < MIN_CAPACITY) ? MIN_CAPACITY : cap;
 }
 
-/* Sample the bed directly under a droplet at fractional (x,y): returns the
- * bilinearly interpolated height and writes the bilinear forward-difference
- * slope into (*gx,*gy). One read shared by steering and the dh calculation,
- * so both see exactly the same four corners. Caller guarantees xi+1,yi+1 are
- * in range (droplet_simulate bounds-checks each step). */
+/* Reads the ground right under a droplet: returns the blended height there and
+ * fills in the local slope through (*gx,*gy). Doing both in one read means the
+ * droplet's steering and its height change agree on exactly the same four
+ * cells. The caller has already checked the point isn't at the far edge. */
 static inline float bed_sample(const Heightmap *hm, float x, float y,
                                float *gx, float *gy)
 {
@@ -933,8 +518,7 @@ static inline float bed_sample(const Heightmap *hm, float x, float y,
          + h01 * (1 - fx) *      fy  + h11 * fx *      fy;
 }
 
-/* True once this generation has spent its whole droplet budget — the
- * ERODING → SETTLED transition of the scene phase machine. */
+/* True once this terrain has used up its whole batch of droplets. */
 static inline bool erosion_complete(const Heightmap *hm)
 {
     return hm->droplets_done >= DROPLETS_PER_GEN;
@@ -977,15 +561,13 @@ static inline float cell_laplacian(const Heightmap *hm, int x, int y)
          + h_at(hm, x, y - 1) + h_at(hm, x, y + 1) - 4.0f * h_at(hm, x, y);
 }
 
-/* ===================================================================== */
-/* §4  SIMULATION  -- advances state (only writers of sim state)         */
-/* ===================================================================== */
+/* ===================================================================== *
+ * §4  SIMULATION  -- advances state (only writers of sim state)         *
+ * ===================================================================== */
 
-/* The ONLY writers of simulation state. Mutates: Heightmap.height[],
- * .initial[], .water_trail[], .seed, .droplets_done (and perm[] via
- * perm_shuffle); Scene.time_secs, .hold_countdown. scene_tick() is the
- * single per-tick entry point, called only from main (§8). User events
- * (key / resize) also mutate Scene but are NOT part of the tick -- see §8. */
+/* The only place the terrain actually changes. scene_tick() is the one
+ * entry point, called once per simulation step from main (§8). Keypresses
+ * also change settings, but they're not part of a tick — see §8. */
 
 static void perm_shuffle(int seed)
 {
@@ -1298,35 +880,31 @@ static void scene_tick(Scene *s, float dt)
     }
 }
 
-/* ===================================================================== */
-/* §5  EFFECTS  -- cosmetic-only state                                   */
-/* ===================================================================== */
+/* ===================================================================== *
+ * §5  EFFECTS  -- cosmetic-only state                                   *
+ * ===================================================================== */
 
-/* No separate layer -- one line, as the SEPARATION audit requires when a
- * concern is trivial. The only cosmetic-only state is Heightmap.water_trail[]
- * (the fading droplet trails behind the DROPLETS view): WRITTEN by
- * droplet_simulate() and faded each tick by decay_water_trails() (both §4),
- * READ only by render_droplets() (§7). Every other glow -- peak twinkle,
- * plasma, caustics, night glints -- is derived at render time from
- * height/time, never stored. */
+/* Nothing of its own to put here. The only purely-cosmetic state is the
+ * fading droplet trails (water_trail[]): they're written and faded back in
+ * §4 and only read by render_droplets(). Every other glow — twinkling peaks,
+ * plasma, caustics — is computed fresh while drawing, never stored. */
 
-/* ===================================================================== */
-/* §6  DELAYS  -- pauses, holds, timers                                  */
-/* ===================================================================== */
+/* ===================================================================== *
+ * §6  DELAYS  -- pauses, holds, timers                                  *
+ * ===================================================================== */
 
-/* No separate layer -- one line. The post-erosion HOLD before regeneration
- * is a single int, Scene.hold_countdown: armed to HOLD_TICKS when the droplet
- * budget is reached and counted down inside scene_tick() (§4); at 0 the scene
- * regenerates. The pause toggle (Scene.paused) early-returns scene_tick().
- * Both are trivial and woven into the simulation tick. */
+/* Nothing of its own here either. The pause between finishing one terrain
+ * and growing the next is a single counter (Scene.hold_countdown), ticked
+ * down inside scene_tick() in §4. Pause works by early-returning from the
+ * same function. */
 
-/* ===================================================================== */
-/* §7  RENDER  -- state -> screen (reads only, never mutates sim)        */
-/* ===================================================================== */
+/* ===================================================================== *
+ * §7  RENDER  -- state -> screen (reads only, never mutates sim)        *
+ * ===================================================================== */
 
-/* state -> screen. Reads Scene / Heightmap, writes ONLY the ncurses back
- * buffer (and the colour-pair table at init). Never touches simulation
- * state, so a frame may be dropped or rebuilt with no effect on the sim. */
+/* Turns the current state into characters on screen. Only writes to the
+ * ncurses buffer (and the colour table at startup); never changes the
+ * terrain, so dropping or redrawing a frame is always safe. */
 
 static void theme_apply(int idx)
 {
@@ -2082,15 +1660,12 @@ static void screen_draw(const Screen *sc, const Scene *s,
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
-/* ===================================================================== */
-/* §8  APP  -- events + per-tick combine + main loop                     */
-/* ===================================================================== */
+/* ===================================================================== *
+ * §8  APP  -- events + per-tick combine + main loop                     *
+ * ===================================================================== */
 
-/* Owns the App aggregate, signal flags, user-event handlers and the main
- * loop. main() is the ONE place that combines the layers per tick, in fixed
- * order:  scene_tick (SIM + EFFECTS + DELAYS) -> screen_draw (RENDER) ->
- * screen_present -> input. app_handle_key() / app_do_resize() mutate state
- * in response to USER EVENTS and are deliberately OUTSIDE the tick. */
+/* The glue: signal flags, key handlers, and the main loop that ties it all
+ * together. Each frame runs the simulation, draws it, then handles input. */
 
 /* ── App ───────────────────────────────────────────────────────────────── *
  * WHAT  Top-level harness binding the simulation (scene) to the terminal

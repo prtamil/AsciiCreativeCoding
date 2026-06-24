@@ -1,299 +1,17 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * diamond_square_heightmap_showcase.c
- *   — Diamond-Square fractal heightmap, animated.
+ * diamond_square_heightmap_showcase.c — fractal terrain that grows on screen.
  *
- * DEMO: Watch a fractal terrain grow from four random corners. The
- *       grid starts blue (uncomputed = water level) with four bright
- *       seeded corners. Each tick, a few more cells are computed via
- *       alternating "diamond" and "square" passes — the standard
- *       midpoint-displacement recurrence. Each cell appears in its
- *       colour band by height: water → beach → grass → hills →
- *       mountain → snow. Heights are normalised at render time so all
- *       six bands are always represented. Once every cell is computed,
- *       the finished terrain holds on screen until you ask for a new one
- *       (r = same preset, n/p = new pattern, t/T = recolour).
+ * Start from four random corner heights, then keep filling in the points
+ * between them: each new point is the average of its neighbours plus a
+ * shrinking dab of randomness. Big landforms get shaped first, finer detail
+ * later, so the result looks like real terrain — water, beach, grass, hills,
+ * mountains, snow — instead of plain static. This is the classic
+ * Diamond-Square algorithm (Fournier, Fussell & Carpenter 1982).
  *
- * Study alongside: ./bsp_dungeon_showcase.c — another "structured
- *       partition" generator. BSP partitions space recursively for
- *       discrete rooms; Diamond-Square recursively interpolates a
- *       continuous height field. Same recursive-halving philosophy,
- *       very different output.
- *
- * Layer map (see ARCHITECTURE below):
- *   §1 CONFIG & DATA   — constants + all data types (no behaviour)
- *   §2 PERFORMANCE     — timing primitives (monotonic clock, sleep)
- *   §3 LOGIC           — pure decisions: const/value in, value out
- *   §4 SIMULATION      — advances HeightField/Subdivision/Scene; the combine point
- *   §5 EFFECTS         — cosmetic-only state (currently none)
- *   §6 RENDER          — state → screen, read-only
- *   §7 APP             — input, signals, fixed-timestep loop
- *
- * Keys:
- *   q / ESC      quit
- *   space        pause / resume
- *   r            reset (immediate restart with new seed)
- *   w/b/g/h/m/s  filter to one biome      a  show all biomes
- *   t / T        next / previous theme  (colour only, recolours live)
- *   n / p        next / previous preset (terrain pattern only, regenerates)
- *   + / =  / -   more / fewer cells per tick
- *   ] / [        raise / lower sim tick Hz
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra diamond_square_heightmap_showcase.c \
- *       -o diamond_square -lncurses -lm
+ * Sister file: ./bsp_dungeon_showcase.c — also builds by recursively
+ * halving space, but carves discrete rooms instead of a smooth height field.
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Diamond-Square (Fournier, Fussell & Carpenter 1982).
- *                  Generates a fractal 2D height field on a
- *                  (2^n + 1) × (2^n + 1) grid by midpoint displacement:
- *                    1. Seed the four corners with random heights.
- *                    2. DIAMOND step. For every square sub-region of the
- *                       current step size, the centre cell becomes the
- *                       AVERAGE of the four corners plus a random offset.
- *                    3. SQUARE step. For every diamond sub-region just
- *                       formed, each of its four edge midpoints becomes
- *                       the average of its (up to four) cardinal
- *                       neighbours plus a random offset.
- *                    4. Halve the step size; halve the random magnitude
- *                       (the "roughness"); repeat from 2.
- *                  Stops when step size = 1 — every cell has a value.
- *                  The result is a self-similar fractal — at any zoom
- *                  level the terrain looks statistically the same.
- *
- *                  The roughness decay (R *= persistence each level,
- *                  typically persistence = 0.5) is what makes the
- *                  output look like terrain rather than noise: large
- *                  features dominate, with progressively smaller
- *                  features layered on top.
- *
- * Data-structure : `HeightField` — a flat float height[] field with a parallel
- *                  computed[] mask (the renderer paints only computed
- *                  cells; the rest are flat water). `Subdivision` — the
- *                  recurrence cursor (current step / roughness / phase)
- *                  plus a queue of pending (x, y, kind) ops; each
- *                  scene_tick drains a few ops and computes them, which
- *                  animates the reveal.
- *
- * Rendering      : Cells map to ASCII terrain glyphs by height (after
- *                  normalisation against the per-frame min/max):
- *                    h < 0.30 water       '~'  (sky blue)
- *                    h < 0.40 beach       '.'  (yellow)
- *                    h < 0.55 grass       ','  (green)
- *                    h < 0.72 hills       ';'  (forest green)
- *                    h < 0.88 mountain    '#'  (grey)
- *                    else     snow        '@'  (white)
- *                  Without normalisation, heights would drift outside
- *                  [0, 1] from accumulated jitter, clamp at the extremes,
- *                  and the middle bands would rarely render.
- *
- * Performance    : O(N²) where N = 2^n + 1. The work per phase grows
- *                  geometrically (1, 4, 4, 16, 16, …, 4ⁿ) but the inner
- *                  per-cell work is constant (3 adds + a divide + a
- *                  random). We throttle via ops_per_tick so the
- *                  spectacle plays out over ~6–10 seconds regardless
- *                  of grid size.
- *
- * References     : ALGORITHM & FRACTAL THEORY
- *                  • Fournier, Fussell & Carpenter (1982) — "Computer
- *                    rendering of stochastic models", CACM 25(6):371-384.
- *                    The original diamond-square paper; start here.
- *                  • Miller, G.S.P. (1986) — "The definition and rendering
- *                    of terrain maps", SIGGRAPH '86, Computer Graphics
- *                    20(4):39-48. Refines the recurrence and names the
- *                    "creasing" artifact that motivates the EDGE CASES.
- *                  • Saupe, D. — "Algorithms for random fractals", ch. 2 of
- *                    Peitgen & Saupe (eds.), "The Science of Fractal
- *                    Images", Springer 1988. The clearest derivation of
- *                    midpoint displacement and the persistence/roughness
- *                    decay used by the presets.
- *                  • Mandelbrot, B. (1982) — "The Fractal Geometry of
- *                    Nature", W.H. Freeman. Foundational: self-similarity
- *                    and fractional Brownian motion, the "why it looks
- *                    like terrain" theory.
- *                  • Ebert, Musgrave, Peachey, Perlin & Worley (2003) —
- *                    "Texturing & Modeling: A Procedural Approach", 3rd ed.,
- *                    Morgan Kaufmann. Musgrave's terrain chapters are the
- *                    standard practitioner reference (multifractals, erosion).
- *
- *                  PRACTICAL WALKTHROUGHS
- *                  • Hunter Loftis — "Realistic terrain in 130 lines":
- *                    https://www.playfuljs.com/realistic-terrain-in-130-lines/
- *                  • Wikipedia — "Diamond-square algorithm" (quick reference,
- *                    good diagrams): https://en.wikipedia.org/wiki/Diamond-square_algorithm
- *
- *                  RENDERING (height -> glyph/colour, terminal)
- *                  • Paul Bourke — "Character representation of grey scale
- *                    images" (1997): http://paulbourke.net/dataformats/asciiart/
- *                    The luminance->ASCII ramp behind §6's band glyphs.
- *                  • Padala, P. — "NCURSES Programming HOWTO" (TLDP), and
- *                    Gookin, D. (2007) "Programmer's Guide to NCurses",
- *                    Wiley. The terminal-rendering API used in §6.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * To make a height field that looks like real terrain, don't sample
- * random heights independently — neighbouring points must be similar.
- * Diamond-Square gets that by INTERPOLATING between known points and
- * adding only a small RANDOM jitter. The jitter shrinks at every
- * recursion depth, so big features (continents, mountain ranges) get
- * shaped first, and tiny details (boulders, ripples) get layered on
- * later. The whole thing is just "average your neighbours, jitter a
- * bit, recurse smaller".
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine a stretched rubber sheet pinned at the four corners. Pinch
- * the centre upward with a small random offset — that's the first
- * DIAMOND step. Now pinch the four edge-midpoints (the points at the
- * middle of each side) — that's the first SQUARE step. The sheet now
- * has 9 fixed points: 4 corners, 4 edge-midpoints, 1 centre. Subdivide
- * each of the 4 quadrants and repeat (with HALF the pinch strength).
- * Eventually every grid point is pinned at a height.
- *
- * Two key observations:
- *   • DIAMOND points see four corners arranged in a SQUARE shape
- *     around them. SQUARE points see (up to) four neighbours arranged
- *     in a DIAMOND shape (cross / +). Hence the names.
- *   • Halving the random magnitude every level is what makes the
- *     output FRACTAL — without that decay you just get noise. The
- *     ratio of decay is called "persistence"; 0.5 is the textbook
- *     value, lower → smoother, higher → noisier.
- *
- * ALGORITHM IN STEPS
- * ──────────────────
- *  1. INIT. Allocate a (2^n+1) × (2^n+1) grid of floats. Mark all
- *     cells uncomputed. Set the 4 CORNERS — (0,0), (N,0), (0,N), (N,N)
- *     where N = 2^n — to random values in [0, 1]; mark them computed.
- *  2. step = N, roughness = R0 (≈ 0.5).
- *  3. DIAMOND PHASE at this step:
- *     for y in [step/2, step/2 + step, step/2 + 2·step, …, N - step/2]:
- *       for x in same range:
- *         h = mean(grid[x±step/2][y±step/2]) + uniform(-R, +R)
- *         set grid[x][y] = h
- *  4. SQUARE PHASE at this step:
- *     for every "edge midpoint" (cells where exactly one of x, y is a
- *     multiple of step and the other is offset by step/2):
- *       h = mean of (up to four) cardinal neighbours at distance step/2
- *           + uniform(-R, +R)
- *       set grid[x][y] = h
- *  5. step ← step / 2; R ← R · 0.5; if step ≥ 1 goto 3.
- *  6. Done. Every cell has a height; clamp to [0, 1] for rendering.
- *
- * KEY FORMULAS
- * ────────────
- *  N (grid side − 1)             : N = 2^n
- *  Number of levels              : log₂(N)
- *  Diamond cell coords           : (i + ½)·step, (j + ½)·step  ∈ {1..⌊N/step⌋}²
- *  Square cell coords            : where (x ÷ half + y ÷ half) is odd,
- *                                  with both x, y multiples of half.
- *                                  Equivalently: every other lattice
- *                                  point on the half-step grid that is
- *                                  NOT a diamond point.
- *  Diamond average               : (NW + NE + SW + SE) / 4
- *  Square average                : (N + E + S + W) / count_in_grid
- *                                  (omit out-of-grid neighbours)
- *  Random offset                 : uniform(-R, +R)
- *  Persistence (roughness decay) : R_{level+1} = R_level · 0.5
- *  Total ops                     : N² − 4 (every cell except corners)
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • OUT-OF-GRID NEIGHBOURS in the SQUARE step. Edge cells along the
- *    map borders only have 3 valid cardinal neighbours (corners only
- *    have 2). The average must use only the in-bounds neighbours,
- *    NOT pretend missing ones are 0 — using 0 makes the entire border
- *    drop into "deep water" regardless of corner seeds. Always count
- *    contributors and divide by the actual count.
- *
- *  • DIAMOND BEFORE SQUARE. The order matters: every level's SQUARE
- *    phase reads the DIAMOND points it just created. Running square
- *    before diamond at the same level produces noise (the square
- *    averages have nothing to average).
- *
- *  • SEAM AT THE WRAP. If you accidentally treat the grid as periodic
- *    you'll see a sharp seam at the boundary because the corners are
- *    independent random samples. The standard algorithm is NON-periodic.
- *    For a wrap-around terrain (e.g. a sphere), seed corners equal
- *    pairwise — but that's a different algorithm.
- *
- *  • CLAMPING THE OUTPUT. Heights drift outside [0, 1] because of the
- *    accumulated random offsets. For rendering we clamp on read, but
- *    the underlying float can go negative or > 1. Don't clamp during
- *    the algorithm — clipping mid-computation flattens features.
- *
- *  • POWER-OF-TWO PLUS ONE. The grid MUST be (2^n + 1) wide. 33, 65,
- *    129, 257 are the practical sizes; non-power-of-2 widths break
- *    the recursion (step halves and never lands on integer cells).
- *
- *  • PHASE TRANSITION. The animation queue must be fully drained
- *    BEFORE moving to the next phase. If you advance to the next
- *    halving while DIAMOND cells from this level haven't been
- *    computed yet, the SQUARE step reads zeros and produces flat
- *    triangles instead of fractal noise.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • At init, exactly 4 cells are computed (the corners). If 0 or 5+,
- *    the seed loop is wrong.
- *  • After every DIAMOND phase, the count of computed cells equals
- *    the previous count + (N/step)². For step=N (level 0) that's +1.
- *  • The final terrain has features at multiple scales — if it looks
- *    like a single big triangle/cone, the random offsets are too
- *    small or the persistence is too aggressive.
- *  • Histogram: a healthy run produces a roughly bell-shaped height
- *    distribution centered near the mean of the corner seeds. A flat
- *    or U-shaped histogram means roughness is wrong.
- *  • Visual: continents, coastlines, mountain interiors should be
- *    obviously distinguishable. If everything is one colour band the
- *    height range is collapsed (corners too similar OR roughness
- *    decay too steep).
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── ARCHITECTURE ─────────────────────────────────────────────────────── *
- *
- * Six concern-layers, each with its own §section. The SIGNATURE CONVENTION
- * makes state-change visible at the call site: a pure read takes a `const`
- * pointer (or a plain value); anything that mutates takes a NON-const
- * pointer.
- *
- *   LAYER        §    LIVES IN                       MUTATES
- *   ─────        ─    ───────                        ───────
- *   SIMULATION   §4   grid_* , subdiv_* , scene_*    HeightField, Subdivision,
- *                                                    Scene.state
- *   LOGIC        §3   grid_idx / grid_in_bounds,     nothing — value/const
- *                     band_* , pick_grid_N           in, value out
- *   EFFECTS      §5   (none at present)              cosmetic-only state —
- *                                                    reserved home
- *   RENDER       §6   grid_draw, screen_*, colour    nothing in program
- *                     setup                          state; terminal only
- *   DELAYS       —    paused gate (§4 scene_tick),   gate advance; no
- *                     SCENE_HOLD, frame sleep (§7)   timers, no auto-reset
- *   PERFORMANCE  §2   clock_*; fixed-timestep loop   accumulator, dt cap,
- *                     + ops_per_tick (§4 / §7)       fps sleep, work/tick
- *
- * DATA AGGREGATION vs NARROW FUNCTIONS. All run state hangs off ONE Scene
- * (§1), arranged to read as: WHAT is simulated (HeightField grid, Subdivision
- * subdiv) · HOW the user drives it (Controls controls) · WHERE we are in
- * the lifecycle (SceneState state). But FUNCTIONS still take the NARROWEST
- * type they need — grid_compute_*(HeightField*), grid_draw(const HeightField*),
- * subdiv_step(Subdivision*, HeightField*) — never the whole Scene. So aggregating
- * data on Scene does NOT re-couple the layers: a RENDER function cannot
- * reach the Subdivision, and LOGIC reads only through `const`.
- *
- * ONE COMBINE POINT. scene_tick() (§4) is the only function that advances
- * the simulation per tick, in explicit order: DELAYS gate → PERFORMANCE
- * throttle → SIMULATION step → state transition. The §7 main loop calls it
- * inside the fixed-timestep accumulator; nothing in RENDER or input
- * advances state.
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -307,24 +25,20 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  CONFIG & DATA — constants and all data types (no behaviour)        */
-/* ===================================================================== */
+/* ── §1  CONFIG & DATA — constants and data types ── */
 
 enum {
-    /* Maximum grid side − 1. We support (2^n + 1) sizes up to 129 — at
-     * 129×129 the heightmap holds 16641 cells, which fits a wide
-     * terminal and stays under 100KB of state. */
-    GRID_N_MAX        = 128,        /* N = 2^n; grid is (N+1) × (N+1) */
-    GRID_N_MIN        =   8,        /* minimum useful — gives a 9×9   */
+    /* Biggest grid we allow: a 129x129 map (N=128). That fits a wide
+     * terminal and keeps the saved state small. The grid is always
+     * (N+1)x(N+1) with N a power of two — the algorithm needs that. */
+    GRID_N_MAX        = 128,
+    GRID_N_MIN        =   8,        /* smallest worth drawing: a 9x9 */
 
-    /* Terminal columns drawn per heightmap cell. Terminal cells are
-     * roughly twice as tall as wide, so rendering each cell 2 columns
-     * wide makes it visually square AND fills the horizontal space —
-     * the terrain reads as a proper map instead of a small skinny
-     * block. The grid stays square in CELL units. 3 fills more of a
-     * wide terminal; the auto-sizer trades resolution if a terminal is
-     * too narrow to fit. */
+    /* How many terminal columns wide we draw each map cell. Terminal
+     * characters are about twice as tall as they are wide, so drawing a
+     * cell a few columns wide keeps the map looking square instead of
+     * tall and skinny. If the terminal is too narrow to fit, the
+     * auto-sizer just uses a smaller grid. */
     CELL_COLS         =   3,
 
     GRID_W_MAX        = GRID_N_MAX + 1,
@@ -336,117 +50,91 @@ enum {
     SIM_FPS_STEP      =  10,
 
     OPS_PER_TICK_MIN  =   1,
-    OPS_PER_TICK_DEF  =   8,        /* cells computed per scene_tick */
+    OPS_PER_TICK_DEF  =   8,        /* how many cells we fill in per tick */
     OPS_PER_TICK_MAX  = 512,
 
     FPS_UPDATE_MS     = 500,
 
-    /* HUD layout — the map is centred in the rows BETWEEN these reserves
-     * (see grid_draw / pick_grid_N). */
-    HUD_TOP_ROWS      =   2,        /* rows 0,1: the two HUD data lines  */
-    HUD_BOTTOM_ROWS   =   1,        /* last row: the action-key hint     */
+    /* Rows kept clear for the heads-up display; the map sits between them. */
+    HUD_TOP_ROWS      =   2,        /* top two rows: the info lines  */
+    HUD_BOTTOM_ROWS   =   1,        /* bottom row: the key hint      */
 
-    /* Color pair indices — PAIR_HUD/PAIR_HINT reserved per CLAUDE.md. */
+    /* Colour-pair slots. HUD/HINT are reserved by the project's HUD rule. */
     PAIR_HUD          =   1,
     PAIR_HINT         =   2,
-    PAIR_WATER        =   3,        /* water — sky blue              */
-    PAIR_BEACH        =   4,        /* beach — sand yellow           */
-    PAIR_GRASS        =   5,        /* grass — green                 */
-    PAIR_HILL         =   6,        /* hills — forest green          */
-    PAIR_MOUNTAIN     =   7,        /* mountain — grey               */
-    PAIR_SNOW         =   8,        /* snow — bright white           */
+    PAIR_WATER        =   3,
+    PAIR_BEACH        =   4,
+    PAIR_GRASS        =   5,
+    PAIR_HILL         =   6,
+    PAIR_MOUNTAIN     =   7,
+    PAIR_SNOW         =   8,
 };
 
-/* Diamond-Square parameters are per-preset now (see presets[] below):
- *   roughness   — initial random offset magnitude
- *   persistence — roughness *= persistence each level (jaggedness)
- *   bias        — biome-mix gamma applied to normalised height
- * Defaults live in the CLASSIC preset (roughness 0.55, persistence 0.5,
- * bias 1.0). */
-
-/* Corner seed heights are drawn from [CORNER_MIN, CORNER_MIN+CORNER_RANGE]
- * = [0.2, 0.8]: a starting spread that is neither trivially flat nor
- * saturated, so midpoint displacement has room to move both ways. */
+/* Each corner starts somewhere in the middle of the height range, not at the
+ * very top or bottom, so later steps have room to push up or down. */
 #define CORNER_MIN       0.2f
 #define CORNER_RANGE     0.6f
 
-/* Terrain band thresholds — applied to NORMALIZED heights ([0, 1] after
- * scaling by min/max of the computed grid) so every band is exercised
- * regardless of where the raw float values landed. */
+/* Where one terrain type ends and the next begins, measured on the 0..1
+ * height scale. We rescale every frame to that range (see normalize01) so
+ * all six terrain types always show up, wherever the raw numbers landed. */
 #define BAND_WATER       0.30f
 #define BAND_BEACH       0.40f
 #define BAND_GRASS       0.55f
 #define BAND_HILL        0.72f
 #define BAND_MOUNTAIN    0.88f
 
-/* A computed-height span narrower than this is treated as flat — we divide
- * by 1 instead of the span, avoiding a divide-by-zero when only the (equal)
- * corners or a perfectly flat patch have been computed. */
+/* If the computed heights are all nearly equal, treat the spread as 1 so we
+ * don't divide by (almost) zero when rescaling — happens early on, when only
+ * the corners are set. */
 #define HSPAN_EPSILON    1e-6f
 
 #define NS_PER_SEC  1000000000LL
 #define NS_PER_MS      1000000LL
 #define TICK_NS(f)  (NS_PER_SEC / (f))
 
-/* Frame pacing (RENDERING) — distinct from the simulation tick rate. The
- * sim advances at controls.sim_fps; the terminal is repainted at RENDER_HZ. */
+/* How fast we repaint the screen. This is separate from how fast the
+ * terrain fills in (that's controls.sim_fps). */
 #define RENDER_HZ        60
 #define RENDER_PERIOD_NS (NS_PER_SEC / RENDER_HZ)
 
-/* Largest frame delta the loop will believe. A debugger pause, terminal
- * suspend, or slow resize can produce a huge dt; without this cap the
- * fixed-timestep accumulator would try to "catch up" with a burst of ticks
- * (the classic spiral of death). 100 ms = at most ~6 ticks at 60 Hz. */
+/* If a single frame somehow takes longer than this (a debugger pause, the
+ * terminal getting suspended, a slow resize), pretend it was only this long.
+ * Otherwise the loop tries to "make up" all the lost time at once and freezes
+ * in a burst of catch-up ticks. 100 ms is at most ~6 ticks at 60 Hz. */
 #define MAX_FRAME_DT_NS  (100 * NS_PER_MS)
 
 /*
- * Phase kinds — the two alternating steps of the diamond-square recurrence
- * (Fournier, Fussell & Carpenter 1982). Stored in Op.kind and
- * Subdivision.phase, they select which neighbour stencil is averaged:
- *   OP_DIAMOND : set a square's CENTRE from its 4 corner points (the
- *                sources form a SQUARE around the target) + jitter
- *   OP_SQUARE  : set an edge MIDPOINT from its up-to-4 cardinal neighbours
- *                (the sources form a DIAMOND / "+" around the target) + jitter
- * The names describe the shape the SOURCE points make, not the target —
- * the classic source of confusion when first reading the algorithm.
+ * The algorithm alternates between two kinds of step, named for the shape
+ * the SOURCE points make around the point being filled in (not the point
+ * itself — that's the usual mix-up):
+ *   OP_DIAMOND : fill a square's centre from its 4 corners (a square around it)
+ *   OP_SQUARE  : fill a side's midpoint from its up-to-4 neighbours (a "+")
+ * Stored in Op.kind and Subdivision.phase to say which step is meant.
  */
 enum { OP_DIAMOND = 0, OP_SQUARE = 1 };
 
 /*
- * Preset — one table row carrying BOTH a colour palette and a set of
- * terrain-generation parameters, but the two are cycled INDEPENDENTLY:
- *   • t / T pick the COLOUR (a row's colors[] becomes the live palette),
- *     recolouring in place with no regeneration.
- *   • n / p pick the terrain PATTERN (a row's roughness/persistence/bias)
- *     and regenerate, leaving the colour untouched.
- * So the colour you see comes from one row and the land shape from
- * another — mix freely (e.g. FIRE colours on ALPINE terrain).
+ * Preset — one row that carries both a colour scheme and a set of terrain
+ * knobs. The two halves are chosen separately: t/T pick the COLOURS (recolour
+ * what's on screen, no regeneration), n/p pick the terrain SHAPE and rebuild.
+ * So you can put any colour scheme on any landscape shape — mix freely.
  *
- * The three terrain params are the knobs of fractional Brownian motion
- * via midpoint displacement (Mandelbrot 1982; Saupe, in Peitgen & Saupe
- * 1988). The value RANGES below are those actually spanned by the 15
- * presets, chosen by eye to bracket "calm" to "extreme".
- *
- *   colors[6]   : [WATER, BEACH, GRASS, HILL, MOUNTAIN, SNOW]. Every
- *                 entry sits in the visible half of the 256-colour space
- *                 (≥24, avoiding the 16-23 cube floor and 232-239 dark
- *                 greys, which render near-black — see CLAUDE.md Theme
- *                 Palette Brightness). PAIR_HUD/HINT stay palette-
- *                 independent so the UI is always legible.
- *   roughness   : INITIAL jitter magnitude R0 at the coarsest level —
- *                 the elevation contrast of the largest landforms.
- *                 Presets span ~0.35 (gentle) … 0.75 (dramatic relief).
- *   persistence : the per-level decay ratio R_{k+1} = R_k · persistence
- *                 (the fBm "Hurst" knob). Higher (→0.62) keeps small-scale
- *                 jitter alive → JAGGED, busy coastlines; lower (→0.42)
- *                 damps it fast → SMOOTH, rounded hills. 0.5 is textbook.
- *   bias        : biome-mix gamma applied at render time to the
- *                 NORMALISED height (v -> v^bias; v∈[0,1] so it stays in
- *                 range). >1 pushes heights DOWN → more low bands,
- *                 water-heavy archipelago (presets to 1.55); <1 pushes UP
- *                 → more high bands, peak-heavy alpine (presets to 0.62);
- *                 1.0 leaves the even spread. Purely cosmetic — it changes
- *                 which BAND a height lands in, not the height itself.
+ *   name        : label shown in the HUD
+ *   colors[6]   : one colour for each terrain type, in order WATER, BEACH,
+ *                 GRASS, HILL, MOUNTAIN, SNOW. All chosen from the bright
+ *                 half of the 256-colour range so nothing renders near-black.
+ *   roughness   : how tall the FIRST, biggest landforms are — how dramatic
+ *                 the overall relief is. Presets run ~0.35 (gentle) to 0.75.
+ *   persistence : how quickly the randomness shrinks at each finer level.
+ *                 Higher keeps small bumps alive -> jagged, busy coastlines;
+ *                 lower smooths them away fast -> rounded hills. 0.5 is the
+ *                 textbook value.
+ *   bias        : a render-only tilt of how much land falls into low vs high
+ *                 terrain types. Above 1 sinks everything -> more water,
+ *                 island-y; below 1 raises everything -> more peaks; 1 leaves
+ *                 it even. It only changes which type a height shows as, not
+ *                 the height itself.
  */
 typedef struct {
     const char *name;
@@ -477,8 +165,8 @@ static const Preset presets[N_PRESETS] = {
     { "INFERNO",  {  52, 124, 166, 202, 208, 231 }, 0.75f, 0.62f, 0.70f },  /* extreme jagged peaks    */
 };
 
-/* Biome filter — the band selected by the w/b/g/h/m/s keys.
- * FILTER_ALL (0) means "show everything". */
+/* Which single terrain type to show, picked by the w/b/g/h/m/s keys.
+ * FILTER_ALL means show everything. */
 enum {
     FILTER_ALL      = 0,
     FILTER_WATER    = 1,
@@ -490,21 +178,15 @@ enum {
 };
 
 /*
- * Tile — the visual appearance of one terrain band: the (colour pair,
- * ncurses attribute, ASCII glyph) a normalised height renders as.
+ * Tile — how one terrain type looks on screen: its colour, any extra
+ * attribute, and the character to draw. Bundling all three lets the
+ * classifier (band_for_height, §3) hand back a complete look in one value.
+ * The characters ~ . , ; # @ run from low ground to high, lightest to
+ * heaviest (Bourke's ASCII-shading idea — see file header).
  *
- * WHY bundle the three: it lets band_for_height (§3) be a PURE function
- * returning ONE value instead of writing three out-parameters — the
- * classification can't be half-applied, and the call site reads as "this
- * height looks like THIS". The glyph ramp (~ . , ; # @) is a coarse
- * luminance ramp ordered low→high terrain, in the spirit of Bourke's
- * ASCII-art intensity mapping (see References).
- *
- *   pair  : ncurses colour-pair id (one of PAIR_WATER..PAIR_SNOW)
- *   attr  : ncurses attribute — A_NORMAL, or A_BOLD to brighten snow so
- *           the peaks read against any palette
- *   glyph : the ASCII character drawn for this band (0x20–0x7E, ASCII-only
- *           per the project's no-UTF-8 rule)
+ *   pair  : which colour to use (one of PAIR_WATER..PAIR_SNOW)
+ *   attr  : A_NORMAL, or A_BOLD to brighten the snow so peaks always show
+ *   glyph : the ASCII character drawn for this terrain type
  */
 typedef struct {
     int  pair;
@@ -513,72 +195,62 @@ typedef struct {
 } Tile;
 
 /*
- * HeightRange — the bottom and width of the currently-computed height
- * window. RENDER normalises raw heights into [0,1] against THIS window (not
- * a fixed range), so the visible terrain always spans all six bands as the
- * field fills in and the extremes drift.
- *   min  : smallest computed height this frame (the window's floor)
- *   span : max-min, floored at HSPAN_EPSILON → 1.0, so we never divide by 0
+ * HeightRange — the lowest height drawn so far and how far it spreads up to
+ * the highest. We rescale every cell against this window (not a fixed range)
+ * so all six terrain types keep showing as the map fills and its highs and
+ * lows drift.
+ *   min  : lowest computed height this frame
+ *   span : highest minus lowest, but never below HSPAN_EPSILON, so we never
+ *          divide by zero when everything is nearly flat
  */
 typedef struct {
     float min, span;
 } HeightRange;
 
 /*
- * Op — one queued cell-computation: the unit of work the animated reveal
- * drains. WHY a queue of ops at all: the diamond-square recurrence would
- * otherwise fill the whole field in one burst; instead each phase enqueues
- * its cells and scene_tick pops a few per frame, so the viewer watches the
- * fractal emerge (Fournier, Fussell & Carpenter 1982).
+ * Op — one cell waiting to be filled in. We don't fill the whole map at once;
+ * we line the cells up and do a few each frame, so you can watch the terrain
+ * appear.
  *
- * WHY each op is SELF-CONTAINED: `step` and `rough` are SNAPSHOTTED from
- * the recurrence cursor when the op is scheduled, not read live when it is
- * computed. That decouples scheduling from computation — the cursor
- * (Subdivision) may advance to the next level while earlier ops are still
- * pending, and their stencil radius and jitter won't change underneath
- * them. (Read the live cursor instead and a partly-drained phase corrupts.)
+ * Each Op carries its own copy of step and rough, taken at the moment it was
+ * lined up — NOT read fresh when it's finally computed. That matters because
+ * the work-in-progress cursor (Subdivision) may have already moved on to a
+ * finer level by then; a stale read would change the neighbour spacing and
+ * randomness under the op's feet and corrupt the map.
  *
- *   x, y  : grid coordinates of the cell to set (each in 0..N)
- *   kind  : OP_DIAMOND (square centre) or OP_SQUARE (edge midpoint) —
- *           selects the neighbour stencil grid_compute_* applies
- *   step  : full step size S at this op's level; the stencil samples at ±S/2
- *   rough : jitter magnitude R at this op's level; the random offset added
- *           is U(-1,1)·R. Snapshotted so per-level decay can't disturb it.
+ *   x, y  : which cell to fill (each 0..N)
+ *   kind  : OP_DIAMOND (a square's centre) or OP_SQUARE (a side's midpoint)
+ *   step  : the spacing of this op's level; it averages neighbours at ±step/2
+ *   rough : how big a random nudge to add at this level
  */
 typedef struct {
     int     x, y;
-    uint8_t kind;     /* OP_DIAMOND / OP_SQUARE */
-    int     step;     /* full step size at scheduling time */
-    float   rough;    /* random-offset magnitude at this level */
+    uint8_t kind;
+    int     step;
+    float   rough;
 } Op;
 
 /*
- * HeightField — the 2D scalar field diamond-square fills (the OUTPUT of the
- * algorithm), stored flat and row-major: cell (x,y) is at index y·w + x.
- * Ref: Fournier, Fussell & Carpenter, "Computer rendering of stochastic
- * models", CACM 25(6), 1982 — midpoint displacement on a height field.
+ * HeightField — the grid of heights the algorithm builds; this is the output.
+ * It's stored as one flat array, row by row: cell (x,y) lives at y*w + x.
  *
- * WHY (2^n + 1) square (w == h == N+1, N a power of two): the algorithm
- * works by repeatedly HALVING the step (N, N/2, … 1). Only a side of
- * 2^n + 1 keeps every midpoint on an integer cell at every level — a
- * non-power-of-two side would, after a few halvings, ask for a cell at a
- * fractional coordinate and the recurrence breaks (see EDGE CASES).
+ * The side length is always a power of two plus one (so 9, 17, 33, ... up to
+ * 129). That's not a style choice — the algorithm keeps halving the spacing,
+ * and only this size guarantees every halfway point lands on an exact cell.
+ * Any other size eventually asks for a fractional cell and breaks.
  *
- * WHY a separate computed[] mask rather than a sentinel height: heights are
- * an UNBOUNDED running sum of jittered averages, so every value (incl. 0,
- * negatives) is a legal height — "is this cell set yet?" simply can't be
- * read from height[]. The mask lets RENDER leave un-revealed cells blank
- * during the animated fill.
+ * We keep a separate computed[] flag per cell instead of using a special
+ * "empty" height, because every number — even 0 or a negative — is a valid
+ * height here, so there's no spare value to mean "not set yet". The flag lets
+ * the renderer leave not-yet-filled cells blank during the reveal.
  *
- * Ownership: SIMULATION (§4) mutates it via HeightField*; RENDER (§6) reads
- * it via const HeightField* and never writes (the signature enforces it).
+ * The simulation (§4) writes this; the renderer (§6) only reads it.
  *
- *   w, h, N        : grid is (N+1)×(N+1); w == h == N+1; N a power of two
- *   height[]       : per-cell height. RAW and UNBOUNDED — the algorithm
- *                    never clamps (clamping mid-run flattens features);
- *                    RENDER normalises against the live min/max and clamps
- *                    on read instead. CELLS_MAX-sized (fits the largest N)
- *   computed[]     : per-cell "has a value yet" flag (see WHY above)
+ *   w, h, N    : the grid is (N+1)x(N+1), so w == h == N+1
+ *   height[]   : each cell's height, raw and unclamped (clamping while
+ *                building flattens the terrain; the renderer rescales on
+ *                read instead). Sized for the largest grid.
+ *   computed[] : has this cell been filled in yet? (see above)
  */
 typedef struct {
     int   w, h, N;
@@ -587,41 +259,38 @@ typedef struct {
 } HeightField;
 
 /*
- * Subdivision — the diamond-square recurrence IN PROGRESS: a cursor over
- * the halving levels, plus the queue of cells each level still owes. This
- * is the algorithm's working memory; the HeightField is its output.
- * Ref: midpoint displacement — Fournier/Fussell/Carpenter 1982; the
- * persistence / roughness-decay view is clearest in Saupe, "Algorithms for
- * random fractals" (Peitgen & Saupe, "The Science of Fractal Images", 1988).
+ * Subdivision — the algorithm's scratch space while it's still building the
+ * map: where it is in the halving process, plus the queue of cells the
+ * current level still owes. (The HeightField is the finished result; this is
+ * the work-in-progress.)
  *
- * The recurrence walks step = N, N/2, N/4, … 2, and at each level runs a
- * DIAMOND phase then a SQUARE phase — order matters: square reads the
- * diamond points just created (see EDGE CASES). Each phase ENQUEUES its
- * cells; subdiv_step drains a few per tick, which is what animates the
- * reveal. SIMULATION (§4) owns and mutates it.
+ * It works through ever-finer spacings (step = N, N/2, N/4, ... down to 2),
+ * and at each spacing does a DIAMOND pass then a SQUARE pass — in that order,
+ * because the square pass averages the points the diamond pass just placed.
+ * Each pass lines up its cells in the queue; a few get filled per tick, which
+ * is what makes the terrain appear gradually.
  *
- * WHY one append-only queue with two cursors (consumed ops are never
- * removed): the slice [qhead, qtail) is "pending". Leaving drained ops in
- * place lets subdiv_step peek at queue[qhead-1] to recover the LAST phase
- * run (diamond vs square) and pick the next transition — so no separate
- * phase-history variable is needed. queue[] is CELLS_MAX-sized because the
- * field has at most that many cells, so a level's ops always fit.
+ * The queue is append-only: we never delete finished ops, just move the
+ * "next to do" cursor forward. Keeping the old ops lets us glance back at the
+ * last one done to tell whether we just finished a diamond or a square pass,
+ * so we know what comes next — no extra bookkeeping needed. It's sized for
+ * the whole grid, which is always enough for one level's worth of cells.
  *
- *   queue[]      : pending Ops in execution order (a phase is fully queued
- *                  before the next is scheduled)
- *   qhead, qtail : drain cursor (next op to compute) / fill cursor (next
- *                  free slot). qhead == qtail ⇒ current phase exhausted
- *   level_step   : current step S — "how big are the squares we're
- *                  subdividing now". Halves each level
- *   level_rough  : current jitter magnitude R; *= persistence each level.
- *                  Big early (continents), tiny late (ripples) — this DECAY
- *                  is precisely what makes the result fractal, not white noise
- *   persistence  : the decay ratio (copied from the active preset, so a
- *                  preset change only takes effect on the next reset)
- *   phase        : OP_DIAMOND or OP_SQUARE — which stencil this level is on
- *   done         : set true once the next step would drop below 2. We stop
- *                  at step 2 (half = 1): at step 1 the half would be 0 —
- *                  a divide-by-zero AND an infinite loop on `y += half`
+ *   queue[]      : cells waiting to be filled, in order
+ *   qhead, qtail : next-to-do cursor / next-free-slot. Equal means this
+ *                  pass is finished.
+ *   level_step   : current spacing — how big the squares we're splitting are.
+ *                  Halves each level.
+ *   level_rough  : current size of the random nudge; shrinks by persistence
+ *                  each level. Big at first (continents), tiny later
+ *                  (ripples) — this shrinking is exactly what makes it look
+ *                  like terrain rather than static.
+ *   persistence  : how fast the nudge shrinks (copied from the chosen
+ *                  preset, so changing presets only takes effect next reset)
+ *   phase        : OP_DIAMOND or OP_SQUARE — which pass we're on
+ *   done         : true once we've gone as fine as we can. We stop at step 2
+ *                  (half = 1): at step 1 the half would be 0, which would
+ *                  divide by zero and loop forever on `y += half`.
  */
 typedef struct {
     Op    queue[CELLS_MAX];
@@ -634,49 +303,38 @@ typedef struct {
 } Subdivision;
 
 /*
- * Controls — the tunable knobs the user drives at runtime: the HOW axis of
- * Scene. WHY its own struct: it separates USER INTENT from ALGORITHM STATE.
- * Nothing here changes except via app_handle_key, and the simulation is a
- * pure function of these knobs plus the RNG seed — so grouping them
- * documents exactly what a viewer can influence, and keeps presentation
- * choices (filter, theme) out of the HeightField/Subdivision that model the
- * maths. Two of the knobs pace the work (ops_per_tick, sim_fps); two pick
- * the look (preset, theme); the rest gate or filter.
+ * Controls — everything the viewer can change at runtime, kept apart from the
+ * algorithm's own state. The terrain depends only on these settings plus the
+ * random seed, so this struct is a tidy list of exactly what you can
+ * influence. Two settings pace the work (ops_per_tick, sim_fps), two pick the
+ * look (preset, theme), and the rest pause or filter.
  *
- *   paused         : freeze the sim. The DELAYS gate at the top of
- *                    scene_tick early-returns while set (render still runs)
- *   ops_per_tick   : cells computed per tick — the PERFORMANCE throttle
- *                    that paces the reveal. Stepped ×2 / ÷2 by +/- and
- *                    clamped to [OPS_PER_TICK_MIN..MAX] = [1..512]
- *   sim_fps        : simulation tick rate in Hz; the fixed-timestep loop
- *                    runs scene_tick this many times per second. ]/[ adjust
- *                    by SIM_FPS_STEP within [10..240]. Effective reveal
- *                    speed = ops_per_tick × sim_fps cells/second
- *   filter_band    : FILTER_ALL, or one biome (w/b/g/h/m/s) — render only
- *                    that band so a biome can be isolated; 'a' clears it
- *   current_preset : index into presets[] (n/p) — supplies the TERRAIN
- *                    params (roughness/persistence/bias) ONLY
- *   current_theme  : index into presets[] (t/T) — supplies the PALETTE
- *                    ONLY. Independent of current_preset, so any colour
- *                    scheme can dress any terrain shape
+ *   paused         : freeze the build (the screen still redraws)
+ *   ops_per_tick   : cells filled per tick — how fast the reveal goes.
+ *                    +/- double or halve it, within [1..512].
+ *   sim_fps        : how many ticks per second. ]/[ adjust it within
+ *                    [10..240]. Reveal speed is ops_per_tick x sim_fps.
+ *   filter_band    : show all terrain, or just one type (w/b/g/h/m/s);
+ *                    'a' goes back to showing all
+ *   current_preset : which preset's terrain SHAPE to use (n/p)
+ *   current_theme  : which preset's COLOURS to use (t/T) — independent of
+ *                    the shape, so any colours can dress any landscape
  */
 typedef struct {
     bool paused;
-    int  ops_per_tick;     /* cells computed per tick (+/-)          */
-    int  sim_fps;          /* simulation tick rate, Hz (] / [)       */
-    int  filter_band;      /* FILTER_ALL or one biome (w/b/g/h/m/s/a) */
-    int  current_preset;   /* terrain pattern index, presets[] (n/p) */
-    int  current_theme;    /* palette index, presets[] (t/T)         */
+    int  ops_per_tick;
+    int  sim_fps;
+    int  filter_band;
+    int  current_preset;
+    int  current_theme;
 } Controls;
 
 /*
- * SceneState — the WHERE-in-lifecycle axis of Scene; a two-state machine.
- *   COMPUTING — the reveal is running: each tick drains ops_per_tick cells;
- *               transitions to HOLD when subdiv_step reports the field done.
- *   HOLD      — the algorithm has finished; the completed terrain stays on
- *               screen indefinitely. Regeneration is USER-driven only
- *               (r / n / p) — there is deliberately no timer or auto-reset,
- *               so a finished map can be studied for as long as you like.
+ * Where the program is in its lifecycle:
+ *   COMPUTING — still building the terrain, a bit more each tick
+ *   HOLD      — finished; the map just stays on screen. It never restarts on
+ *               its own — only when you ask (r / n / p) — so you can look at a
+ *               finished map as long as you like.
  */
 typedef enum {
     SCENE_COMPUTING = 0,
@@ -684,52 +342,40 @@ typedef enum {
 } SceneState;
 
 /*
- * Scene — the whole simulation in one aggregate, deliberately ordered so it
- * reads top-to-bottom as the three questions you'd ask about any sim:
- *   WHAT is simulated  — a HeightField filled by a Subdivision process
- *   HOW the user drives — the Controls knobs
- *   WHERE in lifecycle  — the SceneState (+ the grid side for this run)
+ * Scene — the whole running demo gathered in one place, ordered as the three
+ * questions you'd ask about it: WHAT is being built (grid + subdiv), HOW the
+ * user steers it (controls), and WHERE it is in its lifecycle (state).
  *
- * CRITICAL: data aggregates HERE, but functions still take the narrowest
- * sub-type they need (grid_compute_*(HeightField*), subdiv_step(...),
- * grid_draw(const HeightField*)) — never Scene* unless they genuinely
- * orchestrate (scene_tick) or report across layers (screen_draw). So
- * aggregation gives one obvious home for state WITHOUT re-coupling the
- * layers §4 kept apart (see ARCHITECTURE).
+ * Even though the state lives together here, each function still takes only
+ * the small piece it needs — the renderer gets just the read-only grid, never
+ * the whole Scene — so grouping the data doesn't let the layers reach into
+ * each other.
  */
 typedef struct {
-    /* WHAT is simulated */
-    HeightField grid;            /* the height field being filled        */
-    Subdivision subdiv;          /* the recurrence cursor + reveal queue  */
+    /* WHAT is being built */
+    HeightField grid;            /* the terrain heights                   */
+    Subdivision subdiv;          /* the work-in-progress + its queue      */
 
-    /* HOW the user drives it */
-    Controls    controls;        /* the tunable knobs                     */
+    /* HOW the user steers it */
+    Controls    controls;
 
-    /* WHERE we are in the lifecycle */
-    SceneState  state;           /* COMPUTING → HOLD                      */
-    int         grid_N;          /* Side N chosen for THIS run from the
-                                  * terminal size (pick_grid_N). Distinct
-                                  * from HeightField.N: this is the TARGET
-                                  * the next scene_reset seeds to. It is
-                                  * held on Scene (not just inside the
-                                  * field) so a SIGWINCH can record the new
-                                  * size, and the following reset rebuilds
-                                  * the field to match it. */
+    /* WHERE in the lifecycle */
+    SceneState  state;
+    int         grid_N;          /* grid side to use for this run, picked from
+                                  * the terminal size. Kept here (not just in
+                                  * the field) so a resize can record the new
+                                  * size and the next reset rebuilds to match. */
 } Scene;
 
 /*
- * Screen — the terminal's current size in character cells, and the WHOLE
- * render context the program keeps. WHY so little: ncurses owns the actual
- * cell framebuffer and double-buffers internally, so we only need to cache
- * the dimensions — to centre the map and place the HUD rows. Refreshed from
- * getmaxyx() at init and after every SIGWINCH resize.
- *   cols, rows : terminal width / height, in character cells
+ * Screen — just the terminal's width and height in characters. That's all we
+ * track, because ncurses handles the actual drawing buffer itself; we only
+ * need the size to centre the map and place the HUD. Re-read at startup and
+ * after every resize.
  */
 typedef struct { int cols, rows; } Screen;
 
-/* ===================================================================== */
-/* §2  PERFORMANCE — timing primitives (the fixed-timestep loop is §7)    */
-/* ===================================================================== */
+/* ── §2  PERFORMANCE — clock and sleep helpers (the main loop is §7) ── */
 
 static int64_t clock_ns(void)
 {
@@ -748,11 +394,8 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/*
- * frame_delta_ns — nanoseconds since the previous frame, CAPPED at
- * MAX_FRAME_DT_NS so one long stall can't spiral the sim. Advances *prev
- * to now (so it is the running "last frame" timestamp the loop owns).
- */
+/* How long since the last frame, but never reported as longer than our cap,
+ * so one big stall can't snowball. Also updates *prev to "now". */
 static int64_t frame_delta_ns(int64_t *prev)
 {
     int64_t now = clock_ns();
@@ -762,21 +405,16 @@ static int64_t frame_delta_ns(int64_t *prev)
     return dt;
 }
 
-/*
- * pace_frame — sleep so the whole frame lasts one RENDER_PERIOD_NS. Sleeps
- * before terminal I/O so the frame cap holds regardless of draw time.
- * `frame_start` is when this frame's work began; `dt` is that frame's delta.
- */
+/* Sleep just long enough that the whole frame lasts one render period, so we
+ * hold a steady frame rate. We sleep before drawing, so draw time doesn't
+ * throw the pacing off. */
 static void pace_frame(int64_t frame_start, int64_t dt)
 {
     int64_t elapsed = clock_ns() - frame_start + dt;
     clock_sleep_ns(RENDER_PERIOD_NS - elapsed);
 }
 
-/* ===================================================================== */
-/* §3  LOGIC — pure decisions. No state, no I/O; reads only through       */
-/*     `const`, returns a value. Cannot be corrupted by §5/§6.            */
-/* ===================================================================== */
+/* ── §3  LOGIC — pure helpers: data in, answer out, nothing changed ── */
 
 static inline int grid_idx(const HeightField *g, int x, int y) { return y * g->w + x; }
 static inline bool grid_in_bounds(const HeightField *g, int x, int y)
@@ -784,11 +422,8 @@ static inline bool grid_in_bounds(const HeightField *g, int x, int y)
     return x >= 0 && x < g->w && y >= 0 && y < g->h;
 }
 
-/*
- * band_index_for_norm — given a normalised height in [0, 1], return a
- * band index 1..6 (FILTER_WATER..FILTER_SNOW). Same thresholds as
- * band_for_height — kept in lock-step. Used for filtering.
- */
+/* Which terrain type a 0..1 height falls into, as a filter number. Uses the
+ * same cut-offs as band_for_height, just so the filter and the drawing agree. */
 static inline int band_index_for_norm(float v)
 {
     if (v < BAND_WATER)    return FILTER_WATER;
@@ -825,11 +460,8 @@ static int band_color_pair(int filter)
     }
 }
 
-/*
- * band_for_height — classify a (clamped) [0,1] height into the Tile it
- * renders as (colour pair + attribute + ASCII glyph). Pure: height in,
- * Tile out. Bands are ordered by altitude; boundaries (BAND_*) are in §1.
- */
+/* Turn a 0..1 height into the full look to draw it with — colour, attribute,
+ * and character. Terrain types run low to high. */
 static Tile band_for_height(float h)
 {
     if (h < BAND_WATER)    return (Tile){ PAIR_WATER,    A_NORMAL, '~' };
@@ -840,11 +472,8 @@ static Tile band_for_height(float h)
     return (Tile){ PAIR_SNOW, A_BOLD, '@' };
 }
 
-/*
- * normalize01 — map a raw height into [0,1] against [min, min+span], then
- * clamp. This is the per-cell "where in the visible range does this height
- * sit?" — the input to band classification.
- */
+/* Rescale a raw height to 0..1 — where does it sit between the lowest and
+ * highest heights drawn so far? — and keep it inside that range. */
 static inline float normalize01(float value, float min, float span)
 {
     float v = (value - min) / span;
@@ -853,11 +482,9 @@ static inline float normalize01(float value, float min, float span)
     return v;
 }
 
-/*
- * computed_height_range — the [min,max] window over the cells set so far,
- * span floored at HSPAN_EPSILON. Pure scan; RENDER normalises against this
- * each frame so all six bands stay in use as the extremes drift.
- */
+/* Find the lowest and highest heights drawn so far. The renderer rescales
+ * against this each frame, so all six terrain types keep showing up as the
+ * extremes shift. */
 static HeightRange computed_height_range(const HeightField *g)
 {
     float min = 1.0f, max = 0.0f;
@@ -873,12 +500,11 @@ static HeightRange computed_height_range(const HeightField *g)
     return (HeightRange){ min, span };
 }
 
-/*
- * cardinal_neighbour_mean — mean of the in-bounds N/E/S/W neighbours at
- * distance `half` (the SQUARE-step stencil). Returns false (leaving *mean)
- * if NONE are in bounds; counts only the in-bounds ones so a border cell
- * with 3 neighbours averages by 3, never by a phantom 4 (see EDGE CASES).
- */
+/* Average of the up/down/left/right neighbours that actually exist, `half`
+ * cells away (used by the square step). Returns false if there are none.
+ * Only real neighbours count, so a cell on the edge averages over 3, not a
+ * fake 4 — pretending the missing one is 0 would drag the whole border down
+ * into deep water. */
 static bool cardinal_neighbour_mean(const HeightField *g, int x, int y,
                                     int half, float *mean)
 {
@@ -893,11 +519,8 @@ static bool cardinal_neighbour_mean(const HeightField *g, int x, int y,
     return true;
 }
 
-/*
- * subdivision_progress — which halving level the recurrence is on, and how
- * many there are in total. total = log2(N); current = halvings done + 1.
- * Both N and level_step are powers of two, so plain right-shift counting.
- */
+/* Which halving level we're on, and how many there are in all — just for the
+ * HUD's "level 3/7" readout. */
 static void subdivision_progress(const HeightField *g, const Subdivision *sd,
                                  int *current, int *total)
 {
@@ -910,15 +533,11 @@ static void subdivision_progress(const HeightField *g, const Subdivision *sd,
     *total   = tot;
 }
 
-/*
- * pick_grid_N — choose the largest N=2^n such that the resulting
- * (N+1) × (N+1) grid fits inside the terminal with HUD margins.
- *
- * Falls back to GRID_N_MIN if the terminal is too small.
- */
+/* Pick the biggest grid that still fits the terminal (after reserving the HUD
+ * rows), falling back to the minimum if the terminal is tiny. */
 static int pick_grid_N(int cols, int rows)
 {
-    int avail_w = cols / CELL_COLS;                       /* each cell is CELL_COLS wide */
+    int avail_w = cols / CELL_COLS;                        /* each cell is CELL_COLS wide */
     int avail_h = rows - (HUD_TOP_ROWS + HUD_BOTTOM_ROWS); /* rows left for the map      */
     int min_dim = (avail_w < avail_h) ? avail_w : avail_h;
     int N = 1;
@@ -930,44 +549,28 @@ static int pick_grid_N(int cols, int rows)
     return N;
 }
 
-/* ===================================================================== */
-/* §4  SIMULATION — advances state. Each function takes the narrowest     */
-/*     mutable type it needs (HeightField* / Subdivision*); scene_tick()   */
-/*     is the one combine point — nothing else advances the simulation.   */
-/* ===================================================================== */
+/* ── §4  SIMULATION — the only code that changes the terrain ── */
 
-/*
- * rand_signed — uniform float in [-1, 1]. The random offset per cell
- * (scaled by the level roughness). NOT pure: it advances rand()'s hidden
- * state, so it is the stochastic SOURCE for the simulation, not a LOGIC
- * helper. rand() quality is fine — artifacts would need statistics to spot.
- */
-static inline float rand_unit(void)   /* uniform in [0, 1] */
+/* The randomness behind the whole thing. rand_unit gives 0..1, rand_signed
+ * gives -1..1 (the per-cell nudge, scaled by the level's roughness). */
+static inline float rand_unit(void)
 {
     return (float)rand() / (float)RAND_MAX;
 }
-static inline float rand_signed(void) /* uniform in [-1, 1] */
+static inline float rand_signed(void)
 {
     return rand_unit() * 2.0f - 1.0f;
 }
 
-/*
- * grid_set — commit a freshly-computed height into the field: store it and
- * mark the cell computed. The one place a cell value is written (called by
- * both compute stencils and the corner seeding).
- */
+/* The one place a cell's height gets written: store it and mark it filled. */
 static void grid_set(HeightField *g, int idx, float value)
 {
     g->height[idx]   = value;
     g->computed[idx] = true;
 }
 
-/*
- * subdiv_schedule_diamond — append every diamond cell of the current
- * level to the queue (mutates Subdivision; reads the grid side N).
- * Ordering: row-major raster sweep. Diamond cells sit at the centres of
- * squares of the current step: (S/2 + i*S, S/2 + j*S).
- */
+/* Line up every diamond cell of this level: the centre of each square at the
+ * current spacing. They get filled later, a few per tick. */
 static void subdiv_schedule_diamond(Subdivision *sd, const HeightField *g)
 {
     sd->phase = OP_DIAMOND;
@@ -983,20 +586,16 @@ static void subdiv_schedule_diamond(Subdivision *sd, const HeightField *g)
     }
 }
 
-/*
- * subdiv_schedule_square — append every square (cross-midpoint) cell of
- * the current level (mutates Subdivision; reads the grid side N). Square
- * cells are the "edge midpoints" of the diamond regions: lattice points
- * on the half-step grid where (x/half + y/half) is ODD.
- */
+/* Line up every square cell of this level: the midpoints of the sides — the
+ * points that sit between the diamond centres we just placed. */
 static void subdiv_schedule_square(Subdivision *sd, const HeightField *g)
 {
     sd->phase = OP_SQUARE;
     int S = sd->level_step;
     int half = S / 2;
     for (int y = 0; y <= g->N; y += half) {
-        /* On row y: if y/half is even, x_start = half (offset);
-         * if odd, x_start = 0 (aligned). Both sequences step by S. */
+        /* Alternate the starting column row by row so we hit the midpoints
+         * and skip the diamond centres. */
         int x_start = ((y / half) & 1) ? 0 : half;
         for (int x = x_start; x <= g->N; x += S) {
             sd->queue[sd->qtail++] = (Op){
@@ -1007,12 +606,8 @@ static void subdiv_schedule_square(Subdivision *sd, const HeightField *g)
     }
 }
 
-/*
- * grid_compute_diamond — the DIAMOND step: set a square's centre to the
- * mean of its four diagonal corners (at ±half) plus a random displacement.
- * Mutates only the HeightField; the Op carries step+rough, so this never
- * touches the Subdivision.
- */
+/* The diamond step: fill a square's centre with the average of its four
+ * corners, plus a small random nudge. */
 static void grid_compute_diamond(HeightField *g, const Op *op)
 {
     int half = op->step / 2;
@@ -1023,16 +618,13 @@ static void grid_compute_diamond(HeightField *g, const Op *op)
         g->height[grid_idx(g, x + half, y - half)] +
         g->height[grid_idx(g, x - half, y + half)] +
         g->height[grid_idx(g, x + half, y + half)]);
-    float displacement = rand_signed() * op->rough;   /* midpoint displacement */
+    float displacement = rand_signed() * op->rough;
 
     grid_set(g, grid_idx(g, x, y), corner_mean + displacement);
 }
 
-/*
- * grid_compute_square — the SQUARE step: set an edge midpoint to the mean
- * of its in-bounds cardinal neighbours (at ±half) plus a random
- * displacement. Border cells average over fewer than 4 (see EDGE CASES).
- */
+/* The square step: fill a side's midpoint with the average of its real
+ * neighbours, plus a small random nudge. Edge cells have fewer neighbours. */
 static void grid_compute_square(HeightField *g, const Op *op)
 {
     int half = op->step / 2;
@@ -1040,19 +632,15 @@ static void grid_compute_square(HeightField *g, const Op *op)
 
     float neighbour_mean;
     if (!cardinal_neighbour_mean(g, x, y, half, &neighbour_mean))
-        return;                                        /* no neighbours — defensive */
-    float displacement = rand_signed() * op->rough;    /* midpoint displacement */
+        return;                                        /* no neighbours — just skip */
+    float displacement = rand_signed() * op->rough;
 
     grid_set(g, grid_idx(g, x, y), neighbour_mean + displacement);
 }
 
-/*
- * subdiv_advance_level — move to the next level: halve step, decay
- * roughness, schedule the next DIAMOND phase. The smallest useful step
- * is 2 (half=1); at step=1 the half would be 0 and schedule_square would
- * divide by zero AND infinite-loop on `y += half=0`. So we stop when the
- * next step would be < 2.
- */
+/* Drop to the next finer level: halve the spacing, shrink the randomness, and
+ * line up its diamond cells. We stop before the spacing would hit 1, since the
+ * half would then be 0 — a divide-by-zero and an endless loop. */
 static void subdiv_advance_level(Subdivision *sd, const HeightField *g)
 {
     int next = sd->level_step / 2;
@@ -1065,40 +653,30 @@ static void subdiv_advance_level(Subdivision *sd, const HeightField *g)
     subdiv_schedule_diamond(sd, g);
 }
 
-/*
- * grid_compute_op — apply the stencil for this op's phase (DIAMOND or
- * SQUARE) to the field. The dispatch the stepper uses to drain one cell.
- */
+/* Fill in one cell, doing whichever step it asked for. */
 static void grid_compute_op(HeightField *g, const Op *op)
 {
     if (op->kind == OP_DIAMOND) grid_compute_diamond(g, op);
     else                        grid_compute_square (g, op);
 }
 
-/*
- * subdiv_open_next — the current phase's queue is drained; schedule the
- * next one. After a DIAMOND phase comes the SQUARE phase at the SAME step;
- * after a SQUARE phase, drop to the next finer level. The last-run phase is
- * recovered from queue[qhead-1] (the queue is never re-shrunk). Returns
- * false when the recurrence is complete (nothing more to schedule).
- */
+/* This pass is finished — start the next one. A diamond pass is followed by a
+ * square pass at the same spacing; a square pass drops to a finer level. We
+ * tell which we just did by glancing at the last queued cell. Returns false
+ * when there's nothing left to do. */
 static bool subdiv_open_next(Subdivision *sd, const HeightField *g)
 {
-    if (sd->qhead == 0) return false;   /* pre-init: nothing was ever scheduled */
+    if (sd->qhead == 0) return false;   /* nothing was ever scheduled */
 
     uint8_t last_phase = sd->queue[sd->qhead - 1].kind;
     if (last_phase == OP_DIAMOND) subdiv_schedule_square(sd, g);
     else                          subdiv_advance_level(sd, g);
 
     if (sd->done) return false;
-    return sd->qhead < sd->qtail;       /* true iff something is now queued */
+    return sd->qhead < sd->qtail;       /* true if there's now work queued */
 }
 
-/*
- * subdiv_step — advance the recurrence by ONE cell. Returns false when the
- * algorithm is finished. Reads as: stop if done → if the phase is drained,
- * open the next (or finish) → pop one op → compute it.
- */
+/* Fill in one more cell. Returns false once the whole map is done. */
 static bool subdiv_step(Subdivision *sd, HeightField *g)
 {
     if (sd->done) return false;
@@ -1109,10 +687,7 @@ static bool subdiv_step(Subdivision *sd, HeightField *g)
     return true;
 }
 
-/*
- * grid_clear — size the field to (N+1)² and mark every cell uncomputed.
- * w MUST equal N + 1; the caller picks N as a power of 2.
- */
+/* Start a blank map of side N+1: nothing filled in yet. */
 static void grid_clear(HeightField *g, int N)
 {
     g->N = N;
@@ -1126,11 +701,8 @@ static void grid_clear(HeightField *g, int N)
     }
 }
 
-/*
- * grid_seed_corners — plant the four corner heights, the fixed points the
- * whole recurrence interpolates between. Each is uniform in
- * [CORNER_MIN, CORNER_MIN+CORNER_RANGE].
- */
+/* Set the four corners to random heights — the fixed points everything else
+ * is built between. */
 static void grid_seed_corners(HeightField *g)
 {
     int N = g->N;
@@ -1141,19 +713,15 @@ static void grid_seed_corners(HeightField *g)
     }
 }
 
-/* grid_seed — fresh field: clear, then plant the corner fixed points. */
+/* Blank map with fresh random corners, ready to grow. */
 static void grid_seed(HeightField *g, int N)
 {
     grid_clear(g, N);
     grid_seed_corners(g);
 }
 
-/*
- * subdiv_begin — start the recurrence over the (already-seeded) grid:
- * reset the cursor to step=N with the preset's roughness/persistence and
- * schedule the first DIAMOND phase. Reads the grid side; mutates the
- * Subdivision.
- */
+/* Begin building over the freshly-seeded grid: start at the coarsest spacing
+ * with the preset's settings, and line up the first diamond pass. */
 static void subdiv_begin(Subdivision *sd, const HeightField *g,
                          float roughness, float persistence)
 {
@@ -1163,7 +731,7 @@ static void subdiv_begin(Subdivision *sd, const HeightField *g,
     sd->level_rough = roughness;
     sd->persistence = persistence;
     sd->done = false;
-    subdiv_schedule_diamond(sd, g);   /* sets phase = OP_DIAMOND */
+    subdiv_schedule_diamond(sd, g);
 }
 
 static void scene_reset(Scene *s)
@@ -1172,8 +740,8 @@ static void scene_reset(Scene *s)
     grid_seed(&s->grid, s->grid_N);
     subdiv_begin(&s->subdiv, &s->grid, p->roughness, p->persistence);
     s->state = SCENE_COMPUTING;
-    /* controls and grid_N are preserved across resets — pressing 'r' or a
-     * filter key gives a fresh heightmap with the same knobs applied. */
+    /* The settings and grid size carry over, so 'r' (or a filter key) just
+     * rebuilds a fresh map with the same knobs. */
 }
 
 static void scene_init(Scene *s, int grid_N)
@@ -1190,70 +758,48 @@ static void scene_init(Scene *s, int grid_N)
 }
 
 /*
- * scene_tick — THE COMBINE POINT. The only function that advances the
- * simulation per tick, in explicit layer order:
- *   1. DELAYS      — paused gate: nothing advances while paused.
- *   2. PERFORMANCE — ops_per_tick bounds the work done this tick.
- *   3. SIMULATION  — subdiv_step advances Subdivision+HeightField one cell at a time.
- *   4. (state transition COMPUTING → HOLD when the algorithm finishes.)
- * EFFECTS (§5) would run here too if any existed (none currently).
- * It takes the whole Scene because it ORCHESTRATES the layers — but the
- * functions it calls each take the narrow Subdivision* / HeightField*.
+ * The one place the terrain advances each tick: skip if paused, otherwise
+ * fill in a batch of cells (how many is ops_per_tick), and switch to HOLD
+ * once the map is finished. It takes the whole Scene because it ties the
+ * pieces together; the functions it calls each take just their own piece.
  */
 static void scene_tick(Scene *s)
 {
-    /* 1. DELAYS — paused gate. */
     if (s->controls.paused) return;
 
     switch (s->state) {
 
     case SCENE_COMPUTING:
-        /* 2. PERFORMANCE throttle → 3. SIMULATION step. */
         for (int i = 0; i < s->controls.ops_per_tick; i++) {
             if (!subdiv_step(&s->subdiv, &s->grid)) {
-                s->state = SCENE_HOLD;   /* 4. done — hold the finished map */
+                s->state = SCENE_HOLD;   /* done — hold the finished map */
                 break;
             }
         }
         break;
 
     case SCENE_HOLD:
-        /* DELAYS — finished terrain stays put; a new one only on demand. */
-        break;
+        break;   /* finished terrain stays put until you ask for a new one */
     }
 }
 
-/* ===================================================================== */
-/* §5  EFFECTS — cosmetic-only state (glows, trails, flashes).            */
-/* ===================================================================== */
+/* ── §5  EFFECTS — purely cosmetic state ── */
 /*
- * Currently EMPTY. The earlier gold compute-flash and yellow supernova
- * reset-flash lived here (per-cell decaying glow buffers — a `Glow` type
- * advanced in the tick alongside SIMULATION, read by RENDER). They were
- * removed. This is the reserved home if a purely cosmetic layer returns:
- * such state must be advanced inside scene_tick (§4) AFTER the simulation
- * step and read-only from RENDER (§6) — never feeding back into
- * SIMULATION or LOGIC.
+ * Empty for now. There used to be glow flashes here. If a cosmetic-only layer
+ * comes back, it belongs here: advanced inside scene_tick after the terrain
+ * step, and only ever read by the renderer — never fed back into the maths.
  */
 
-/* ===================================================================== */
-/* §6  RENDER — state → screen. Draw functions take the narrowest `const` */
-/*     state they need (grid_draw → const HeightField*) and mutate only    */
-/*     the terminal. Colour setup lives here (it writes ncurses pairs).   */
-/* ===================================================================== */
+/* ── §6  RENDER — turn the state into something on screen ── */
 
 /*
- * palette_apply — install one entry's 6 terrain colour pairs (its
- * "theme"). Cycled independently of the terrain by t/T; n/p does not call
- * it (a preset change leaves the colour alone). HUD/HINT pairs stay the
- * same so the UI remains legible.
+ * Load one preset's six terrain colours as the live colour scheme. This is
+ * what t/T cycle; changing presets with n/p leaves the colours alone. It's
+ * safe to call any time — ncurses updates the colours in place, so what's
+ * already on screen just repaints in the new scheme.
  *
- * Safe to call any time; ncurses' init_pair updates the live pair
- * definition, so cells already on screen redraw with the new colours.
- *
- * On 8-colour terminals all palettes degrade to the same fallback set —
- * 256-colour palettes can't render with 8 colours, and remapping each
- * one to ANSI primaries would just produce indistinguishable variants.
+ * On a plain 8-colour terminal every scheme collapses to the same basic
+ * fallback, since the rich 256-colour schemes can't be shown with 8 colours.
  */
 static void palette_apply(int idx)
 {
@@ -1281,21 +827,18 @@ static void color_init(void)
     start_color();
     use_default_colors();
     if (COLORS >= 256) {
-        init_pair(PAIR_HUD,        226, -1);   /* reserved bright yellow */
-        init_pair(PAIR_HINT,        51, -1);   /* reserved bright cyan   */
+        init_pair(PAIR_HUD,        226, -1);   /* bright yellow */
+        init_pair(PAIR_HINT,        51, -1);   /* bright cyan   */
     } else {
         init_pair(PAIR_HUD,       COLOR_YELLOW,  -1);
         init_pair(PAIR_HINT,      COLOR_CYAN,    -1);
     }
-    palette_apply(0);   /* CLASSIC palette on startup */
+    palette_apply(0);   /* start on the CLASSIC scheme */
 }
 
-/*
- * draw_cell — paint one terrain cell as a CELL_COLS-wide run of its glyph,
- * at screen row sy starting at column sx. Cells are widened because
- * terminal characters are ~twice as tall as wide; one column per cell would
- * squash the square map. Columns past the screen edge are skipped.
- */
+/* Draw one map cell as a few side-by-side copies of its character (terminal
+ * characters are tall and narrow, so widening keeps the map looking square).
+ * Anything past the screen edge is skipped. */
 static void draw_cell(int sy, int sx, int cols, Tile t)
 {
     attron(COLOR_PAIR(t.pair) | t.attr);
@@ -1308,17 +851,14 @@ static void draw_cell(int sy, int sx, int cols, Tile t)
 }
 
 /*
- * grid_draw — paint the height field. Reads ONLY the HeightField (const)
- * plus two render parameters (the active `filter_band` and the preset
- * `bias`); it cannot see the Subdivision or Controls — the narrowest type
- * it needs. Reads top-to-bottom as: centre the map, find the visible height
- * window, then for each computed cell normalise → bias → filter → draw.
+ * Draw the whole terrain. For each filled-in cell: rescale its height to
+ * 0..1, tilt it by the preset's bias, and (if a filter is on) skip it unless
+ * it's the chosen terrain type, then draw it.
  */
 static void grid_draw(const HeightField *g, int filter_band, float bias,
                       int cols, int rows)
 {
-    /* Centre the (g->w*CELL_COLS)-wide × g->h-tall map block in the rows
-     * left between the top HUD lines and the bottom hint. */
+    /* Centre the map block in the rows between the top and bottom HUD. */
     int map_rows = rows - (HUD_TOP_ROWS + HUD_BOTTOM_ROWS);
     int gx0 = (cols - g->w * CELL_COLS) / 2;
     int gy0 = (map_rows - g->h) / 2 + HUD_TOP_ROWS;
@@ -1335,12 +875,12 @@ static void grid_draw(const HeightField *g, int filter_band, float bias,
             if (sx >= cols) break;             /* rest of row is off-screen */
 
             int idx = grid_idx(g, x, y);
-            if (!g->computed[idx]) continue;   /* uncomputed — blank */
+            if (!g->computed[idx]) continue;   /* not filled in yet — leave blank */
 
             float v = normalize01(g->height[idx], range.min, range.span);
-            if (bias != 1.0f) v = powf(v, bias);   /* biome-mix gamma */
+            if (bias != 1.0f) v = powf(v, bias);   /* tilt toward low or high ground */
 
-            /* filter mode: render only the selected biome */
+            /* with a filter on, draw only the chosen terrain type */
             if (filter_band != FILTER_ALL && band_index_for_norm(v) != filter_band)
                 continue;
 
@@ -1350,11 +890,9 @@ static void grid_draw(const HeightField *g, int filter_band, float bias,
 }
 
 /*
- * hud_print — draw one HUD segment at (row, x) in (pair, attr), clipped
- * so it never passes max_x or wraps onto the next line. (ncurses wraps a
- * too-long string by default, which would corrupt the data row below.)
- * Returns the column just past the drawn text so segments chain
- * left-to-right; a no-op once x has reached max_x.
+ * Print one piece of HUD text, trimmed so it can't run off the right edge —
+ * if it did, ncurses would wrap it onto the next line and mangle the row
+ * below. Returns where it stopped, so pieces can be chained left to right.
  */
 static int hud_print(int row, int x, int max_x, int pair, int attr,
                      const char *str)
@@ -1369,11 +907,8 @@ static int hud_print(int row, int x, int max_x, int pair, int attr,
     return x + n;
 }
 
-/*
- * hud_draw_status — HUD row 0 (bold, the dominant line): title, run state,
- * the two visual axes (theme = palette via t/T, preset = terrain via n/p),
- * and the frame rate.
- */
+/* Top HUD line (bold): title, what it's doing, the current colour scheme and
+ * terrain preset, and the frame rate. */
 static void hud_draw_status(const Screen *sc, const Scene *s, double fps)
 {
     const Controls *c = &s->controls;
@@ -1389,12 +924,9 @@ static void hud_draw_status(const Screen *sc, const Scene *s, double fps)
     hud_print(0, 0, sc->cols, PAIR_HUD, A_BOLD, seg);
 }
 
-/*
- * hud_draw_detail — HUD row 1 (not bold, so row 0 stays dominant):
- * recurrence internals that advance as the fractal fills in (level, step,
- * phase, roughness), the live sim settings (cells/tick, Hz), then the
- * active biome filter, colour-coded to its own tile colour.
- */
+/* Second HUD line (not bold): the build's progress (level, spacing, which
+ * pass, current randomness), the speed settings, and the active filter shown
+ * in its own terrain colour. */
 static void hud_draw_detail(const Screen *sc, const Scene *s)
 {
     const Subdivision *sd = &s->subdiv;
@@ -1417,18 +949,14 @@ static void hud_draw_detail(const Screen *sc, const Scene *s)
               band_name(c->filter_band));
 }
 
-/* hud_draw_actions — bottom row: every interactive key, clipped to width. */
+/* Bottom HUD line: the list of every key you can press. */
 static void hud_draw_actions(const Screen *sc)
 {
     hud_print(sc->rows - 1, 0, sc->cols, PAIR_HINT, A_BOLD,
               " w/b/g/h/m/s a:all  t/T:theme  n/p:preset  +/-:ops  [/]:rate  spc:pause  r:reset  q:quit ");
 }
 
-/*
- * screen_draw — one frame: clear, paint the map, then the three HUD rows.
- * The dashboard reads the whole Scene (const) because the HUD reports across
- * layers, but the map is painted via grid_draw with the narrow arguments.
- */
+/* Draw one whole frame: clear, paint the map, then the three HUD lines. */
 static void screen_draw(const Screen *sc, const Scene *s, double fps)
 {
     const Controls *c = &s->controls;
@@ -1443,8 +971,7 @@ static void screen_draw(const Screen *sc, const Scene *s, double fps)
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
-/* Screen lifecycle — these MUTATE Screen (terminal dimensions), so they
- * take a non-const pointer. Setup/teardown, not per-frame render. */
+/* Start up, tear down, and resize the terminal. */
 static void screen_init(Screen *s)
 {
     initscr();
@@ -1465,31 +992,24 @@ static void screen_resize(Screen *s)
     getmaxyx(stdscr, s->rows, s->cols);
 }
 
-/* ===================================================================== */
-/* §7  APP — input, signals, and the fixed-timestep loop. PERFORMANCE     */
-/*     (accumulator, caps, frame sleep) and the input layer live here;    */
-/*     simulation advances only via scene_tick.                          */
-/* ===================================================================== */
+/* ── §7  APP — input, signals, and the main loop ── */
 
 /*
- * App — top-level container wiring the simulation to the terminal and the
- * run loop. Exactly ONE static instance (g_app) exists: POSIX signal
- * handlers take no user argument, so they must reach the run flags through
- * a global. Everything else is passed by pointer; the global is only here
- * for the handlers.
+ * App — the whole program in one box: the demo, the terminal, and two flags
+ * the loop watches. There's exactly one of these (g_app), as a global,
+ * because signal handlers get no argument of their own and can only reach
+ * these flags through a global.
  *
- *   scene       : the whole simulation (WHAT / HOW / WHERE)
- *   screen      : cached terminal dimensions
- *   running     : main-loop flag; cleared by SIGINT/SIGTERM to exit cleanly
- *   need_resize : set by the SIGWINCH handler, then serviced and cleared at
- *                 the top of the loop
+ *   scene       : the whole running demo
+ *   screen      : the terminal's size
+ *   running     : the loop runs while this is set; a Ctrl-C clears it
+ *   need_resize : the resize signal sets this; the loop handles it next time
  *
- * WHY both flags are volatile sig_atomic_t: they are written inside a
- * signal handler and read in the main loop. sig_atomic_t is the only type
- * the C standard guarantees is read/written atomically w.r.t. a signal,
- * and `volatile` stops the compiler caching the value across the loop. The
- * handlers do nothing but set a flag — the real work (resize, teardown)
- * happens on the main thread where it is safe.
+ * The two flags are volatile sig_atomic_t because a signal handler writes
+ * them while the main loop reads them — that's the one type C promises is
+ * safe to share that way, and volatile stops the compiler from caching a
+ * stale copy. The handlers only set a flag; the real work happens back in
+ * the main loop where it's safe.
  */
 typedef struct {
     Scene                 scene;
@@ -1512,11 +1032,8 @@ static void app_do_resize(App *app)
     app->need_resize = 0;
 }
 
-/*
- * app_handle_key — input layer. Translates a keypress into a change of
- * Controls (pause, filter, preset/theme, throttles) or a reset request.
- * It does NOT step the simulation — that stays in scene_tick.
- */
+/* Turn one keypress into a settings change or a reset. Returns false only on
+ * quit. It never builds terrain itself — that stays in scene_tick. */
 static bool app_handle_key(App *app, int ch)
 {
     Scene    *s = &app->scene;
@@ -1528,9 +1045,8 @@ static bool app_handle_key(App *app, int ch)
         scene_reset(s);
         break;
 
-    /* Biome filter keys — set the filter to one band and reset the
-     * heightmap so the user sees a fresh reveal showing only that
-     * biome's cells. 'a' clears the filter back to "show all". */
+    /* Show just one terrain type, and rebuild so you watch only that type
+     * appear. 'a' goes back to showing everything. */
     case 'w': case 'W': c->filter_band = FILTER_WATER;    scene_reset(s); break;
     case 'b': case 'B': c->filter_band = FILTER_BEACH;    scene_reset(s); break;
     case 'g': case 'G': c->filter_band = FILTER_GRASS;    scene_reset(s); break;
@@ -1539,9 +1055,8 @@ static bool app_handle_key(App *app, int ch)
     case 's': case 'S': c->filter_band = FILTER_SNOW;     scene_reset(s); break;
     case 'a': case 'A': c->filter_band = FILTER_ALL;      scene_reset(s); break;
 
-    /* Theme cycling — 't' next, 'T' previous. Swaps ONLY the colour
-     * palette of the current view; the terrain is untouched (no regen),
-     * so you can recolour the land you're looking at. */
+    /* Recolour: t next scheme, T previous. Only the colours change — the
+     * terrain stays, so you recolour the land you're already looking at. */
     case 't':
         c->current_theme = (c->current_theme + 1) % N_PRESETS;
         palette_apply(c->current_theme);
@@ -1551,9 +1066,8 @@ static bool app_handle_key(App *app, int ch)
         palette_apply(c->current_theme);
         break;
 
-    /* Preset cycling — 'n' next, 'p' previous. Changes ONLY the terrain
-     * pattern (roughness/persistence/bias) and regenerates. The colour
-     * is left untouched — recolour separately with t/T. */
+    /* New terrain shape: n next preset, p previous. Only the landscape
+     * changes and rebuilds; the colours stay (recolour with t/T). */
     case 'n':
         c->current_preset = (c->current_preset + 1) % N_PRESETS;
         scene_reset(s);
@@ -1584,12 +1098,8 @@ static bool app_handle_key(App *app, int ch)
     return true;
 }
 
-/*
- * run_fixed_ticks — drain the fixed-timestep accumulator: add this frame's
- * dt, then run one scene_tick per whole tick_ns of accumulated time. Decouples
- * simulation rate from frame rate; scene_tick (§4) is the single combine
- * point, so this only decides HOW MANY ticks the frame owes.
- */
+/* Run however many ticks this frame is owed. Banking the leftover time keeps
+ * the terrain building at a steady pace no matter the frame rate. */
 static void run_fixed_ticks(Scene *s, int64_t *accum, int64_t tick_ns, int64_t dt)
 {
     *accum += dt;
@@ -1629,11 +1139,11 @@ int main(void)
 
         int64_t dt = frame_delta_ns(&frame_time);
 
-        /* SIMULATION: run the ticks this frame owes. */
+        /* build a bit more terrain */
         run_fixed_ticks(&app->scene, &sim_accum,
                         TICK_NS(app->scene.controls.sim_fps), dt);
 
-        /* measure the displayed fps over FPS_UPDATE_MS windows */
+        /* work out the fps shown in the HUD, averaged over a short window */
         frame_count++;
         fps_accum += dt;
         if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -1643,9 +1153,9 @@ int main(void)
             fps_accum   = 0;
         }
 
-        pace_frame(frame_time, dt);      /* PERFORMANCE/DELAYS: hold ~RENDER_HZ */
+        pace_frame(frame_time, dt);      /* wait so we hold a steady frame rate */
 
-        /* RENDER then INPUT. */
+        /* draw, then read a keypress */
         screen_draw(&app->screen, &app->scene, fps_display);
         screen_present();
 

@@ -1,360 +1,30 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * cloud.c
- *   — Procedural cloud layers from a stack of fractional-Brownian-
- *     motion (fBm) noise samples.  Each cell of the sky asks "how
- *     dense is the cloud here?", the answer comes from one or more
- *     fBm evaluations, and the cell is drawn at a glyph + colour
- *     intensity that maps to that density.  Wind drifts the noise
- *     coordinates over time, so the clouds slide across the screen
- *     forever.
+ * cloud.c — a drifting ASCII sky.
  *
- * DEMO: A sky.  Soft white shapes drift slowly from left to right.
- *       Cycle 15 cloud presets with n / p — every preset is one row in
- *       the `presets[]` table (noise scale + anisotropy, octaves, domain-
- *       warp, thresholds, glyphs, ramp, lightning), all driven by ONE
- *       sampler and ONE renderer:
+ * For every cell we ask "how thick is the cloud here?" The answer is a
+ * noise value; the thicker it is, the heavier the glyph and brighter the
+ * tint we draw. Wind slowly shifts where we sample the noise, so the
+ * clouds slide across the screen forever. Fifteen presets (cumulus,
+ * cirrus, storm...) are just different settings fed to one sampler and
+ * one renderer; n/p cycles them.
  *
- *         CUMULUS  CIRRUS  STRATUS   — the textbook three.
- *         STORM    ANVIL             — dense + flickering '/' lightning.
- *         MACKEREL FOG     WISPS     — dappled / overcast / sparse high.
- *         MARESTAILS STREETS POPCORN — curved streaks / bands / fair-weather.
- *         NIMBUS   TURBULENT VEIL    — dark rain / churning / thin haze.
- *         BILLOWS                    — wave clouds.
+ * The noise is fractional Brownian motion (fBm): plain Perlin noise
+ * stacked at finer and finer detail so clouds have shape at every scale.
  *
- *       Anisotropy (scale_y > scale_x) stretches features horizontally;
- *       domain-warp turns clean blobs into swirly, turbulent silhouettes;
- *       the threshold row sets how much sky the cloud covers.
+ * Related files:
+ *   ../fields/perin_noise_flow_showcase.c — the Perlin/fBm reference.
+ *   ../worldgen/hydraulic.c — same fBm field used as a height map, not a
+ *                             density map. Two uses, one noise scaffold.
  *
- *       'r' reseeds the Perlin permutation table — same preset, new cloud
- *       arrangement.  No phase machine, no rebuild cycle: the wind blows on.
- *
- * Study alongside:
- *   ../fields/perin_noise_flow_showcase.c
- *      — Perlin / fBm reference. The `fbm2` here is the same scaffold,
- *        parameterised by octave count so each preset picks the
- *        amount of detail it needs.
- *   ../worldgen/hydraulic.c
- *      — uses the same fBm field as a HEIGHT MAP that gets carved.
- *        Here the field is a DENSITY MAP that gets thresholded into
- *        glyphs. Two domains, one noise scaffold.
- *
- * Section map:
- *   §1 config    — wind, warp, themes, the 15-row CloudPreset table
- *   §2 clock     — monotonic timer + sleep
- *   §3 color     — HUD reserved + 10 themes (8-step ramp + accents)
- *   §5 cloud     — hash, perlin, fbm with octave count, one parameterised
- *                  density sampler, level helper
- *   §6 scene     — wind / drift state, scene_tick (just advances time)
- *   §7 screen    — one preset-driven renderer + HUD
- *   §8 app       — signals, resize, fixed-step main loop
- *
- * Keys:
- *   q / ESC    quit
- *   space      pause / resume the wind
- *   r          reseed (new cloud arrangement, same preset)
- *   n / N      next preset  (cycles all 15)
- *   p / P      previous preset
- *   t / T      next / previous theme
- *   + / =      faster wind
- *   -          slower wind
- *   ] / [      raise / lower tick Hz
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra \
- *     procedural/worldgen/cloud.c \
- *     -o cloud -lncurses -lm
- */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Two pieces composed together.
- *
- *                  (1) FRACTIONAL BROWNIAN MOTION (fBm). A single
- *                      Perlin-noise sample is a smooth scalar field
- *                      with one characteristic feature size. STACK
- *                      several Perlin samples at doubled frequency
- *                      and halved amplitude, sum them, and you get
- *                      detail at every scale — the classic fBm
- *                      formula:
- *                          f(x, y) = Σ_k a_k · perlin(x·2^k, y·2^k)
- *                                     where a_k = 0.5^k
- *                      Normalise to roughly [0, 1] and threshold:
- *                      every cell becomes opaque (cloud) or
- *                      transparent (clear sky) depending on whether
- *                      the field exceeds a chosen threshold.
- *
- *                  (2) MORPHOLOGY VIA SAMPLING SHAPE. The cloud TYPE
- *                      is encoded in HOW you sample fBm — and ALL of it
- *                      lives in one CloudPreset row (§1), read by one
- *                      sampler (cloud_density). Four knobs span the gallery:
- *                        SCALE / ANISOTROPY — scale_x, scale_y set feature
- *                                   size per axis. scale_y ≫ scale_x squashes
- *                                   features vertically → horizontal wisps
- *                                   (CIRRUS) or flat bands (STRATUS); equal-
- *                                   ish scales → round puffs (CUMULUS).
- *                        OCTAVES  — fBm detail (smooth FOG ↔ fractal STORM).
- *                        DOMAIN WARP — warp_amt offsets the sample coords by
- *                                   a second fBm: 0 = clean streaks, high =
- *                                   swirly / turbulent (STORM, TURBULENT).
- *                        THRESHOLDS — where density becomes cloud: a low
- *                                   cut = overcast (FOG), high = sparse (WISPS).
- *                      15 rows of these four knobs = 15 distinct skies.
- *
- *                  Plus DRIFT — every sample's input coords get a
- *                  time-dependent offset (wind), so the cloud field
- *                  appears to scroll. Each preset's wind_mult scales its
- *                  drift speed, giving parallax between presets.
- *
- * Data-structure : One const CloudPreset table (15 rows) + a few Scene
- *                  floats — time, wind offset, preset index. The whole sky
- *                  is a function of (cell_x, cell_y, time); re-evaluated
- *                  every frame, no caching, no allocation. Rendering at
- *                  240×80 × 60 fps takes on the order of one Perlin call
- *                  per cell per frame, well under 1 % of a current CPU.
- *
- * Rendering      : ASCII only. Per cell: compute density, find which
- *                  of five LEVELS it falls into (clear / wispy / thin
- *                  / dense / core), pick a glyph from the active preset's
- *                  4-glyph table, render in the matching ramp tint. Glyphs
- *                  vary by preset so the same density reads differently per
- *                  sky — e.g. CUMULUS '.'/'o'/'@' vs STRATUS ','/'_'/'#'.
- *                  Presets flagged `lightning` (STORM, ANVIL) overstrike
- *                  sparse '/' bolts in PAIR_HOT at their dense cores.
- *
- * Performance    : The full screen is recomputed each frame. Warped
- *                  presets cost 3 fBm calls per cell (2-octave warp pass +
- *                  the main sample); at 4 octaves that is ~12 Perlin
- *                  samples / cell. At 19 200 cells × 60 fps × 50 ns per
- *                  sample ≈ 60 ms / sec, around 6 % of one core. Warp-free
- *                  presets (CIRRUS, FOG) are cheaper. No allocation in
- *                  steady state.
- *
- * References     :
- *   NOISE — the underlying field (§3 perlin2d / grad2 / fade_q)
- *   • Perlin, K. (1985)  "An Image Synthesizer", Computer Graphics
- *     19(3), SIGGRAPH '85.  The original gradient-noise lattice.
- *   • Perlin, K. (2002)  "Improving Noise", SIGGRAPH '02.
+ * References the code can't give you:
+ *   Perlin (2002) "Improving Noise" — the fade curve + gradient scheme.
  *     https://mrl.cs.nyu.edu/~perlin/paper445.pdf
- *       Source of the quintic fade curve fade_q = 6t⁵−15t⁴+10t³ and
- *       the 8-gradient scheme used here.
- *
- *   fBm — detail at every scale (§3 fbm2_n + the density samplers)
- *   • Mandelbrot, B. & Van Ness, J. (1968)  "Fractional Brownian
- *     Motions, Fractional Noises and Applications", SIAM Review
- *     10:422–437.  Where fBm comes from.
- *   • Ebert, Musgrave, Peachey, Perlin & Worley — "Texturing &
- *     Modeling: A Procedural Approach", 3rd ed. (2003).  Musgrave's
- *     chapters are the canonical fBm / turbulence / noise-as-density
- *     reference behind this whole file.
- *
- *   RENDERING — turning the field into a picture
- *   • Quílez, I. — "fBm"   https://iquilezles.org/articles/fbm/
- *       octave summation + normalisation (the fbm2_n recipe.)
- *   • Quílez, I. — "Domain warping"  https://iquilezles.org/articles/warp/
- *       the warp pre-pass that makes CUMULUS / STORM swirl.
- *
- *   CLOUD DOMAIN — the subject itself
- *   • Schneider, A. & Vos, N. (2015)  "The Real-Time Volumetric
- *     Cloudscapes of Horizon: Zero Dawn", SIGGRAPH course.  How cloud
- *     TYPE maps to noise shape — the idea the presets are built on.
- *   • WMO — International Cloud Atlas.  https://cloudatlas.wmo.int/
- *       the genera (cumulus, cirrus, stratus, nimbus…) the presets
- *       are named after.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * To draw a cloud, do not draw a cloud — draw the THRESHOLD of a
- * smooth scalar field. Fractional Brownian motion gives you a scalar
- * field that has interesting features at every scale; ask "is this
- * field over 0.6 here?" and the YES regions look exactly like clouds,
- * because clouds in nature are exactly that: regions where some
- * scalar (water-vapor density) exceeds a threshold. The MORPHOLOGY
- * (puffy vs wispy vs banded) is just the SHAPE you sample the field
- * at — isotropic spheres, horizontally stretched ovals, vertically
- * stacked bands.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine a sheet of cotton ball stuffing. It has a lumpy density —
- * thicker in some places, thinner in others, with structure at many
- * scales (small fibres clump into tufts which clump into wads). Now
- * cut a 2-D cross-section through it. The lumps you see are the
- * density's THRESHOLD CONTOURS — places where the cotton crosses some
- * fixed threshold. Slide a window over the cross-section: it looks
- * like clouds drifting.
- *
- * That's literally the algorithm. fBm is the cotton-density function;
- * thresholding turns it into binary "cloud / not-cloud"; soft
- * thresholding (multiple bands) gives shaded glyphs. The wind is just
- * the cross-section sliding over the cotton.
- *
- * Different cloud TYPES come from how you tilt and squeeze the
- * cotton sheet. Stretch it horizontally → the lumps become long
- * streaks → CIRRUS. Squash it vertically → the lumps become flat
- * pancakes → STRATUS. Leave it alone (and add a domain-warp jiggle
- * for organicness) → CUMULUS.
- *
- * ALGORITHM IN STEPS
- * ──────────────────
- *  1. PERMUTATION TABLE — shuffle perm[256] from a seed and
- *     duplicate to 512 (Perlin's standard trick to skip the modulo
- *     in lookup).
- *  2. EACH FRAME:
- *     a. Advance wind: wind_x += WIND_X · dt · speed_mul
- *                      wind_y += WIND_Y · dt · speed_mul
- *                      warp_t += DRIFT  · dt · speed_mul
- *     b. For every screen cell (sx, sy), using the active preset row:
- *         i. Compute density with cloud_density (1 fBm call, or 3 if the
- *            preset's warp_amt > 0 — 2 for the warp offset, 1 for the main
- *            sample). Coords are scaled by the preset's scale_x / scale_y.
- *        ii. Convert density → level via the preset's 4 thresholds.
- *       iii. If level > 0:
- *              glyph = preset.glyphs[level - 1]
- *              ramp  = preset.ramp  [level - 1]
- *              attr  = A_DIM / A_NORMAL / A_BOLD by level
- *              if preset.lightning AND level == 4 AND hash-gate → '/' in HOT
- *              mvaddch (sy, sx, glyph)
- *
- * KEY FORMULAS
- * ────────────
- *  fBm with N octaves:
- *     f(x, y) = (1/A) · Σ_{k=0..N-1} a_k · perlin(x·2^k, y·2^k)
- *     A       = Σ a_k = 1 + 0.5 + 0.25 + … (so f ∈ roughly [-1, 1])
- *     We re-map to [0, 1] with f' = 0.5·f + 0.5.
- *
- *  Cloud density (one parameterised sampler; the preset row supplies
- *  scale_x, scale_y, octaves, warp_amt, wind_mult):
- *     wx = x + wind_x · wind_mult,   wy = y + wind_y
- *     if warp_amt > 0:                       // domain-warp pre-pass
- *        qx = fbm(x · WARP_SCALE,       y · WARP_SCALE + warp_t)
- *        qy = fbm(x · WARP_SCALE + 5.2, y · WARP_SCALE + 1.3 + warp_t)
- *        wx += qx · warp_amt,   wy += qy · warp_amt
- *     d = fbm(wx · scale_x, wy · scale_y, octaves)
- *   The aspect ratio is baked into each preset's scale_y (round looks set
- *   scale_y ≈ 2·scale_x; anisotropic looks push scale_y far higher).
- *
- *  Density → level (5 buckets from the preset's 4 thresholds):
- *     d < thresholds[0] → 0   (clear sky, do not draw)
- *       < thresholds[1] → 1   (wispy edge)
- *       < thresholds[2] → 2   (medium body)
- *       < thresholds[3] → 3   (dense)
- *       ≥                → 4   (core / highlight)
- *
- *  Lightning gate (presets with lightning = true):
- *     bolt = (level == 4) AND (hash3(x, y, ⌊30·t⌋) % LIGHTNING_HASH_MOD == 0)
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • ASPECT RATIO. Terminal cells are ~2× taller than wide, so a round
- *    cloud wants scale_y ≈ 2·scale_x. Each preset bakes this into its
- *    scale_y directly: "round" presets (CUMULUS) use ~2×, while wispy /
- *    banded presets (CIRRUS, STRATUS) push scale_y much higher on purpose
- *    so features stretch horizontally.
- *
- *  • WIND CONTINUITY. wind_x grows monotonically with time. After
- *    days it can exceed float precision (~10^7 cells of drift
- *    before single-precision Perlin starts to bin into the same
- *    integer cells). For a real long-running demo, modulo wind_x
- *    by perm size periodically; for an interactive showcase that
- *    rarely runs more than minutes, ignore.
- *
- *  • DOMAIN WARP COST. Each warped cell does 3 fBm calls (qx, qy, main);
- *    warp-free presets (CIRRUS, FOG, VEIL) do just 1. At 60 fps × 240×80
- *    cells × 4 octaves the warped path is ~14 M Perlin samples per second.
- *    Modern hardware handles it easily; to scale to 8 K terminals, drop
- *    the warp pre-pass to fewer octaves (OCT_WARP).
- *
- *  • FLOAT-VS-INT IN FLOOR. Perlin's permutation lookup uses
- *    `(int)floorf(x) & 255`. For NEGATIVE x, (int) cast truncates
- *    toward zero — wrong direction; floorf rounds toward −∞ — right
- *    direction. Don't replace floorf with a plain (int) cast or the
- *    cloud field becomes discontinuous at x = 0.
- *
- *  • ANISOTROPIC SCALES NEED ADJUSTING THRESHOLDS. A high scale_y / scale_x
- *    ratio doesn't change fBm's output range but does change the spatial
- *    distribution of high values — wispy presets usually want slightly
- *    lower thresholds than round ones for a similar sky-fill ratio.
- *
- *  • LIGHTNING DENSITY. Bolts fire only at a preset's level-4 cores, then
- *    a 1-in-LIGHTNING_HASH_MOD hash gate keeps them sparse, so storms get
- *    a few flickering '/' glyphs per frame. The ⌊30·t⌋ in the seed
- *    regenerates them at 30 Hz so they don't stick. Lower the modulo for
- *    more strikes.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • PAUSE (space). Clouds freeze in place — no drift, no animation.
- *    Resume: clouds slide from exactly where they froze. Verifies
- *    the wind accumulator.
- *
- *  • Press 'r'. The cloud arrangement reshapes (different perm
- *    table) but the wind speed and preset are unchanged. Verifies
- *    perm reseed.
- *
- *  • CUMULUS preset. Clouds should look ROUND-ish, with organic
- *    swirly outlines (the domain-warp signature). If they look like
- *    perfect blobs with no swirl, the warp pre-pass is missing.
- *
- *  • CIRRUS / WISPS presets. Clouds should be obviously HORIZONTAL
- *    streaks, much wider than tall. If they look round, the
- *    anisotropic scale_y is wrong.
- *
- *  • STRATUS / STREETS presets. Clouds form horizontal BANDS that span
- *    much of the screen width. If you see localised blobs instead, the
- *    y-scale isn't compressed enough.
- *
- *  • STORM / ANVIL presets. Dense churning cloud with bright cores, plus
- *    occasional '/' bolts flickering in red at the densest cells.
- *
- *  • Counter (top-left HUD). n / p step the preset i/15 and the name
- *    updates; the whole gallery should cycle and wrap.
- *
- *  • Wind direction. Watch a cloud edge for a few seconds; it
- *    should slide leftward-to-rightward at speed proportional to
- *    the user's "speed" knob. + key doubles the rate; − halves it.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── ARCHITECTURE (concern layers) ─────────────────────────────────────── *
- *
- * The file is cut into six concern-layers; each function lives in exactly
- * one. The table says what each layer MUTATES.
- *
- *   Layer        §   Mutates
- *   ──────────── ── ──────────────────────────────────────────────────────
- *   CONFIG       §1  nothing — const tables (presets[], themes[]) + #defines
- *   PERFORMANCE  §2  nothing — clock read + sleep; the throttle that USES
- *                    them (fixed timestep + frame cap) runs in §6
- *   LOGIC        §3  nothing — pure reads: perlin / fBm / cloud_density /
- *                    density_to_level. Reads the perm[] seed; never writes.
- *   SIMULATION   §4  perm[] (noise seed, on init/reseed EVENTS only) and the
- *                    Scene's Drift (time/wind/warp, advanced once per tick)
- *   RENDER       §5  ncurses state only (colour pairs, Screen dims). Paints
- *                    Scene → screen; never touches simulation state.
- *   APP          §6  App (running / need_resize / sim_fps); owns the tick.
- *
- * LOGIC is provably uncorruptible: it does no mutation and no I/O, so
- * deleting or reordering RENDER cannot change a density or a level.
- *
- * No EFFECTS layer: the only cosmetic flourish — STORM / ANVIL lightning —
- * is DERIVED at render time in render_clouds (a level-4 core that passes a
- * hash gate is drawn as '/'), never stored. Nothing to advance → no section.
- *
- * No DELAYS section: the sole hold is the `paused` flag, which short-circuits
- * scene_tick (§4). One line, documented there — not worth its own layer.
- *
- * PER-TICK COMBINE ORDER — main() (§6) is the ONE place sim state advances:
- *   PERFORMANCE  measure + clamp dt
- *   SIMULATION   scene_tick × N        (fixed timestep; skipped when paused)
- *   PERFORMANCE  fps tally + frame-cap sleep
- *   RENDER       screen_draw (→ scene_draw → render_clouds → LOGIC) + present
- *   EVENTS       getch → app_handle_key / resize   (NOT part of the tick)
- * ─────────────────────────────────────────────────────────────────────── */
+ *   Quílez — "fBm" and "Domain warping": https://iquilezles.org/articles/
+ *   Schneider & Vos (2015), "Volumetric Cloudscapes of Horizon: Zero Dawn"
+ *     — how cloud type maps to noise shape, the idea behind the presets.
+ *   WMO International Cloud Atlas — the genus names: https://cloudatlas.wmo.int/
+ */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -368,106 +38,96 @@
 #include <string.h>
 #include <time.h>
 
-/* ===================================================================== */
-/* §1  CONFIG — const tables + tunables (mutates nothing)                  */
-/* ===================================================================== */
+/* ── §1 config — const tables + tunable knobs ───────────────────────────── */
 
-/* Named constants in three groups: the simulation-rate / speed knobs the user
- * adjusts, two HUD sizing values, and the ncurses colour-pair IDs. Kept as one
- * enum so every magic number in the file has a name at the top. */
+/* Every named number lives here so nothing magic hides in the logic. */
 enum {
-    /* tick rate — ]/[ step it; sets the fixed timestep in main() */
-    SIM_FPS_MIN         =  10,    /* floor — below this the sim feels jerky    */
+    /* tick rate — how often the wind advances; ]/[ change it */
+    SIM_FPS_MIN         =  10,    /* below this the motion looks jerky          */
     SIM_FPS_DEFAULT     =  60,
-    SIM_FPS_MAX         = 240,    /* ceiling — past display refresh anyway     */
+    SIM_FPS_MAX         = 240,    /* above this is past the display refresh      */
     SIM_FPS_STEP        =  10,
 
-    /* wind speed — +/- step it; doubles/halves (see app_handle_key) */
+    /* wind speed knob — +/- double or halve it */
     SPEED_MIN           =   1,
-    SPEED_DEF           =   8,    /* the 1.0× reference; Scene.speed/SPEED_DEF  */
+    SPEED_DEF           =   8,    /* the "1.0x" reference speed                  */
     SPEED_MAX           =  64,
 
-    /* HUD */
-    HUD_COLS            =  80,    /* status-line buffer width (chars)          */
-    FPS_UPDATE_MS       = 500,    /* fps readout refresh period                */
+    HUD_COLS            =  80,    /* width of the status-line text buffer        */
+    FPS_UPDATE_MS       = 500,    /* how often the fps number on screen refreshes */
 
-    /* ncurses colour-pair IDs. PAIR_HUD/PAIR_HINT reserved per /CLAUDE.md;
-     * PAIR_RAMP_BASE..+7 are the 8 theme-ramp tints (Theme.ramp). */
+    /* ncurses colour-pair slots. HUD/HINT are fixed per CLAUDE.md;
+     * RAMP_BASE..+7 hold the 8 cloud-density tints of the active theme. */
     PAIR_HUD            =   1,
     PAIR_HINT           =   2,
-    PAIR_RAMP_BASE      =   3,    /* +0..+7 = 8 cloud-density tints            */
-    PAIR_HOT            =  11,    /* lightning bolt accent (Theme.hot)         */
+    PAIR_RAMP_BASE      =   3,    /* +0..+7 = the 8 density tints                */
+    PAIR_HOT            =  11,    /* the lightning-bolt colour                   */
 };
 
 #define NS_PER_SEC      1000000000LL
 #define NS_PER_MS          1000000LL
 #define TICK_NS(f)      (NS_PER_SEC / (f))
-#define RENDER_FPS_CAP       60        /* outer frame-rate cap (Hz), separate from sim tick */
-#define MAX_FRAME_DT_MS     100        /* clamp a frame's dt to dodge spiral-of-death (ms)  */
+#define RENDER_FPS_CAP       60        /* how many frames we draw per second        */
+#define MAX_FRAME_DT_MS     100        /* if a frame stalls longer than this, pretend
+                                        * it was only this long, so the sim doesn't
+                                        * try to catch up in a runaway burst        */
 
-/* Wind — base velocities at SPEED_DEF. The user's speed knob scales
- * these linearly. */
-#define WIND_X_BASE          6.0f      /* cells / sec */
-#define WIND_Y_BASE          0.4f
-#define WARP_DRIFT_BASE      0.05f     /* warp-noise time evolution */
+/* Wind speed at the default knob setting; the user's knob scales these. */
+#define WIND_X_BASE          6.0f      /* cells per second, sideways  */
+#define WIND_Y_BASE          0.4f      /* a slow vertical drift too    */
+#define WARP_DRIFT_BASE      0.05f     /* how fast the swirl pattern churns */
 
-/* fBm octaves + spatial scale of the domain-WARP pre-pass (the per-preset
- * cloud octave count lives in the preset table). */
+/* The swirl ("domain warp") pre-pass uses its own, coarser noise. The clouds'
+ * own detail level lives per-preset in the table below. */
 #define OCT_WARP             2
 #define WARP_SCALE           0.012f
 
-/* Storm lightning — presets with `lightning` fire a sparse hash-gated '/'
- * bolt at their brightest cells (level 4 cores). 1-in-MOD cells strike. */
+/* Storm lightning: a few cells flash '/' at the brightest cloud cores.
+ * Only 1 in MOD cells strikes, so bolts stay sparse. */
 #define LIGHTNING_HASH_MOD   1500u
-#define LIGHTNING_HZ         30.0f    /* bolt pattern regenerates this often (Hz) */
+#define LIGHTNING_HZ         30.0f    /* how often the bolt pattern reshuffles (Hz) */
 
-/* Noise seed used at startup and as the salt for the 'r' reseed. */
+/* Seed for the noise, also the starting point for the 'r' reseed. */
 #define BASE_SEED            0xC0FFEE
 
 /*
- * CloudPreset — one cloud "look", encoded as PURE DATA: how to sample the fBm
- * density field and how to ink the result.
+ * CloudPreset — one cloud "look" stored as plain numbers, not code.
  *
- * WHY a struct: the morphology of a real cloud — puffy cumulus vs streaky
- * cirrus vs flat stratus — is NOT separate code here; it is captured entirely
- * by this row of numbers. So all 15 presets share one sampler (cloud_density,
- * §3) and one renderer (render_clouds, §5), and a new sky costs one line.
- * INTENT: keep the inner loops preset-agnostic — they take a single const
- * CloudPreset* and never branch on which sky is active.
+ * The whole point: a cumulus puff and a cirrus streak differ only in HOW you
+ * sample and shade the same noise, not in separate code paths. So every preset
+ * is one row here, and all 15 share one sampler (cloud_density) and one
+ * renderer (render_clouds). Adding a new sky costs one line. The inner loops
+ * never ask "which cloud is this?" — they just read the row they're handed.
  *
- * This "cloud TYPE = the SHAPE of the noise sampling" idea is the core lesson:
- *   • Schneider & Vos (2015) — cloud genera modelled from layered noise.
- *   • Musgrave, in Ebert et al. "Texturing & Modeling" — fBm AS a density
- *     field, and how octaves / lacunarity tune its look.
- *   • Quílez — "fBm" and "Domain warping" (the octaves and warp_amt knobs).
+ * That "cloud type = the shape of the noise sampling" idea comes from
+ * Schneider & Vos (2015) and Quílez's fBm / domain-warping articles.
  */
 typedef struct {
-    const char *name;        /* HUD label; the WMO genus this row imitates    */
+    const char *name;        /* shown in the HUD; the real cloud genus it mimics */
 
-    /* --- sampling SHAPE — consumed by cloud_density (§3) ----------------- */
-    float scale_x, scale_y;  /* noise frequency per axis (cycles per cell).
-                              * scale_y > scale_x squashes features in y so they
-                              * read as horizontal wisps/bands; scale_y ≈ 2·scale_x
-                              * cancels the terminal's 2:1 cell aspect → round.  */
-    int   octaves;           /* fBm octaves summed (2..5). More = finer detail,
-                              * but the normalised sum also clusters nearer 0.5. */
-    float warp_amt;          /* domain-warp strength, in cells (0 = clean blobs;
-                              * 3–6 = swirly / turbulent). Offsets the sample
-                              * coords by a second fBm — Quílez, "Domain warping". */
-    float wind_mult;         /* this preset's share of the global wind drift
-                              * (multiplies Drift.wind_x) → parallax per preset. */
+    /* --- shape: how to sample the noise (used by cloud_density) ---------- */
+    float scale_x, scale_y;  /* how zoomed-in the noise is on each axis. Making
+                              * scale_y bigger squashes clouds flat, so they read
+                              * as horizontal streaks or bands; roughly 2x bigger
+                              * just cancels the fact that terminal cells are
+                              * twice as tall as wide, giving round puffs.        */
+    int   octaves;           /* how many noise layers to stack (2..5). More =
+                              * finer, wispier detail.                            */
+    float warp_amt;          /* how much to swirl the sampling. 0 = clean blobs;
+                              * higher = churning, turbulent silhouettes.         */
+    float wind_mult;         /* this preset's slice of the wind, so different
+                              * skies drift at slightly different speeds.         */
 
-    /* --- inking — consumed by density_to_level (§3) + render_clouds (§5) - */
-    float thresholds[4];     /* ascending density cuts mapping d → level 1..4;
-                              * d below thresholds[0] is clear sky. Lower [0] =
-                              * more coverage (FOG ~0.30 overcast, WISPS ~0.60
-                              * sparse). fBm output is ~[0,1], dense around 0.5. */
-    char  glyphs[4];         /* glyph for levels 1..4 (light → dense). ASCII
-                              * only — density is read through glyph weight.     */
-    short ramp[4];           /* theme-ramp slot 0..7 per level (see Theme.ramp);
-                              * higher slot = brighter tint for denser cloud.    */
-    bool  lightning;         /* true → overstrike sparse '/' bolts at level-4
-                              * cores (STORM, ANVIL); see render_clouds (§5).    */
+    /* --- shading: how to ink the result (used by density_to_level / render) */
+    float thresholds[4];     /* the four density cutoffs, rising. Below the first
+                              * is clear sky; the rest split cloud into 4 tiers.
+                              * Lowering the first cutoff covers more of the sky.  */
+    char  glyphs[4];         /* the glyph for each of the four cloud tiers, light
+                              * to dense (ASCII only — weight reads as density).   */
+    short ramp[4];           /* which theme tint (slot 0..7) each tier uses;
+                              * higher slot = brighter, for denser cloud.         */
+    bool  lightning;         /* if true, flash sparse '/' bolts at the densest
+                              * cores (storm, anvil).                             */
 } CloudPreset;
 
 static const CloudPreset presets[] = {
@@ -491,25 +151,21 @@ static const CloudPreset presets[] = {
 #define N_PRESETS ((int)(sizeof presets / sizeof presets[0]))
 
 /*
- * Theme — one named colour palette: an 8-step density gradient plus a lightning
- * accent, stored as xterm-256 colour indices (ANSI 256-colour SGR numbers).
+ * Theme — one named colour palette: an 8-step dim-to-bright gradient plus a
+ * colour for lightning, written as xterm-256 colour numbers.
  *
- * WHY a struct / INTENT: it decouples "how dense is this cell" (the LEVEL, via
- * CloudPreset.ramp) from "what colour is it" (the theme), so any preset reads
- * correctly under any palette. 't'/'T' swap the whole palette live by re-running
- * theme_apply (§5) over these indices — the field itself never changes.
- * CONTEXT: every entry is kept in the BRIGHT half of the cube so even A_DIM
- * cells stay legible on a black terminal — see "Theme Palette Brightness" in
- * /CLAUDE.md. Same 10-name menu as the other procedural showcases.
+ * Keeping colour separate from cloud thickness means any preset looks right
+ * under any palette: a preset says "tier 3," the theme says what tint that is.
+ * t/T swap the whole palette live without touching the clouds. Every colour
+ * sits in the bright half of the range so even dim cells stay readable on a
+ * black terminal (see "Theme Palette Brightness" in CLAUDE.md).
  */
 typedef struct {
-    const char *name;    /* HUD label                                         */
-    short       ramp[8]; /* density gradient dim→bright (xterm-256 indices).
-                          * Cloud levels map only into slots 3..7, so the four
-                          * drawn tiers occupy the upper, well-separated half
-                          * and never collapse toward clear-sky colour.        */
-    short       hot;     /* accent for storm lightning — '/' bolts, PAIR_HOT
-                          * (STORM / ANVIL presets).                           */
+    const char *name;    /* shown in the HUD                                  */
+    short       ramp[8]; /* the dim-to-bright gradient. Clouds only ever use
+                          * slots 3..7, so the drawn tiers stay in the bright,
+                          * well-spread upper half.                            */
+    short       hot;     /* the colour of the '/' lightning bolts             */
 } Theme;
 
 #define N_THEMES 10
@@ -528,12 +184,8 @@ static const Theme themes[N_THEMES] = {
     { "ARCTIC", { 24,  31,  67, 110, 117, 153, 195, 231 }, 226 },
 };
 
-/* ===================================================================== */
-/* §2  PERFORMANCE — timing primitives for the fixed-timestep loop         */
-/* ===================================================================== */
-/* Pure helpers. The throttle that USES them — the fixed-timestep
- * accumulator + ~60 fps frame cap — lives at the one tick-combine point in
- * main() (§6), not here. */
+/* ── §2 clock — read the time, sleep ────────────────────────────────────── */
+/* Just the two timing helpers; the loop that uses them lives in main(). */
 
 static int64_t clock_ns(void)
 {
@@ -552,16 +204,12 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  LOGIC — pure field math: hash, perlin, fBm, density, level          */
-/* ===================================================================== */
-/* Every function here is a pure read — no mutation, no I/O — so it is
- * provably impossible to corrupt from RENDER: reorder or delete the
- * renderer and these results are unchanged. The one shared datum is perm[]
- * (the noise seed), which LOGIC only READS; its sole writer is
- * SIMULATION's perm_shuffle (§4). */
+/* ── §3 logic — the field math: hash, perlin, fBm, density, level ───────── */
+/* These functions only read; they never change anything, so the renderer
+ * can't corrupt them. The one thing they share is perm[] (the noise table),
+ * which they only read — perm_shuffle in §4 is what fills it. */
 
-/* hash3 — same routine as other showcases. Used by the lightning gate. */
+/* hash3 — turns three ints into a scrambled number; used by the lightning gate. */
 static inline uint32_t hash3(int wx, int wy, int wz)
 {
     uint32_t h = (uint32_t)wx * 73856093u
@@ -575,11 +223,8 @@ static inline uint32_t hash3(int wx, int wy, int wz)
     return h;
 }
 
-/* Perlin scaffold — same as other showcases.
- * perm[] is the noise seed table. LOGIC only READS it (perlin2d below); its
- * sole writer is SIMULATION's perm_shuffle (§4), run on init/reseed events
- * only — never in the tick. So LOGIC's output stays a pure function of
- * (coords, preset, perm[]). */
+/* perm[] is the shuffled lookup table that gives the noise its randomness.
+ * Read here; only perm_shuffle (§4) writes it, and only on startup or 'r'. */
 static uint8_t perm[512];
 
 static inline float fade_q(float t)
@@ -595,35 +240,31 @@ static inline float grad2(int hash, float x, float y)
     return ((h & 1) ? -u : u) + ((h & 2) ? -2.0f * v : 2.0f * v);
 }
 
+/* perlin2d — smooth random value at a point. Find the grid square the point
+ * sits in, take a random direction at each of its four corners, and blend them
+ * with a soft S-curve so neighbouring squares join seamlessly.
+ * (floorf, not a plain int cast, so negative coords round the right way.) */
 static float perlin2d(float x, float y)
 {
-    /* integer lattice cell + fractional position within it */
     int X = (int)floorf(x) & 255;
     int Y = (int)floorf(y) & 255;
-    x -= floorf(x); y -= floorf(y);
+    x -= floorf(x); y -= floorf(y);          /* position inside the square */
 
-    /* fade-weighted blend factors (smoothstep so cell seams vanish) */
-    float u = fade_q(x), v = fade_q(y);
+    float u = fade_q(x), v = fade_q(y);       /* the soft S-curve blend weights */
 
-    /* hash the four corners of the cell via the permutation table */
     int A = perm[X    ] + Y;
     int B = perm[X + 1] + Y;
 
-    /* gradient dot-product contribution from each corner */
-    float n00 = grad2(perm[A    ], x,        y       );
+    float n00 = grad2(perm[A    ], x,        y       );   /* the four corners */
     float n10 = grad2(perm[B    ], x - 1.0f, y       );
     float n01 = grad2(perm[A + 1], x,        y - 1.0f);
     float n11 = grad2(perm[B + 1], x - 1.0f, y - 1.0f);
 
-    /* bilinear blend of the four corners */
     return lerp_f(lerp_f(n00, n10, u), lerp_f(n01, n11, u), v);
 }
 
-/*
- * fbm2_n — fBm with a parameterised octave count. Each octave doubles
- * the frequency and halves the amplitude. Output is normalised to
- * roughly [0, 1].
- */
+/* fbm2_n — stack several noise layers, each finer and fainter than the last,
+ * to get detail at every scale. Returns roughly 0..1, densest around 0.5. */
 static float fbm2_n(float x, float y, int octaves)
 {
     float total = 0.0f, amp = 1.0f, freq = 1.0f, max_amp = 0.0f;
@@ -636,22 +277,13 @@ static float fbm2_n(float x, float y, int octaves)
     return (total / max_amp) * 0.5f + 0.5f;
 }
 
-/* ----------------------------------------------------------------------- *
- * Density sampler — one parameterised function drives all 15 presets.      *
- * ----------------------------------------------------------------------- */
-
 /*
- * cloud_density — sample the preset's fBm density field at cell (x, y).
+ * cloud_density — how thick is this preset's cloud at cell (x, y)?
  *
- * Two steps, both driven by the preset row:
- *   (1) DOMAIN WARP (only if warp_amt > 0). Two cheap fBm samples build an
- *       offset vector (qx, qy) that distorts the input coords. This breaks the
- *       "perfect blob" look of plain Perlin into swirly, organic silhouettes —
- *       the difference between CIRRUS (warp 0, clean streaks) and STORM /
- *       TURBULENT (high warp, churning).
- *   (2) ANISOTROPIC fBm. The warped, wind-drifted coords are scaled by
- *       scale_x / scale_y before the main fBm call. scale_y > scale_x squashes
- *       features vertically so they read as horizontal wisps or bands.
+ * First, if the preset wants swirl, nudge the sample point around using a
+ * second, coarse noise — this turns clean blobs into churning shapes. Then
+ * stretch the point by the preset's per-axis scales (which flattens clouds
+ * into streaks or bands) and read the main noise there.
  */
 static float cloud_density(const CloudPreset *p, float x, float y,
                            float wind_x, float wind_y, float warp_t)
@@ -668,15 +300,8 @@ static float cloud_density(const CloudPreset *p, float x, float y,
     return fbm2_n(wx * p->scale_x, wy * p->scale_y, p->octaves);
 }
 
-/* ----------------------------------------------------------------------- *
- * Density → level conversion.                                             *
- * ----------------------------------------------------------------------- */
-
-/*
- * density_to_level — bin a density value (in roughly [0, 1]) into one
- * of five levels using the active preset's thresholds. Level 0 is
- * "clear sky"; level 4 is "bright core".
- */
+/* density_to_level — turn a thickness into a tier 0..4 using the preset's
+ * cutoffs. 0 is clear sky (draw nothing); 4 is the bright core. */
 static inline int density_to_level(float d, const CloudPreset *p)
 {
     if (d < p->thresholds[0]) return 0;
@@ -686,23 +311,18 @@ static inline int density_to_level(float d, const CloudPreset *p)
     return 4;
 }
 
-/* ===================================================================== */
-/* §4  SIMULATION — the mutable state and what advances it                 */
-/* ===================================================================== */
-/* Mutates two things: perm[] (the noise seed in §3 — reseeded by
- * perm_shuffle on init / 'r' EVENTS, never in the tick) and the Scene
- * fields (time/wind/warp — advanced once per tick by scene_tick).
- * DELAYS: the `paused` flag short-circuits scene_tick — the only hold. */
+/* ── §4 simulation — the state that changes, and what changes it ────────── */
+/* Two things move: perm[] (the noise table, only on startup or 'r') and the
+ * Scene's drift (wind and time, once per tick). 'paused' freezes the tick. */
 
-/* perm_shuffle — reseed the noise table. The lone writer of perm[] (§3);
- * runs from scene_init and scene_reseed (init / 'r' events), NOT the tick. */
+/* perm_shuffle — refill the noise table with a fresh random shuffle. The only
+ * place perm[] gets written. Called on startup and on 'r', never in the tick. */
 static void perm_shuffle(int seed)
 {
-    /* start from the identity permutation 0..255 */
     uint8_t base[256];
     for (int i = 0; i < 256; i++) base[i] = (uint8_t)i;
 
-    /* Fisher–Yates shuffle, driven by an LCG seeded from `seed` */
+    /* shuffle the 0..255 list into random order, driven by the seed */
     uint32_t st = (uint32_t)seed * 2654435761u;
     for (int i = 255; i > 0; i--) {
         st = st * 1664525u + 1013904223u;
@@ -710,7 +330,8 @@ static void perm_shuffle(int seed)
         uint8_t t = base[i]; base[i] = base[j]; base[j] = t;
     }
 
-    /* mirror into the upper half so perlin2d can index perm[x]+y unwrapped */
+    /* keep a second copy right after the first so perlin2d can index past the
+     * end (perm[x]+y) without ever wrapping around */
     for (int i = 0; i < 256; i++) {
         perm[i      ] = base[i];
         perm[i + 256] = base[i];
@@ -718,55 +339,39 @@ static void perm_shuffle(int seed)
 }
 
 /*
- * Drift — the cloud field's animation state: how far wind has ADVECTED the
- * noise sampling, plus the warp field's own time phase, all accumulated from
- * the master clock.
+ * Drift — how far the sky has slid so far.
  *
- * WHY/CONTEXT: a static noise field is made to move by translating the sample
- * point a little each frame (advection) — the whole sky is f(cell − drift).
- * That is the standard way to animate Perlin/fBm; cf. ../fields/
- * perin_noise_flow_showcase.c and Quílez's noise articles. INTENT: keep this
- * apart from the wind SPEED knob (Scene.speed) — speed is the RATE the user
- * turns; Drift is the accumulated DISPLACEMENT it produces. VALUE LOGIC: all
- * four are monotonic accumulators advanced together once per tick (scene_tick,
- * §4); the renderer reads them, never writes. Floats, so after ~10^7 cells of
- * drift Perlin starts re-binning — fine for a minutes-long showcase.
+ * The noise itself never moves; we make it look like it does by sampling a
+ * little further along each frame. So these are running totals of "how far,"
+ * not speeds (the speed knob is Scene.speed). They only grow, advanced together
+ * each tick; the renderer just reads them. They're floats, so after a very long
+ * run the numbers get coarse — fine for a demo that runs minutes.
  */
 typedef struct {
-    float time_secs;   /* master clock — seconds since start; also seeds the
-                        * 30 Hz lightning flicker bucket in render_clouds.   */
-    float wind_x;      /* accumulated horizontal sample offset, in cells     */
-    float wind_y;      /* accumulated vertical   sample offset, in cells     */
-    float warp_t;      /* domain-warp field's own evolving time offset, so the
-                        * warp churns independently of the bulk wind.        */
+    float time_secs;   /* seconds since start; also drives the lightning flicker */
+    float wind_x;      /* how far the sky has drifted sideways, in cells          */
+    float wind_y;      /* how far it has drifted vertically, in cells             */
+    float warp_t;      /* a separate clock for the swirl, so it churns on its own */
 } Drift;
 
 /*
- * Scene — the whole simulated world, written as a table of contents so a reader
- * can see at a glance WHAT is simulated, HOW the user steers it, and the one
- * RENDER setting that rides along.
- *   WHAT   the drifting cloud field            → drift
- *   HOW    the simulation knobs the user turns → paused / speed / current_preset
- *   RENDER a render-only setting (palette), grouped APART from the sim knobs:
- *          a theme is a RENDER concept that merely happens to share a key, so
- *          it must not be mistaken for something the simulation reads.
- * Only init / tick orchestrators take Scene*; every other function takes the
- * narrowest sub-type (Drift, CloudPreset…) so the layers stay decoupled.
+ * Scene — everything about the running sky in one place: the drift, the knobs
+ * the user turns, and the chosen palette. The theme is grouped apart because it
+ * only affects colour, not the clouds themselves. Most functions take a smaller
+ * piece (just the Drift, just a CloudPreset) so the layers stay independent.
  */
 typedef struct {
-    Drift drift;               /* WHAT — the field's animation; advanced 1×/tick */
-    bool  paused;              /* HOW  — DELAYS: freezes scene_tick when true    */
-    int   speed;               /* HOW  — wind speed, SPEED_MIN..MAX (1..64),
-                                *        def 8; scales the per-tick drift step.   */
-    int   current_preset;      /* HOW  — active sky, index 0..N_PRESETS-1 of presets[] */
-    int   current_theme;       /* RENDER — active palette, index 0..N_THEMES-1 of themes[] */
+    Drift drift;               /* the moving sky; advanced once per tick         */
+    bool  paused;              /* true freezes the drift                         */
+    int   speed;               /* wind speed knob, 1..64 (default 8)             */
+    int   current_preset;      /* which sky is showing (index into presets[])    */
+    int   current_theme;       /* which palette is active (index into themes[])  */
 } Scene;
 
-/* scene_reseed — reads the scene (its drift) to derive a seed, reshuffles the
- * noise table. Mutates only the global perm[], not the scene → const Scene*. */
+/* scene_reseed — pick a new random sky from the current moment, so each 'r'
+ * gives a different layout. Only touches the noise table, not the scene. */
 static void scene_reseed(const Scene *s)
 {
-    /* salt the base seed with the current drift so each 'r' gives a new sky */
     int seed = (int)hash3((int)(s->drift.time_secs * 1000.0f),
                           (int)(s->drift.wind_x * 100.0f), BASE_SEED);
     perm_shuffle(seed);
@@ -782,10 +387,8 @@ static void scene_init(Scene *s)
     perm_shuffle(BASE_SEED);
 }
 
-/*
- * scene_tick — advance the drift. No regen; clouds drift forever.
- * The user can press 'r' to reseed the perm table for a new layout.
- */
+/* scene_tick — nudge the sky forward by one step. Clouds drift forever; the
+ * only way to get a new layout is 'r'. */
 static void scene_tick(Scene *s, float dt)
 {
     s->drift.time_secs += dt;
@@ -797,18 +400,12 @@ static void scene_tick(Scene *s, float dt)
     s->drift.warp_t += WARP_DRIFT_BASE * speed_mul * dt;
 }
 
-/* ===================================================================== */
-/* §5  RENDER — state → screen; reads only, never mutates sim state         */
-/* ===================================================================== */
-/* All ncurses I/O. Reads Scene + presets[]/themes[] and paints; the only
- * state it writes is terminal/ncurses internals (colour pairs, Screen
- * dimensions), never the simulation. EFFECTS: none stored — STORM / ANVIL
- * lightning is DERIVED here at draw time in render_clouds (a level-4 core
- * that passes a hash gate becomes a '/'), not kept as state. */
+/* ── §5 render — paint the scene onto the screen ────────────────────────── */
+/* All the ncurses drawing lives here. It reads the scene and paints; it never
+ * changes the simulation. Lightning isn't stored anywhere — it's decided here,
+ * at draw time, for cells that land on a bright core. */
 
-/* --- colour: HUD pairs + theme ramp → ncurses colour pairs -------------- */
-
-/* bind one palette into ncurses pairs: the 8 ramp tints + the lightning accent */
+/* set_palette_pairs — load one palette into ncurses: 8 tints + the bolt colour. */
 static void set_palette_pairs(const short ramp[8], short hot)
 {
     for (int i = 0; i < 8; i++)
@@ -823,7 +420,8 @@ static void theme_apply(int idx)
         const Theme *t = &themes[idx];
         set_palette_pairs(t->ramp, t->hot);
     } else {
-        /* 8-colour terminals: a fixed cool→bright fallback ramp */
+        /* old 8-colour terminals can't do the palette, so fall back to a
+         * fixed cool-to-bright ramp */
         static const short fb[8] = {
             COLOR_BLUE, COLOR_BLUE,  COLOR_CYAN,   COLOR_CYAN,
             COLOR_WHITE,COLOR_WHITE, COLOR_YELLOW, COLOR_WHITE,
@@ -846,14 +444,10 @@ static void color_init(void)
     theme_apply(0);
 }
 
-/* --- terminal lifecycle + per-cell painting ----------------------------- */
-
-/* Screen — the terminal viewport the field is painted into. WHY a type: it is
- * the bounds every render reader needs, so passing one const Screen* keeps the
- * 240×80-or-whatever size out of globals and current after a resize. Refreshed
- * from getmaxyx in screen_init / screen_resize (§5). */
+/* Screen — the current terminal size. Passing this around (instead of a global)
+ * keeps the width/height correct after a resize. Refreshed from getmaxyx. */
 typedef struct {
-    int cols, rows;   /* viewport width / height in character cells, ≥ 0 */
+    int cols, rows;   /* width / height in character cells */
 } Screen;
 
 static void screen_init(Screen *s)
@@ -876,9 +470,7 @@ static void screen_resize(Screen *s)
     getmaxyx(stdscr, s->rows, s->cols);
 }
 
-/*
- * draw_cell — common path. Pick attr from level (DIM/NORMAL/BOLD).
- */
+/* draw_cell — put one glyph on screen, brightening it for denser tiers. */
 static inline void draw_cell(int sy, int sx, char glyph, int pair, int level)
 {
     int attr;
@@ -891,12 +483,8 @@ static inline void draw_cell(int sy, int sx, char glyph, int pair, int level)
     attroff(COLOR_PAIR(pair) | attr);
 }
 
-/* ----------------------------------------------------------------------- *
- * Cloud renderer — one loop drives all 15 presets.                         *
- * ----------------------------------------------------------------------- */
-
-/* lightning_strikes — is this dense core hit by a bolt on frame-bucket `t`?
- * Only level-4 cores of a lightning preset, then a sparse 1-in-MOD hash gate. */
+/* lightning_strikes — does a bolt flash at this cell right now? Only at the
+ * brightest cores of a storm preset, and only 1 cell in MOD, so it stays rare. */
 static inline bool lightning_strikes(const CloudPreset *p, int level,
                                      int sx, int sy, int t)
 {
@@ -904,15 +492,12 @@ static inline bool lightning_strikes(const CloudPreset *p, int level,
            (hash3(sx, sy, t) % LIGHTNING_HASH_MOD) == 0u;
 }
 
-/*
- * render_clouds — for every sky cell: sample the active preset's density,
- * bin it to a level, and ink the matching glyph + ramp tint. Presets with
- * `lightning` overstrike a sparse '/' bolt (PAIR_HOT) at their level-4 cores.
- */
+/* render_clouds — for every cell of sky, work out how thick the cloud is,
+ * pick the matching glyph and tint, and draw it; storms add the odd bolt. */
 static void render_clouds(const Screen *sc, const Drift *drift,
                           const CloudPreset *p)
 {
-    int top = 2, bottom = sc->rows - 1;          /* skip the 2 HUD rows + hint row */
+    int top = 2, bottom = sc->rows - 1;          /* leave the HUD rows alone */
     int strike_bucket = (int)(drift->time_secs * LIGHTNING_HZ);
 
     for (int sy = top; sy < bottom; sy++) {
@@ -939,7 +524,7 @@ static void scene_draw(const Screen *sc, const Scene *s)
     render_clouds(sc, &s->drift, &presets[s->current_preset]);
 }
 
-/* Row 0 right — fps / tick-rate / run-state / wind-speed, right-justified. */
+/* top-right status: fps, tick rate, paused/drifting, wind speed. */
 static void hud_status_line(const Screen *sc, const Scene *s,
                             double fps, int sim_fps)
 {
@@ -954,7 +539,7 @@ static void hud_status_line(const Screen *sc, const Scene *s,
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-/* Row 0 left — title + preset counter (i/N) and name. */
+/* top-left: the title plus which preset is showing (e.g. 3/15 STRATUS). */
 static void hud_title(const Scene *s)
 {
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
@@ -964,7 +549,7 @@ static void hud_title(const Scene *s)
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-/* Row 1 — theme name, a live ramp swatch in the active palette, and the drift. */
+/* second row: theme name, a little swatch of the palette, and the drift so far. */
 static void hud_param_line(const Scene *s)
 {
     int x = 1;
@@ -993,7 +578,7 @@ static void hud_param_line(const Scene *s)
     attroff(COLOR_PAIR(PAIR_HUD));
 }
 
-/* Bottom row — the interactive key legend. */
+/* bottom row: the list of keys you can press. */
 static void hud_key_hints(const Screen *sc)
 {
     attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
@@ -1015,30 +600,23 @@ static void screen_draw(const Screen *sc, const Scene *s,
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
-/* ===================================================================== */
-/* §6  APP — events + the one per-tick combine point                       */
-/* ===================================================================== */
-/* main() is the SINGLE place that advances simulation state. User events
- * (resize, keys) also mutate state — app_do_resize, app_handle_key — but
- * they are NOT the tick: they fire on input, outside the fixed-timestep
- * loop, and never call scene_tick. */
+/* ── §6 app — keys, resize, and the main loop ───────────────────────────── */
+/* main() is the one place the sky actually advances. Keys and resizes also
+ * change state, but they happen on input, outside the timed loop. */
 
 /*
- * App — the running program: the simulated world plus the runtime that drives
- * it. WHY a type: main() owns exactly one (g_app) so the signal handlers can
- * reach the run-state flags; everything else is reached through it. It is the
- * top of the containment tree (App ▸ Scene ▸ Drift), not a behaviour layer.
+ * App — the whole running program: the sky plus the bookkeeping that drives it.
+ * There's exactly one (g_app) so the signal handlers can reach the run flags;
+ * everything else is reached through it.
  */
 typedef struct {
-    Scene                 scene;       /* the simulated world (§4)             */
-    Screen                screen;      /* the viewport it is painted into (§5) */
-    int                   sim_fps;     /* PERFORMANCE: tick rate, SIM_FPS_MIN..MAX
-                                        * (10..240); sets the fixed timestep.  */
-    volatile sig_atomic_t running;     /* main loop runs while non-zero; cleared
-                                        * by SIGINT/SIGTERM or 'q'.            */
-    volatile sig_atomic_t need_resize; /* set by SIGWINCH, consumed next frame;
-                                        * sig_atomic_t + volatile = safe to
-                                        * write from a signal handler.         */
+    Scene                 scene;       /* the simulated sky                    */
+    Screen                screen;      /* the terminal it's drawn into         */
+    int                   sim_fps;     /* tick rate, 10..240                   */
+    volatile sig_atomic_t running;     /* loop runs while non-zero; 'q' or a
+                                        * kill signal clears it                */
+    volatile sig_atomic_t need_resize; /* a signal handler sets this; volatile +
+                                        * sig_atomic_t makes that safe          */
 } App;
 
 static App g_app;
@@ -1053,7 +631,7 @@ static void app_do_resize(App *app)
     app->need_resize = 0;
 }
 
-/* cycle an index forward / backward through [0, n) with wraparound */
+/* step an index forward / backward, wrapping around the ends */
 static inline int wrap_inc(int i, int n) { return (i + 1)     % n; }
 static inline int wrap_dec(int i, int n) { return (i + n - 1) % n; }
 
@@ -1100,8 +678,8 @@ static bool app_handle_key(App *app, int ch)
     return true;
 }
 
-/* app_init — wire up signals/cleanup, set run-state, bring up the terminal
- * and the scene. Everything needed before the first frame; not the tick. */
+/* app_init — set everything up before the first frame: signals, the terminal,
+ * and a fresh scene. */
 static void app_init(App *app)
 {
     srand((unsigned int)(clock_ns() & 0xFFFFFFFF));

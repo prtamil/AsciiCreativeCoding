@@ -1,165 +1,48 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 01_hex_direct.c — cursor-based direct object placement on a flat-top hex grid
+ * 01_hex_direct.c — move a cursor around a hex grid and drop objects on it.
  *
- * DEMO: A flat-top hexagonal grid fills the screen. Navigate '@' between
- *       hexagons with arrow keys. Press SPACE to toggle a '*' object at the
- *       cursor hex. Objects are stored by axial address (q, r) and survive
- *       resizes — they follow their hex when the terminal changes size.
+ * A grid of flat-topped hexagons fills the screen. Arrow keys move the '@'
+ * cursor from hex to hex; SPACE drops or removes a '*' on the current hex.
+ * Each object remembers which hex it's on (not where on screen), so resizing
+ * the terminal keeps it stuck to the same hex.
  *
- * Study alongside: grids/hex_grids/01_flat_top.c (background rasterizer),
- *                  grids/rect_grids_placement/01_direct.c (same idea on rect)
- *
- * Section map:
- *   §1  config   — all tunable constants
- *   §2  clock    — monotonic timer + sleep
- *   §3  color    — color pairs: grid, cursor, object, HUD, hint
- *   §4  gridctx  — GridCtx struct + ctx_init / ctx_to_screen / ctx_draw_bg
- *                  (also cube_round, hex_dist, angle_char helpers)
- *   §5  pool     — Pool: object array, toggle, clear, draw
- *   §6  cursor   — Cursor struct + axial movement table, cursor_draw
- *   §7  scene    — hud_draw + scene_draw
- *   §8  screen   — ncurses init / cleanup
- *   §9  app      — signals, main loop
- *
- * Keys:  arrows:move  spc:toggle  C:clear  r:reset  +/-:size  q/ESC:quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/hex_grids_placement/01_hex_direct.c \
- *       -o 01_hex_direct -lncurses -lm
+ * Sister files: grids/hex_grids/01_flat_top.c (the grid drawing on its own),
+ *               grids/rect_grids_placement/01_direct.c (same idea, square grid).
+ * Hex coordinate math: https://www.redblobgames.com/grids/hexagons/
  */
 
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
+/*
+ * THE BIG PICTURE
  *
- * Algorithm      : Flat-top hex cursor placement.  A cursor (cur.q, cur.r) in
- *                  axial coordinates moves with arrow keys.  SPACE toggles an
- *                  object record (q, r, glyph) in a flat Pool array.  Each frame:
- *                  ctx_draw_bg rasterizes the background per-pixel using the
- *                  inverse matrix; pool_draw projects each stored (q, r) back
- *                  to screen via the forward matrix.
+ * There are two ways of saying "where" in this program, and we constantly
+ * translate between them:
  *
- * Data-structure : Pool — flat array of Obj{q, r, glyph}.  Removal swaps
- *                  the dead slot with the last item (O(1)).  Capacity MAX_OBJ
- *                  greatly exceeds the visible hex count on any terminal.
+ *   - Hex address (q, r): which hexagon. The cursor and every dropped object
+ *     are stored this way. The centre hex is (0, 0). This doesn't change when
+ *     the window resizes.
  *
- * GridContext    : GridCtx carries the hex-specific geometry (hex_size,
- *                  border_w, screen origin ox/oy, terminal extent rows/cols).
- *                  The same struct shape is shared with rect/tri/polar
- *                  placement files; only the fields differ.
+ *   - Screen position (row, col): which character cell ncurses draws into.
  *
- * Rendering      : Three-pass: (1) ctx_draw_bg rasterizes hex borders per
- *                  pixel, (2) pool_draw renders each placed object at its hex
- *                  centre, (3) cursor_draw places '@' at cursor hex centre.
- *                  The cursor draws over objects so the player always sees
- *                  their position.
+ * Going from a hex to a screen cell is the "forward" direction: plug (q, r)
+ * into a formula and out comes the centre of that hex on screen. Going the
+ * other way — from a screen cell back to which hex covers it — is the
+ * "inverse" direction, and it's how we paint the grid lines: we ask every cell
+ * "which hex are you part of, and are you near its edge?".
  *
- * Performance    : ctx_draw_bg is O(rows × cols) per frame — the dominant cost.
- *                  pool_draw is O(MAX_OBJ).  No dynamic allocation after init.
+ * Handy mental image: each hex is a town with a name (q, r). We never write
+ * down where a town sits on screen — we work it out from the name whenever we
+ * need it. A dropped object is a sticky note pinned to a town's name, so it
+ * always reappears wherever that town currently is.
  *
- * References     :
- *   Red Blob Games hex guide  — https://www.redblobgames.com/grids/hexagons/
- *   Cube coordinates          — https://www.redblobgames.com/grids/hexagons/#coordinates-cube
- *   Object pool pattern       — gameprogrammingpatterns.com/object-pool.html
+ * The trickiest bit is the inverse step. Turning a screen cell into a hex name
+ * first gives fractional, in-between numbers; cube_round() snaps them to the
+ * nearest real hex. See cube_round() for why that needs a fix-up step.
  *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Two independent coordinate systems are always in play:
- *
- *   HEX space   — axial (q, r) integers.  The cursor and placed objects live
- *                 here.  Hex (0, 0) is the screen centre.  Distances between
- *                 hexes are hex_dist — independent of terminal size.
- *
- *   SCREEN space — (row, col) characters.  ncurses lives here.  The background
- *                  rasterizer visits every (row, col), converts to pixel,
- *                  applies the inverse matrix → (q, r), and draws a border
- *                  character if that pixel is near a hex edge.
- *
- * Placed objects know ONLY their (q, r) address.  To render them, apply the
- * forward matrix (hex centre → pixel) then divide by (CELL_W, CELL_H) to get
- * the screen cell.  This is the same formula cursor_draw uses for '@'.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Think of each hex as a named city.  Its name is (q, r).  Its pixel location
- * (cx, cy) is computed on demand from the forward matrix — it is never stored.
- * The background map (ctx_draw_bg) redraws each frame by asking every pixel
- * "which city owns you?" via the inverse matrix.  Placed objects are sticky
- * notes attached to a city name; they rerender at that city's pixel location.
- *
- * DRAWING METHOD  (forward matrix — hex → screen)
- * ──────────────────────────────────────────────
- *  Given hex (q, r) and radius parameter size:
- *
- *  1. Flat-top forward matrix (hex → pixel centre):
- *       cx = size × 3/2 × q
- *       cy = size × (√3/2 × q  +  √3 × r)
- *
- *  2. Terminal cell (centering offset ox = cols/2, oy = (rows-1)/2):
- *       col = ox + round(cx / CELL_W)
- *       row = oy + round(cy / CELL_H)
- *     cursor_draw uses truncation (int)(cx/CELL_W) to stay in interior.
- *
- *  3. Draw glyph at (row, col) if within visible bounds.
- *
- * KEY FORMULAS
- * ────────────
- *  Forward (hex → pixel centre):
- *    cx = size × 3/2 × q
- *    cy = size × (√3/2 × q  +  √3 × r)
- *
- *  Inverse (pixel → fractional cube):
- *    fq = (2/3 × px) / size
- *    fr = (−1/3 × px  +  √3/3 × py) / size
- *    fs = −fq − fr
- *
- *  cube_round (fractional cube → nearest integer hex):
- *    Round all three; fix the component with the LARGEST rounding error:
- *      if dq = max: q = −rr − rs
- *      if dr = max: r = −rq − rs
- *      otherwise:   q = rq, r = rr  (s = −q − r implicit)
- *
- *  hex_dist (axial distance between two hexes A and B):
- *    d = (|dq| + |dr| + |dq + dr|) / 2
- *    where dq = q_B − q_A, dr = r_B − r_A
- *
- *  Cube distance (border detection in ctx_draw_bg):
- *    dist = max(|fq − q|, |fr − r|, |fs − s|)
- *    border if dist ≥ 0.5 − border_w
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • cube_round: never skip the "fix largest error" step. Rounding fq, fr, fs
- *    independently breaks q+r+s=0. The fix step restores the constraint.
- *
- *  • pool_draw uses round() (not truncation). Objects must centre in their hex,
- *    not drift to the interior like '@'. One pixel of difference matters.
- *
- *  • CELL_H / CELL_W = 4/2 = 2. Terminal chars are ~2× taller than wide.
- *    Without this ratio, hexes appear squashed vertically on screen.
- *
- *  • Resize: ox/oy recompute from current rows/cols each frame. cur.q/cur.r and
- *    Pool (q, r) values stay valid — they live in hex space, not screen space.
- *
- * HOW TO VERIFY  (80×24 terminal, HEX_SIZE=14, CELL_W=2, CELL_H=4)
- * ─────────────
- *  Screen centre: ox=40, oy=11.
- *
- *  Cursor at (q=0, r=0):
- *    cx = 0, cy = 0 → col=40, row=11 → '@' at (11,40). ✓
- *
- *  Place object at (q=1, r=0):
- *    cx = 14×1.5×1 = 21,  cy = 14×(√3/2×1 + 0) ≈ 12.12
- *    col = 40 + round(21/2) = 50,  row = 11 + round(12.12/4) = 14
- *    → '*' at (14, 50). ✓
- *
- *  Move cursor RIGHT: cur.q += +1 → (q=1, r=0) → '@' at (14, 50).
- *  Draws over '*' — cursor always visible on top. ✓
- *
- * ─────────────────────────────────────────────────────────────────────── */
+ * Aspect note: terminal characters are about twice as tall as they are wide,
+ * so CELL_W=2 / CELL_H=4 squash the math the right amount to make hexes look
+ * round on screen instead of stretched.
+ */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -174,35 +57,32 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
-/* Aspect correction: terminal chars are ~2× taller than wide.
- * CELL_W=2, CELL_H=4 → 2:1 ratio so hexes appear circular, not oval. */
+/* Terminal characters are taller than they are wide, so we treat each cell as
+ * 2 wide by 4 tall sub-units. That 1:2 shape keeps hexes looking round. */
 #define CELL_W              2
 #define CELL_H              4
 
-#define HEX_SIZE_DEFAULT   14.0   /* hex radius in pixels (sub-cell units) */
+#define HEX_SIZE_DEFAULT   14.0   /* how big each hex is; bigger = fewer on screen */
 #define HEX_SIZE_MIN        6.0
 #define HEX_SIZE_MAX       40.0
 #define HEX_SIZE_STEP       2.0
 
-/* Border width as a fraction of cube distance [0..0.5].
- * 0.10 ≈ 1–2 terminal cells of border visible inside each hex. */
+/* How thick the hex outlines are. 0 = no border, 0.5 = solid hexes.
+ * 0.10 leaves a thin outline with open space inside each hex. */
 #define BORDER_W_DEFAULT    0.10
 #define BORDER_W_MIN        0.03
 #define BORDER_W_MAX        0.35
 
-#define MAX_OBJ            256   /* max placed objects; far more than visible */
-#define FRAME_NS    16666667LL   /* ~60 fps                                   */
+#define MAX_OBJ            256   /* room for far more objects than fit on screen */
+#define FRAME_NS    16666667LL   /* one frame at ~60 fps, in nanoseconds */
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How much the on-screen fps number leans on its old value vs. the latest
+ * frame. Small = smooth and slow to react, so the readout doesn't jitter. */
 #define FPS_EWMA_ALPHA      0.05
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -218,15 +98,13 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&ts, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
-#define PAIR_GRID    1   /* dim hex border lines        */
-#define PAIR_CURSOR  2   /* cursor hex + '@' character  */
-#define PAIR_OBJ     3   /* placed object glyphs        */
-#define PAIR_HUD     4   /* status bar (yellow)         */
-#define PAIR_HINT    5   /* key hint footer (cyan)      */
+#define PAIR_GRID    1   /* the hex outlines            */
+#define PAIR_CURSOR  2   /* the hex you're on + the '@' */
+#define PAIR_OBJ     3   /* dropped '*' objects         */
+#define PAIR_HUD     4   /* status bar, top-right        */
+#define PAIR_HINT    5   /* key hints, bottom row        */
 
 static void color_init(void)
 {
@@ -239,39 +117,30 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,    -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx — GridCtx + cube_round, hex_to_screen, hex_dist, angle_char */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx ── */
 
 /*
- * GridCtx — geometry of the active hex grid.
+ * GridCtx — everything the drawing code needs to know about the current grid:
+ * how big the window is, how big the hexes are, and where the centre sits.
+ * We pass this around instead of using globals so the same helpers could draw
+ * any grid (the sister rect/tri/polar files reuse the same idea).
  *
- * Hex-specific fields:
- *   hex_size  — hex radius in pixel sub-units (governs apparent cell size)
- *   border_w  — border thickness in fractional cube distance
- *   ox, oy    — screen origin (screen position of axial (0, 0))
- *
- * Same struct shape as the rect/tri/polar placement files; only the fields
- * differ.  Carrying these as fields (not globals) lets ctx_to_screen() work
- * for any GridCtx — the abstraction shared with the rest of the series.
+ *   rows, cols  — size of the terminal in character cells.
+ *   hex_size    — how big each hexagon is, in sub-cell units (see CELL_W/H).
+ *   border_w    — how thick the hex outlines are, 0..0.5 (see BORDER_W_*).
+ *   ox, oy      — where hex (0, 0) lands on screen. Recomputed on every resize
+ *                 so the grid stays centred.
  */
 typedef struct {
-    /* terminal extent */
-    int    rows, cols;
-
-    /* hex geometry */
-    double hex_size;
-    double border_w;
-
-    /* screen origin (screen pos of axial 0,0) */
-    int    ox, oy;
+    int    rows, cols;        /* terminal size, in character cells */
+    double hex_size;          /* hex size, in sub-cell units */
+    double border_w;          /* outline thickness, 0..0.5 */
+    int    ox, oy;            /* screen cell that hex (0, 0) sits on */
 } GridCtx;
 
 /*
- * ctx_init — derive geometry from terminal size and current hex parameters.
- *
- * ox/oy place axial (0,0) at the screen centre.  oy uses (rows-1)/2 to leave
- * the bottom row free for the HUD hint.
+ * Centre the grid in the current window. The bottom row is left out of the
+ * vertical centring so the key-hint line at the bottom doesn't overlap a hex.
  */
 static void ctx_init(GridCtx *g, int rows, int cols,
                       double hex_size, double border_w)
@@ -284,19 +153,13 @@ static void ctx_init(GridCtx *g, int rows, int cols,
 }
 
 /*
- * cube_round — nearest integer hex to fractional cube position (fq, fr, fs).
+ * Snap an in-between hex position to the nearest real hex.
  *
- * THE FORMULA:
- *   Round all three axes independently: rq=round(fq), rr=round(fr), rs=round(fs).
- *   Rounding can break q+r+s=0, so fix the component with the LARGEST error:
- *     dq=|rq-fq|, dr=|rr-fr|, ds=|rs-fs|
- *     if dq is max: q = -rr - rs   (recomputed to restore constraint)
- *     if dr is max: r = -rq - rs
- *     else:         q = rq, r = rr  (s = -q-r, implicit)
- *
- * WHY fix the largest-error component: it was rounded the most aggressively,
- * so reassigning it from the constraint loses the least accuracy in the other
- * two axes (which were rounded more conservatively).
+ * Hex math uses three numbers (fq, fr, fs) that must always add up to zero.
+ * Rounding each to the nearest whole number can break that, so we round all
+ * three, then re-derive whichever one we trusted least — the one that moved
+ * furthest when we rounded it. Fixing the worst-off number keeps the two we
+ * rounded more cleanly intact. (Red Blob Games, hex rounding.)
  */
 static void cube_round(double fq, double fr, double fs, int *q, int *r)
 {
@@ -310,20 +173,12 @@ static void cube_round(double fq, double fr, double fs, int *q, int *r)
 }
 
 /*
- * ctx_to_screen — project hex (q, r) to terminal (col, row).
+ * Work out which screen cell sits at the centre of hex (q, r).
  *
- * THE FORMULA (flat-top forward matrix + aspect correction):
- *
- *   Pixel centre of hex (q, r):
- *     cx = size × 3/2 × q
- *     cy = size × (√3/2 × q  +  √3 × r)
- *
- *   Terminal cell (centering offset ox, oy):
- *     col = ox + round(cx / CELL_W)
- *     row = oy + round(cy / CELL_H)
- *
- * round() (not truncation) keeps object glyphs centred in their hex interior.
- * cursor_draw uses truncation to guarantee '@' stays inside the border ring.
+ * This is the "forward" direction: hex name in, screen position out. We round
+ * to the nearest cell so a dropped object lands smack in the middle of its
+ * hex. (cursor_draw deliberately rounds the other way to keep '@' off the
+ * outline.) Standard flat-top hex layout from the Red Blob Games guide.
  */
 static void ctx_to_screen(const GridCtx *g, int q, int r, int *col, int *row)
 {
@@ -335,13 +190,11 @@ static void ctx_to_screen(const GridCtx *g, int q, int r, int *col, int *row)
 }
 
 /*
- * angle_char — map a tangent angle to the best-fit ASCII line character.
+ * Pick the ASCII character that best matches the slope of a line.
  *
- * THE FORMULA:
- *   Input theta = atan2(py-cy, px-cx) + π/2  (radial → tangent direction).
- *   Fold into [0, π) — ASCII chars are symmetric under 180° rotation.
- *   Map: [0, π/8) → '-'  [π/8, 3π/8) → '\'  [3π/8, 5π/8) → '|'
- *        [5π/8, 7π/8) → '/'  [7π/8, π) → '-'
+ * Given which way an edge runs, choose from -, \, |, / so the outline looks
+ * like a real hexagon instead of a blob. A line and the same line flipped 180°
+ * look identical, so we only care about the angle within a half-turn.
  */
 static char angle_char(double theta)
 {
@@ -355,26 +208,15 @@ static char angle_char(double theta)
 }
 
 /*
- * ctx_draw_bg — rasterize the flat-top hex background with cursor highlighted.
+ * Draw the whole hex grid, one screen cell at a time.
  *
- * THE PIPELINE (per screen cell):
+ * For each cell we run the "inverse" step: figure out which hex covers it and
+ * how far it is from that hex's centre. Cells near the middle are blank; cells
+ * out near a hex edge get an outline character (angle_char picks which one).
+ * The hex the cursor is on is drawn in the cursor colour so it stands out.
  *
- *   (col, row) → pixel:  px = (col-ox)×CELL_W,  py = (row-oy)×CELL_H
- *      ↓
- *   Inverse matrix → fractional cube:
- *     fq = (2/3 × px) / size
- *     fr = (-px/3 + √3·py/3) / size
- *     fs = -fq - fr
- *      ↓
- *   cube_round → integer hex (q, r)
- *      ↓
- *   Cube distance: dist = max(|fq-q|, |fr-r|, |fs-(-q-r)|)
- *      ├── dist < 0.5-border_w → interior → skip
- *      └── dist ≥ 0.5-border_w → border:
- *            cx = size×1.5×q,  cy = size×(√3/2×q + √3×r)
- *            theta = atan2(py-cy, px-cx)
- *            ch = angle_char(theta + π/2)
- *            color = PAIR_CURSOR if q==cur.q && r==cur.r, else PAIR_GRID
+ * This visits every cell every frame, so it's the most expensive thing here —
+ * but it's what lets the grid follow a resize for free.
  */
 static void ctx_draw_bg(const GridCtx *g, int curq, int curr)
 {
@@ -419,10 +261,17 @@ static void ctx_draw_bg(const GridCtx *g, int curq, int curr)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool — flat object array with O(1) removal                         */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool ── */
 
+/*
+ * Obj — one dropped object: which hex it's on (q, r) and what to draw ('*').
+ * Storing the hex address, not a screen position, is what lets objects stick
+ * to their hex through resizes.
+ *
+ * Pool — the whole collection of dropped objects, kept in a plain array.
+ *   items — the objects, packed into the front of the array.
+ *   count — how many slots in items are actually used. Capped at MAX_OBJ.
+ */
 typedef struct { int q, r; char glyph; } Obj;
 typedef struct { Obj items[MAX_OBJ]; int count; } Pool;
 
@@ -435,17 +284,17 @@ static int pool_find(const Pool *p, int q, int r)
 }
 
 /*
- * pool_toggle — add '*' at (q, r) if absent; remove it if present.
+ * Drop an object on this hex, or pick it back up if one's already there.
  *
- * Removal swaps the target with the last item and decrements count — O(1).
- * This avoids shifting the array but makes the pool unordered.  Draw order
- * doesn't matter for placement (each hex is unique), so this is fine.
+ * To remove an object we just move the last one into its slot — no shuffling
+ * the rest of the array down. That leaves the objects in a jumbled order, but
+ * order never matters here since each hex holds at most one.
  */
 static void pool_toggle(Pool *p, int q, int r)
 {
     int i = pool_find(p, q, r);
     if (i >= 0) {
-        p->items[i] = p->items[--p->count];   /* swap-last remove */
+        p->items[i] = p->items[--p->count];   /* fill the gap with the last one */
         return;
     }
     if (p->count < MAX_OBJ)
@@ -455,10 +304,8 @@ static void pool_toggle(Pool *p, int q, int r)
 static void pool_clear(Pool *p) { p->count = 0; }
 
 /*
- * pool_draw — render all objects using the flat-top forward matrix.
- *
- * THE FORMULA: for each (q, r) in pool → ctx_to_screen → bounds check → draw.
- * Drawing over the grid background is intentional: objects sit ON the grid.
+ * Draw every dropped object. Each one's hex address is turned into a screen
+ * cell and drawn on top of the grid, since objects sit on top of it.
  */
 static void pool_draw(const Pool *p, const GridCtx *g)
 {
@@ -472,37 +319,34 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_OBJ) | A_BOLD);
 }
 
-/* ── end §5 — to understand the cursor placement, read §6 ─────────────── */
-
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  cursor — axial cursor and movement                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 cursor ── */
 
 /*
- * Cursor — just (q, r) in axial hex space.
+ * Cursor — where the player is: just a hex address (q, r).
  *
- * Bounds are unclamped: the hex plane is infinite.  The pool stores objects
- * by (q, r) so they survive resize/movement off-screen.
+ * There's no limit on how far it can go — the grid is conceptually endless, so
+ * the cursor can roam off the visible screen and come back.
  */
 typedef struct { int q, r; } Cursor;
 
 static void cursor_reset(Cursor *cur) { cur->q = 0; cur->r = 0; }
 
 /*
- * HEX_DIR — axial movement deltas for the 4 arrow keys.
+ * HEX_DIR — how each arrow key nudges the cursor's hex address.
  *
- * Flat-top hex: UP/DOWN move along r, LEFT/RIGHT move along q.
- * The 2 diagonal faces (NE = +q−r, SW = −q+r) are not mapped to keys.
+ * On a flat-top grid the four arrows give you up/down (changing r) and
+ * left/right (changing q). A hex actually has six sides, so the two diagonal
+ * neighbours have no key — you reach them by combining moves.
  *
  *             UP: (0, -1)
- *  LEFT: (-1, 0)  ●  RIGHT: (+1, 0)
+ *  LEFT: (-1, 0)  *  RIGHT: (+1, 0)
  *            DOWN: (0, +1)
  */
 static const int HEX_DIR[4][2] = {
-    { 0, -1 },   /* UP    — r decreases */
-    { 0, +1 },   /* DOWN  — r increases */
-    {-1,  0 },   /* LEFT  — q decreases */
-    {+1,  0 },   /* RIGHT — q increases */
+    { 0, -1 },   /* UP    */
+    { 0, +1 },   /* DOWN  */
+    {-1,  0 },   /* LEFT  */
+    {+1,  0 },   /* RIGHT */
 };
 
 static void cursor_move(Cursor *cur, int dq, int dr)
@@ -511,13 +355,11 @@ static void cursor_move(Cursor *cur, int dq, int dr)
 }
 
 /*
- * cursor_draw — place '@' at the interior centre of hex (cur.q, cur.r).
+ * Draw the '@' on the hex the player is standing on.
  *
- * THE FORMULA:
- *   cx_pix = size × 3/2 × cur.q
- *   cy_pix = size × (√3/2 × cur.q  +  √3 × cur.r)
- *   col = ox + (int)(cx_pix / CELL_W)   ← truncation stays in interior
- *   row = oy + (int)(cy_pix / CELL_H)
+ * It uses the same hex-to-screen math as everything else, but rounds toward
+ * zero rather than to nearest, which nudges the '@' just inside the hex so it
+ * never lands on the outline.
  */
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
@@ -534,11 +376,10 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 scene ── */
 
-/* Bright bold yellow fps readout (top-right) + bold cyan key hints (bottom). */
+/* Status line at top-right (cursor address, object count, fps) and the list of
+ * keys along the bottom. */
 static void hud_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
                       double fps)
 {
@@ -568,9 +409,7 @@ static void scene_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -583,9 +422,7 @@ static void screen_init(void)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 app ── */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 

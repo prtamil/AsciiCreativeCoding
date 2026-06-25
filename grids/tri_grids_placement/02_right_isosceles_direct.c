@@ -1,120 +1,57 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 02_right_isosceles_direct.c — direct placement on the half-rect grid
+ * 02_right_isosceles_direct.c
  *
- * DEMO: Square cells split by a single '\' diagonal into UR / LL right-
- *       isosceles triangles. Move '@' with arrows; SPACE toggles a glyph
- *       at the cursor triangle. 'g' cycles glyphs.
+ * A grid of squares, each cut in half by a '\' diagonal into two right
+ * triangles: an upper-right one and a lower-left one. Move the '@' cursor
+ * with the arrows; SPACE drops or removes a glyph on whichever half the
+ * cursor sits on. Every glyph remembers which half-square it's on, so it
+ * stays put when you resize the window or zoom the grid.
  *
- * Study alongside: grids/tri_grids/02_right_isosceles.c (background),
- *                  01_equilateral_direct.c (same idea on equilateral).
+ * Sister files: grids/tri_grids/02_right_isosceles.c shows the bare grid,
+ * and 01_equilateral_direct.c does the same trick on 60-degree triangles.
  *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, TRI_SIZE, MAX_OBJ
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 5 pairs: edge / cursor / object / HUD / hint
- *   §4 gridctx  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg
- *   §5 pool     — Pool: place / remove / toggle / find / clear / draw
- *   §6 cursor   — Cursor + TRI_DIR + reset / move / draw
- *   §7 scene    — hud_draw + scene_draw
- *   §8 screen   — ncurses init / cleanup
- *   §9 app      — signals, main loop
- *
- * Keys:  arrows:move  spc:toggle  g:glyph  C:clear  +/-:size
- *        t:theme  r:reset  q/ESC:quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/02_right_isosceles_direct.c \
- *       -o 02_right_isosceles_direct -lncurses -lm
+ * Sections: §1 settings  §2 clock  §3 color  §4 grid math  §5 glyph pool
+ *           §6 cursor  §7 drawing  §8 ncurses setup  §9 main loop
  */
 
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
+/* ── how the addressing works ──
  *
- * Algorithm      : Cursor in (col, row, up) where up ∈ {LL=0, UR=1}.
- *                  Pixel→lattice axis-aligned: a=px/size, b=py/size.
- *                  Diagonal split: up = (fa ≥ fb) ? UR : LL.
- *                  Centroids:
- *                    UR (col+2/3, row+1/3),  LL (col+1/3, row+2/3).
+ * Picture ordinary graph paper, then slice every square along the '\'
+ * diagonal so each square holds two triangles. We give each triangle its
+ * own address: the square it lives in (col, row) plus which half it is
+ * (up = 1 means the upper-right triangle, up = 0 the lower-left).
  *
- * References     :
- *   Half-rect tiling — https://en.wikipedia.org/wiki/Triangular_tiling
- *   Object pool pattern — gameprogrammingpatterns.com/object-pool.html
+ * Going from a pixel position to a triangle is easy here because the grid
+ * lines up with the axes — no slanting to undo. Divide the pixel by the
+ * square size to get a fractional position inside the square; the whole
+ * part is the square, the leftover fractions (fa across, fb down) tell you
+ * which side of the diagonal you're on. More across than down means the
+ * upper-right half, otherwise the lower-left.
  *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ * To draw a triangle's glyph we aim for its center of mass: the upper-right
+ * triangle sits at (col + 2/3, row + 1/3) and the lower-left at
+ * (col + 1/3, row + 2/3), measured in square-widths.
  *
- * CORE IDEA
- * ─────────
- * Same two-address-space idea as 01_equilateral_direct, but on a square
- * (axis-aligned) lattice instead of a 60° skew lattice. Each unit
- * square is bisected by '\' into UR (up=1) and LL (up=0). The pixel→
- * lattice inverse is just (a,b) = (px/size, py/size); no shear to
- * undo. Above the diagonal (fa ≥ fb) is UR, below is LL.
+ * Moving the cursor with an arrow key sometimes just flips to the other
+ * half of the same square and sometimes steps into a neighbour — the
+ * TRI_DIR table in §6 spells out each case. Two presses in one direction
+ * always equal one full square's worth of travel.
  *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Picture standard graph paper — but instead of giving each square
- * one address, you split each square diagonally and give each HALF its
- * own address (col, row, UR/LL). The cursor walks half-squares; SPACE
- * pins an object onto the current half-square. Resize moves the
- * window; objects keep their (col, row, up) addresses.
+ * Worth knowing:
+ *  - On the exact diagonal we pick the upper-right half. That line is
+ *    infinitely thin, so rounding can flip the choice for a single frame
+ *    on resize. Harmless.
+ *  - Terminal cells are taller than they are wide (2 wide, 4 tall here), so
+ *    the triangles look stretched vertically on screen even though they're
+ *    true right-isosceles triangles in pixel terms. Not a bug.
+ *  - The pool holds a fixed number of glyphs; once full, new drops are
+ *    ignored. 'C' clears them all.
  *
- * DRAWING METHOD  (per frame)
- * ──────────────
- *  1. erase()
- *  2. ctx_draw_bg — raster scan: pixel_to_tri → tri_edge_char → mvaddch
- *     when min-weight < border_w. Edges are '|', '_', '\\'.
- *  3. pool_draw — for each object, ctx_to_screen → mvaddch the glyph
- *     at that screen cell.
- *  4. cursor_draw — '@' on top.
- *
- * KEY FORMULAS
- * ────────────
- *  Pixel → lattice  (axis-aligned, no shear):
- *    a = px / size,   b = py / size
- *    col = ⌊a⌋,       row = ⌊b⌋
- *    fa  = a - col,   fb  = b - row
- *    up  = (fa ≥ fb)  ?  UR  :  LL
- *
- *  Centroid lattice → pixel:
- *    UR centroid:  a = col + 2/3,  b = row + 1/3
- *    LL centroid:  a = col + 1/3,  b = row + 2/3
- *    px = a · size,  py = b · size
- *
- *  Cursor step (TRI_DIR table, see §6):
- *    LEFT   ▽LL: col-1, up→UR;     △UR: same square, toggle to LL
- *    RIGHT  ▽LL: same square, toggle to UR;  △UR: col+1, up→LL
- *    UP     ▽LL: same, toggle UR;  △UR: row-1, stay UR
- *    DOWN   ▽LL: row+1, stay LL;   △UR: same, toggle LL
- *
- *  Pool toggle (O(1) remove via swap-with-last):
- *    if (i = pool_find(col,row,up)) >= 0:
- *      pool->items[i] = pool->items[--pool->count]
- *    else:
- *      pool->items[pool->count++] = (Obj){col,row,up,glyph,true}
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Diagonal tie-break: at fa == fb the formula picks UR. This is a
- *    measure-zero set; integer round-off may flicker the choice for
- *    one frame on resize. Harmless.
- *  • Cells appear vertically squashed: CELL_W=2, CELL_H=4 means each
- *    terminal cell is 1:2 wide:tall. Triangles drawn here are right-
- *    isosceles in PIXEL space, so the displayed shape looks taller
- *    than wide. That is correct, not a bug.
- *  • MAX_OBJ cap: silently dropped when full; 'C' clears.
- *  • Resize: addresses preserved; objects re-centre as ox/oy update.
- *
- * HOW TO VERIFY
- * ─────────────
- *  Place a glyph on the LL of the origin square. Press '+': size
- *  increases, the glyph stays on the LL. Press LEFT: cursor goes to
- *  UR of (col-1, row). Press LEFT again: cursor goes to LL of
- *  (col-1, row). Two LEFTs = one full square left, regardless of
- *  starting orientation.
- *
- * ─────────────────────────────────────────────────────────────────────── */
+ * References: half-square triangular tiling
+ *   https://en.wikipedia.org/wiki/Triangular_tiling
+ * Object pool idea: gameprogrammingpatterns.com/object-pool.html
+ */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -127,9 +64,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 settings ── */
 
 #define TARGET_FPS 60
 #define CELL_W 2
@@ -155,9 +90,7 @@
 
 static const char GLYPHS[N_GLYPHS] = { '*', 'o', '+', '#', 'X', '%' };
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -174,9 +107,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static const short THEME_FG[N_THEMES][2] = {
     {  75, 226 }, { 207, 226 }, {  82, 207 }, {  15,  39 },
@@ -201,19 +132,19 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx — half-rect (axis-aligned, single diagonal)                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 grid math — squares split by one diagonal ── */
 
+/* Everything the grid needs to know to draw itself and convert between
+ * the math world and the screen. One of these lives for the whole run. */
 typedef struct {
-    int    rows, cols;
-    double tri_size;        /* unit square side length in pixel sub-units */
-    int    cell_w, cell_h;
-    int    ox, oy;
-    double border_w;
-    int    theme;
-    int    paused;
-    int    glyph_idx;
+    int    rows, cols;      /* terminal size in character cells */
+    double tri_size;        /* how big one square is, in pixel sub-units; bigger = zoomed in */
+    int    cell_w, cell_h;  /* pixel sub-units per character cell (cells are taller than wide) */
+    int    ox, oy;          /* screen cell the grid's origin (0,0) lands on — re-centred on resize */
+    double border_w;        /* how close to an edge counts as "on the edge" when drawing lines */
+    int    theme;           /* which color set is active (0..N_THEMES-1) */
+    int    paused;          /* unused here; kept for parity with animated demos */
+    int    glyph_idx;       /* which glyph SPACE will drop, an index into GLYPHS */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols)
@@ -249,7 +180,7 @@ static void pixel_to_tri(double px, double py, double size,
     *col = c; *row = r;
     *fa = a - (double)c;
     *fb = b - (double)r;
-    *up = (*fa >= *fb) ? 1 : 0;     /* 1 = UR, 0 = LL */
+    *up = (*fa >= *fb) ? 1 : 0;     /* more across than down -> upper-right half, else lower-left */
 }
 
 static void tri_centroid_pixel(int col, int row, int up, double size,
@@ -270,15 +201,18 @@ static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
     *srow = g->oy + (int)(cy_pix / g->cell_h);
 }
 
+/* Of the triangle's three edges, find the one this point is closest to and
+ * return the line glyph for it. out_min is that distance, so the caller can
+ * decide whether the point is close enough to an edge to draw the line. */
 static char tri_edge_char(int up, double fa, double fb, double *out_min)
 {
     double l1, l2, l3;
     char ch1, ch2, ch3;
-    if (up == 1) {                /* UR */
+    if (up == 1) {                /* upper-right triangle */
         l1 = 1.0 - fa;       ch1 = '|';
         l2 = fa - fb;        ch2 = '\\';
         l3 = fb;             ch3 = '_';
-    } else {                       /* LL */
+    } else {                       /* lower-left triangle */
         l1 = 1.0 - fb;       ch1 = '_';
         l2 = fa;             ch2 = '|';
         l3 = fb - fa;        ch3 = '\\';
@@ -308,11 +242,20 @@ static void ctx_draw_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_BORDER));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 glyph pool ── */
 
-typedef struct { int col, row, up; char glyph; bool alive; } Obj;
+/* One placed glyph and where it lives. The address (col, row, up) is the
+ * source of truth — the screen position is recomputed from it each frame,
+ * so glyphs follow the grid through resizes and zooms. */
+typedef struct {
+    int  col, row, up;  /* which square, and which half (1 = upper-right, 0 = lower-left) */
+    char glyph;         /* the character to draw */
+    bool alive;         /* false = this slot is empty and skipped when drawing */
+} Obj;
+
+/* A fixed-size bag of placed glyphs. We keep all the live ones packed at the
+ * front, so 'count' is exactly how many there are and removal just moves the
+ * last one into the gap. */
 typedef struct { Obj items[MAX_OBJ]; int count; } Pool;
 
 static int pool_find(const Pool *p, int col, int row, int up)
@@ -362,12 +305,17 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_OBJECT) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 cursor ── */
 
+/* Where the '@' is: which square (col, row) and which half (up). */
 typedef struct { int col, row, up; } Cursor;
 
+/* The movement rulebook. Look up [direction][current half] to get the change
+ * to apply: {dcol, drow, new up}. Each arrow either flips to the other half of
+ * the same square or steps into a neighbour, so two presses one way always
+ * move a full square. Rows are LEFT, RIGHT, UP, DOWN; the inner pair is
+ * indexed by whether you're currently on the lower-left (0) or upper-right (1)
+ * half. */
 static const int TRI_DIR[4][2][3] = {
     /* LEFT  */ { { -1,  0,  1 }, {  0,  0,  0 } },
     /* RIGHT */ { {  0,  0,  1 }, { +1,  0,  0 } },
@@ -398,9 +346,7 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 drawing ── */
 
 static void hud_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
                      double fps)
@@ -433,9 +379,7 @@ static void scene_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 ncurses setup ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -448,9 +392,7 @@ static void screen_init(int theme)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 main loop ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;

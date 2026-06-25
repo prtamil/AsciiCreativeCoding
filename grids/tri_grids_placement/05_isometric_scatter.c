@@ -1,125 +1,13 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 05_isometric_scatter.c — distance-coloured scatter on iso (solid-fill) grid
+ * 05_isometric_scatter.c — random dots on an isometric triangle grid,
+ * coloured by how far each one sits from the cursor (warm = near, cool = far).
+ * The background is the same solid-filled iso grid from tri_grids/05_isometric.c;
+ * arrows walk the cursor, SPACE drops a fresh batch of dots, +/- changes how many.
  *
- * DEMO: Iso solid-fill background (6-cycle palette by triangle position).
- *       A random scatter of N triangles is overlaid with glyphs coloured
- *       on a 6-stop distance gradient from the cursor — closer = warm,
- *       farther = cool. The cursor walks the iso lattice; SPACE reseeds;
- *       +/- changes density.
- *
- * Study alongside: grids/tri_grids/05_isometric.c (rasterizer + palette),
- *                  05_isometric_direct.c (manual placement on iso),
- *                  01_equilateral_scatter.c (same scatter, edges).
- *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, TRI_SIZE, SCATTER_RADIUS, DENSITY
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — iso fill palette + 6-bucket distance gradient + cursor
- *   §4 gridctx  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg
- *   §5 pool     — Pool: place / find / draw  (scatter entries)
- *   §6 cursor   — Cursor + cursor_reset / cursor_move / cursor_draw
- *   §7 mode     — scatter_seed (LCG random spawn) + bucket colouring
- *   §8 scene    — hud_draw + scene_draw
- *   §9 screen   — ncurses init / cleanup
- *  §10 app      — signals, main loop
- *
- * Keys:  arrows:move  spc:reseed  +/-:density  r:reset
- *        t:theme  q/ESC:quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/05_isometric_scatter.c \
- *       -o 05_isometric_scatter -lncurses -lm
+ * Sister files: grids/tri_grids/05_isometric.c (the grid + fill palette),
+ *               05_isometric_direct.c, 01_equilateral_scatter.c.
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Random scatter on the equilateral skew lattice. Pick
- *                  N random (Δcol, Δrow, up) within ±SCATTER_RADIUS of
- *                  the cursor; colour each by Manhattan-style cell
- *                  distance from the cursor, bucketed into 6 gradient
- *                  slots. The iso solid-fill background remains.
- *
- * Data-structure : Pool — flat array of Obj{col, row, up, glyph='*',
- *                  alive}. Bucket is recomputed every frame from cursor
- *                  position; entries change only on reseed.
- *
- * Distance metric: |Δcol| + |Δrow| + (Δup ? 1 : 0).
- *
- * Re-seeding     : SPACE reseeds with a new seed (xor'd by clock).
- *                  +/- density also reseeds. Cursor movement does not.
- *
- * References     :
- *   Triangular tiling — https://en.wikipedia.org/wiki/Triangular_tiling
- *   Linear congruential generator — Numerical Recipes ch. 7
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Two layers: ISO BACKGROUND (every triangle filled by palette_index) and
- * SCATTER OVERLAY (random triangles overlaid with glyphs whose fg colour
- * comes from a distance-bucket palette). The iso colours decorate the
- * field; the scatter glyphs read the cursor distance.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine a wall of stacked cubes (iso fills) with sticky dots placed at
- * random triangles around the cursor. Each dot is a different shade
- * depending on how far it is from the cursor — warm near, cool far. The
- * cubes don't move when you walk the cursor; only the dot colours shift.
- *
- * DRAWING METHOD  (per frame)
- * ──────────────
- *  1. erase()
- *  2. ctx_draw_bg paints every cell with its palette colour.
- *  3. scatter_draw — for each entry compute distance bucket, draw '*'
- *     in the bucket-coloured pair.
- *  4. cursor_draw — '@' on top.
- *
- *  Reseed (only on SPACE or +/- density):
- *    pool->count = 0
- *    g_seed ^= clock_ns()
- *    for i in 0..density:
- *      dC = floor(frand·(2·R+1)) - R    ; dR = same
- *      up = (frand > 0.5) ? △ : ▽
- *      pool_place(cur.col+dC, cur.row+dR, up)   // dedup
- *
- * KEY FORMULAS
- * ────────────
- *  Pixel → lattice (h = size · √3 / 2):
- *    b = py / h,  a = px / size - 0.5·b
- *    col = ⌊a⌋,    row = ⌊b⌋
- *    up  = (fa + fb ≥ 1) ? △ : ▽
- *
- *  Palette hash:
- *    k = (col + 2·row + up) mod N_PALETTE
- *
- *  Manhattan cell distance:
- *    d = |Δcol| + |Δrow| + (Δup ? 1 : 0)
- *
- *  LCG step:
- *    g_seed = g_seed · 1103515245 + 12345
- *    frand  = ((g_seed >> 16) & 0x7FFF) / 32767.0
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Bucket vs fill colour: bucket pair uses high-luminance fg over
- *    default bg so it's readable on any palette tile.
- *  • Density saturation, dedup, reseed-on-cursor-move: same caveats as
- *    01_equilateral_scatter.c.
- *
- * HOW TO VERIFY
- * ─────────────
- *  Place cursor at the centre of a fresh scatter — glyphs are warmest
- *  right around '@'. Walk the cursor diagonally: same dots persist; the
- *  warm/cool boundary follows the cursor. Press 't': background
- *  recolours, scatter dots stay where they are, bucket gradient remains
- *  aligned to cursor distance.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -132,9 +20,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 
@@ -158,15 +44,15 @@
 
 #define FPS_EWMA_ALPHA  0.05
 
-#define PAIR_FILL_BASE  1                                 /* 1..6  iso bg */
-#define PAIR_BUCK0     (PAIR_FILL_BASE + N_PALETTE)       /* 7..12 scatter fg */
+/* Colour-pair slot numbers. The fill pairs colour the background grid;
+ * the bucket pairs colour the scattered dots by distance band. */
+#define PAIR_FILL_BASE  1                                 /* background grid: one pair per fill colour */
+#define PAIR_BUCK0     (PAIR_FILL_BASE + N_PALETTE)       /* dots: one pair per distance band */
 #define PAIR_CURSOR    (PAIR_BUCK0 + N_BUCKETS)
 #define PAIR_HUD       (PAIR_CURSOR + 1)
 #define PAIR_HINT      (PAIR_HUD + 1)
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -181,9 +67,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static const short PAL256[N_THEMES][N_PALETTE] = {
     { 196, 214, 226, 118,  39, 129 },
@@ -195,7 +79,8 @@ static const short PAL8[N_THEMES][N_PALETTE] = {
     { COLOR_BLUE,  COLOR_CYAN,   COLOR_GREEN, COLOR_YELLOW,  COLOR_MAGENTA, COLOR_BLUE    },
     { COLOR_WHITE, COLOR_CYAN,   COLOR_BLUE,  COLOR_WHITE,   COLOR_BLUE,    COLOR_CYAN    },
 };
-/* Distance gradient — bright fg colours that pop over the iso bg */
+/* Dot colours, near to far. Kept bright so the dots stay readable on top of
+ * any background tile. */
 static const short GRAD256[N_BUCKETS] = { 15, 226, 214, 196, 207, 51 };
 static const short GRAD8[N_BUCKETS]   = {
     COLOR_WHITE, COLOR_YELLOW, COLOR_YELLOW, COLOR_RED, COLOR_MAGENTA, COLOR_CYAN
@@ -217,16 +102,17 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx                                                             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx ── */
 
+/* Everything needed to turn a triangle's grid address into a screen spot.
+ * Built once at start-up (and again on resize) so the drawing code can stay
+ * simple. */
 typedef struct {
-    int    rows, cols;
-    int    cw, ch;
-    double tri_size;
-    int    ox, oy;
-    int    max_col, max_row;
+    int    rows, cols;        /* terminal size in characters */
+    int    cw, ch;            /* how many sub-pixels wide/tall one character is */
+    double tri_size;          /* edge length of one triangle, in sub-pixels */
+    int    ox, oy;            /* where grid (0,0) lands on screen — roughly centre */
+    int    max_col, max_row;  /* how far the cursor may roam from the origin */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols, double tri_size)
@@ -296,33 +182,39 @@ static void ctx_draw_bg(const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool ── */
 
+/* One scattered dot, addressed by which triangle it sits in. */
 typedef struct {
-    int  col, row, up;
-    char glyph;
-    bool alive;
+    int  col, row, up;   /* which triangle: column, row, and which half (up vs down) */
+    char glyph;          /* the character drawn for it (always '*' here) */
+    bool alive;          /* false = skip this slot when drawing */
 } Obj;
 
+/* The whole batch of dots. Plain fixed array — we never free or grow it, we
+ * just refill it from the front on each reseed. */
 typedef struct {
     Obj items[MAX_OBJ];
-    int count;
+    int count;           /* how many slots are actually in use */
 } Pool;
 
 static void pool_clear(Pool *p) { p->count = 0; }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 cursor ── */
 
+/* The '@' marker you steer, plus a few app-wide settings that ride along with
+ * it since the same struct gets passed everywhere. */
 typedef struct {
-    int col, row, up;
-    int density;
-    int theme, paused;
+    int col, row, up;     /* which triangle the cursor is on */
+    int density;          /* how many dots to drop on the next reseed */
+    int theme, paused;    /* current colour theme; paused is unused here */
 } Cursor;
 
+/* Where each arrow press takes you, in triangle coordinates. Moving on this
+ * grid is awkward: the step depends on whether you're on an up- or down-facing
+ * triangle, so we look it up instead of computing it. First index is the
+ * arrow (left/right/up/down), second is your current up/down half, then the
+ * three numbers are the change to col, row, and the new up value. */
 static const int TRI_DIR[4][2][3] = {
     { { -1,  0,  1 }, {  0,  0,  0 } },
     { {  0,  0,  1 }, { +1,  0,  0 } },
@@ -359,10 +251,11 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     attroff(COLOR_PAIR(pair) | A_BOLD | A_REVERSE);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  mode — scatter (LCG spawn + bucket colouring)                       */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 mode — drop the dots and pick each one's colour by distance ── */
 
+/* Our own tiny random-number generator (a classic LCG, Numerical Recipes
+ * ch. 7). Built in rather than using rand() so a given seed always replays
+ * the same scatter. Returns a number in [0, 1). */
 static unsigned int g_seed = 1;
 static double frand(void)
 {
@@ -388,7 +281,7 @@ static int distance_bucket(int dist, int max_d)
 static void scatter_seed(Pool *pool, const Cursor *cur)
 {
     pool_clear(pool);
-    g_seed ^= (unsigned int)clock_ns();
+    g_seed ^= (unsigned int)clock_ns();   /* stir in the clock so each reseed looks new */
     int max = (cur->density < MAX_OBJ) ? cur->density : MAX_OBJ;
     int tries = 0;
     while (pool->count < max && tries < max * 4) {
@@ -417,9 +310,7 @@ static void scatter_draw(const Pool *p, const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, const Pool *p,
                      double fps)
@@ -451,9 +342,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, const Pool *p,
     wnoutrefresh(stdscr); doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(int theme)
@@ -464,9 +353,7 @@ static void screen_init(int theme)
     color_init(theme); atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §10 app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §10 app ── */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 static void on_signal(int s)

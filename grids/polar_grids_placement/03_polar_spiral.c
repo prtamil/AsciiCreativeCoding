@@ -1,149 +1,20 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 03_polar_spiral.c — parametric spiral path placement on a polar grid
+ * 03_polar_spiral.c — draw a spiral by walking along it and dropping dots.
  *
- * DEMO: Move the cursor and watch the spiral preview update in real time.
- *       Toggle 'l'/'o' for Archimedean or log-spiral mode.  +/- adjusts
- *       pitch or growth rate; [/] adjusts the number of turns; ,/. adjusts
- *       density (dots per radian).  Press space to stamp the current spiral
- *       into the permanent pool; C clears the pool.  Because the path is
- *       parametric (θ → r → cell) rather than a screen sweep, dots follow
- *       the spiral equation exactly.
+ * Move the cursor to pick where the spiral starts, watch a live preview, and
+ * press space to stamp it down for keeps. Two spiral shapes: Archimedean (arms
+ * evenly spaced) and logarithmic (arms spread wider as they go out, like a
+ * nautilus shell).
  *
- * Study alongside: 02_polar_arc.c (arc/spoke from two anchors),
- *                  grids/polar_grids/03_archimedean_spiral.c (sweep rendering)
+ * The trick here: instead of checking every screen cell "are you near a
+ * spiral?", we step the angle forward, compute the radius for that angle, and
+ * place a dot right there. Walking the curve instead of scanning the screen.
  *
- * Section map:
- *   §1 config   — spiral parameters, density, turn range
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 5 pairs: grid, active, anchor, HUD (yellow), hint (cyan)
- *   §4 gridctx  — GridCtx (mode, origin), cell_to_polar, polar_to_screen
- *   §5 pool     — Pool: place, clear, draw
- *   §6 cursor   — Cursor (row, col, r, theta) + screen-space arrow move
- *   §7 mode     — draw_polar_bg: 7 inline polar background types in one switch
- *   §8 spiral   — spiral_place_archim, spiral_place_log
- *   §9 scene    — hud_draw + scene_draw (+ live preview)
- *   §10 screen  — ncurses init / cleanup
- *   §11 app     — signals, resize, main loop
- *
- * Keys:  q/ESC quit   P pause   t theme   a/e prev/next background
- *        l Archimedean mode    o log-spiral mode
- *        +/- pitch or growth rate    [/] turns    ,/. density
- *        space stamp spiral to pool    C clear pool    r reset cursor
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/polar_grids_placement/03_polar_spiral.c \
- *       -o 03_polar_spiral -lncurses -lm
+ * Sister files: 02_polar_arc.c (arc/spoke from two anchors),
+ *               grids/polar_grids/03_archimedean_spiral.c (the scan-the-screen
+ *               version of the same spiral, for comparison).
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Parametric spiral rasterisation.  Instead of testing
- *                  every screen cell (sweep approach used in polar_grids/),
- *                  this file evaluates the spiral equation forward:
- *
- *                  Archimedean: r(θ) = r_0 + a × θ,    a = PITCH/(2π)
- *                  Log-spiral:  r(θ) = r_0 × e^(GROWTH × θ)
- *
- *                  θ is incremented by DENSITY_STEP (radians) up to
- *                  N_TURNS × 2π.  Each (r, θ) is converted to a terminal
- *                  cell; objects accumulate in the pool.
- *
- *                  Parametric vs sweep: the sweep in polar_grids/ tests
- *                  whether a cell is NEAR a spiral; the parametric approach
- *                  here WALKS along the spiral and places objects directly.
- *                  Parametric placement gives sparser dots but exact
- *                  positions — ideal for seeing the curve's structure.
- *
- * Math           : At radius r, one terminal column subtends CELL_W/r radians.
- *                  Setting DENSITY_STEP ≈ CELL_W/r_start ensures ≈ 1 object
- *                  per column near the inner end.  The user can coarsen
- *                  (fewer dots) or refine (more) with ,/. keys.
- *
- * References     :
- *   Archimedean spiral — en.wikipedia.org/wiki/Archimedean_spiral
- *   Logarithmic spiral — en.wikipedia.org/wiki/Logarithmic_spiral
- *   Sweep approach — grids/polar_grids/03_archimedean_spiral.c
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ──────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Instead of sweeping every screen cell and testing whether it lies near a
- * spiral (the approach in polar_grids/03_archimedean_spiral.c), this file
- * walks the spiral PARAMETRICALLY: t increments from 0 to N_TURNS×2π, r is
- * computed from t, and each (r, θ0+t) is placed as an object.  This gives
- * exact positions at adjustable dot density.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Parametric vs. sweep:
- *   Sweep:      for each screen cell → is this cell near the spiral?
- *   Parametric: for each t step    → where does the spiral go?
- * Parametric gives sparser, exact dots; sweep gives a filled line.
- * Use sweep for a thick background; use parametric to study the curve.
- *
- * t is the angular offset from the start (the "clock hand" rotation).
- * Archimedean: hand grows by a constant amount per radian.
- * Log-spiral:  hand grows by a fraction of its current length per radian.
- *
- * DRAWING METHOD
- * ──────────────
- * 1. Move cursor to the spiral's starting point (r0, θ0).
- * 2. The live preview redraws every frame in scene_draw():
- *    walk t from 0 to N_TURNS×2π by DENSITY_STEP, compute r(t),
- *    call polar_to_screen(r(t), θ0+t), draw dot directly.
- * 3. SPACE stamps: spiral_place_archim or spiral_place_log does the same
- *    walk and appends each cell to the permanent pool.
- * 4. +/-: pitch/growth; [/]: turns; ,/.: density.
- *
- * KEY FORMULAS
- * ────────────
- * Archimedean (spiral_place_archim):
- *   a = pitch / (2π)                  [px of radial advance per radian]
- *   r(t) = r0 + a × t                 [linear radial growth]
- *   θ(t) = θ0 + t,  t ∈ [0, N_TURNS × 2π],  step = DENSITY_STEP
- *   Dots ≈ N_TURNS × 2π / DENSITY_STEP
- *   Example: N=3, d=0.08 → 3×6.283/0.08≈236 dots
- *
- * Log-spiral (spiral_place_log):
- *   r(t) = r0 × e^(GROWTH × t)       [exponential radial growth]
- *   r0 clamped to ≥ 1.0 (r0=0 would freeze r=0 for all t since 0×eˣ=0)
- *   Radius after 1 turn: r0 × e^(GROWTH × 2π)
- *   Example: GROWTH=0.18, 1 turn: r × e^1.13 ≈ r × 3.1
- *
- * Dot density at radius r:
- *   One terminal column subtends CELL_W/r radians.
- *   DENSITY ≈ CELL_W/r_start ≈ 1 dot per column at the inner end.
- *   Outer end is sparser (more arc length per radian).
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- * - r0 < 1.0 clamp: spiral_place_log enforces r0≥1 to prevent the
- *   r=0 freeze case.
- * - Very small DENSITY_STEP (0.01): up to N_MAX×2π/0.01≈6280 dots per
- *   spiral arm; MAX_OBJ=4096 may be reached with 2+ turns.
- * - Live preview loops up to N_MAX×2π/DENSITY_MIN≈6280 times per frame;
- *   no pool writes so this is fast (just mvaddch calls).
- *
- * HOW TO VERIFY
- * ─────────────
- * Terminal 80×24 → ox=40, oy=12.
- * Defaults: r0=20, θ0=0, PITCH=32, N_TURNS=3, DENSITY=0.08.
- *
- * Archimedean:
- *   a=32/(2π)≈5.09
- *   t=0:  r=20, θ=0   → col=40+round(20/2)=50, row=12         ✓
- *   t=2π: r=52, θ=2π  → col=40+round(52/2)=66, row=12         ✓
- *   t=4π: r=84, θ=4π  → col=40+round(84/2)=82 (off-screen)    ✓
- *
- * Log-spiral (GROWTH=0.18):
- *   t=π/2: r=20×e^(0.18×π/2)≈20×e^0.283≈26.6, θ=90°
- *          → col=40, row=12+round(26.6/4)≈19                   ✓
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
@@ -160,38 +31,36 @@
 #  define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS    30
 #define CELL_W         2
 #define CELL_H         4
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How fast the on-screen fps number settles. Small = smooth but laggy. */
 #define FPS_EWMA_ALPHA  0.05
 
-/* Archimedean pitch: pixel advance per full turn */
+/* Archimedean shape: how far the arm steps outward over one full turn. */
 #define PITCH_DEFAULT  32.0
 #define PITCH_MIN       8.0
 #define PITCH_MAX      80.0
 #define PITCH_STEP      4.0
 
-/* Log-spiral growth rate a: r multiplies by e^(a×2π) per turn */
+/* Log-spiral shape: bigger growth = arms fly outward faster each turn. */
 #define GROWTH_DEFAULT  0.18
 #define GROWTH_MIN      0.05
 #define GROWTH_MAX      0.70
 #define GROWTH_STEP     0.02
 #define PHI             1.61803398874989484820
-#define GROWTH_GOLDEN  (2.0 * log(PHI) / M_PI)   /* ≈ 0.3065 */
+#define GROWTH_GOLDEN  (2.0 * log(PHI) / M_PI)   /* the nautilus-shell rate, ≈ 0.31 */
 
-/* Number of spiral turns to draw */
+/* How many full turns the spiral makes. */
 #define N_TURNS_DEFAULT  3
 #define N_TURNS_MIN      1
 #define N_TURNS_MAX     10
 
-/* Angular step between placed objects (radians) */
-#define DENSITY_DEFAULT  0.08    /* ~4.6° per dot */
+/* Angle to step between dots. Bigger = sparser dots. */
+#define DENSITY_DEFAULT  0.08    /* about one dot every 4.6 degrees */
 #define DENSITY_MIN      0.01
 #define DENSITY_MAX      0.40
 #define DENSITY_STEP     0.01
@@ -206,8 +75,8 @@
 #define PAIR_GRID    1
 #define PAIR_ACTIVE  2
 #define PAIR_ANCHOR  3
-#define PAIR_HUD     4   /* status bar (yellow)  */
-#define PAIR_HINT    5   /* key-hint footer (cyan) */
+#define PAIR_HUD     4   /* top status bar, yellow */
+#define PAIR_HINT    5   /* bottom key hints, cyan */
 
 static const char *const BG_NAMES[] = {
     "rings+spokes", "log-polar",  "archimedean",
@@ -224,9 +93,7 @@ static const short THEME_FG[][2] = {
 };
 #define N_THEMES  5
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -241,9 +108,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static void color_init(int theme)
 {
@@ -256,16 +121,19 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx                                                             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx ── */
 
+/*
+ * Everything we need to map between screen cells and polar (radius, angle)
+ * coordinates, all anchored to one center point. Set up once at startup and
+ * again on resize; nothing here changes per frame.
+ */
 typedef struct {
-    int mode;
-    int rows, cols;
-    int cw, ch;
-    int ox, oy;
-    int max_ring, max_spoke;
+    int mode;             /* which background pattern (0..6), see BG_NAMES */
+    int rows, cols;       /* terminal size in cells right now */
+    int cw, ch;           /* cell size in pixels, so a cell isn't square */
+    int ox, oy;           /* center of the polar grid, in cells */
+    int max_ring, max_spoke;  /* how many rings/spokes fit on screen */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int mode, int rows, int cols)
@@ -296,6 +164,8 @@ static void polar_to_screen(double r, double theta, int ox, int oy,
     *row = oy + (int)round(r * sin(theta) / CELL_H);
 }
 
+/* Pick a slash/dash/pipe that points roughly along the angle, so the grid
+ * lines look like they're flowing in the right direction. */
 static char angle_char(double theta)
 {
     double a = fmod(theta + 2.0*M_PI, M_PI);
@@ -305,12 +175,24 @@ static char angle_char(double theta)
     return '/';
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool ── */
 
-typedef struct { int row, col; char glyph; bool alive; } Obj;
-typedef struct { Obj items[MAX_OBJ]; int count; } Pool;
+/* One stamped dot: where it sits and what character to draw. */
+typedef struct {
+    int  row, col;   /* cell position on screen */
+    char glyph;      /* the character to draw there */
+    bool alive;      /* false means skip it when drawing */
+} Obj;
+
+/*
+ * The permanent collection of stamped dots. A plain fixed array used like a
+ * stack: stamping pushes onto the end, clearing just resets the count to 0
+ * (no need to wipe the old entries). Full at MAX_OBJ; extra dots are dropped.
+ */
+typedef struct {
+    Obj items[MAX_OBJ];
+    int count;
+} Pool;
 
 static void pool_place(Pool *p, int row, int col,
                        int rows, int cols, char glyph)
@@ -333,13 +215,17 @@ static void pool_draw(const Pool *p)
 
 static void pool_clear(Pool *p) { p->count = 0; }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 cursor ── */
 
+/*
+ * The movable spot that marks where the next spiral starts. We keep it both
+ * ways: as a screen cell (for drawing and arrow-key moves) and as polar
+ * radius/angle (what the spiral math actually needs). The two are kept in
+ * sync — move the cell, then recompute the polar pair.
+ */
 typedef struct {
-    int    row, col;
-    double r, theta;
+    int    row, col;   /* where it is on screen, in cells */
+    double r, theta;   /* same spot as distance-from-center and angle */
 } Cursor;
 
 static void cursor_sync_polar(Cursor *c, const GridCtx *g)
@@ -374,11 +260,13 @@ static void cursor_draw(const Cursor *c, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_ANCHOR) | A_REVERSE | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  mode  (polar background dispatcher)                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 mode ── */
 
-/* Mode 0 — rings + spokes (defaults from polar_grids/01_rings_spokes.c). */
+/* These draw the faint backdrop the spiral sits on. Each is a self-contained
+ * pattern lifted from a sister file in grids/polar_grids/; the cited file is
+ * where to go for how that one works. Cycle them with a/e. */
+
+/* Mode 0 — evenly spaced rings crossed by straight spokes, like a dartboard. */
 static void bg_rings_spokes_draw(const GridCtx *g)
 {
     const double two_pi = 2.0 * M_PI;
@@ -399,7 +287,7 @@ static void bg_rings_spokes_draw(const GridCtx *g)
     }
 }
 
-/* Mode 1 — log-polar grid (defaults from polar_grids/02_log_polar.c). */
+/* Mode 1 — rings that get farther apart as they go out (polar_grids/02_log_polar.c). */
 static void bg_log_polar_draw(const GridCtx *g)
 {
     const double two_pi = 2.0 * M_PI;
@@ -424,7 +312,7 @@ static void bg_log_polar_draw(const GridCtx *g)
     }
 }
 
-/* Mode 2 — archimedean 2-arm spiral (polar_grids/03_archimedean_spiral.c). */
+/* Mode 2 — two evenly-spaced spiral arms (polar_grids/03_archimedean_spiral.c). */
 static void bg_archimedean_draw(const GridCtx *g)
 {
     const double two_pi = 2.0 * M_PI;
@@ -444,7 +332,8 @@ static void bg_archimedean_draw(const GridCtx *g)
     }
 }
 
-/* Mode 3 — golden log-spiral, 2 arms (polar_grids/04_log_spiral.c). */
+/* Mode 3 — two nautilus-shell spiral arms at the golden growth rate
+ * (polar_grids/04_log_spiral.c). */
 static void bg_log_spiral_draw(const GridCtx *g)
 {
     const double two_pi = 2.0 * M_PI;
@@ -465,10 +354,13 @@ static void bg_log_spiral_draw(const GridCtx *g)
     }
 }
 
-/* Mode 4 — Vogel sunflower phyllotaxis (polar_grids/05_sunflower.c). */
+/* Mode 4 — seeds packed in a sunflower-head spiral, golden-angle apart
+ * (polar_grids/05_sunflower.c). */
 static void bg_sunflower_draw(const GridCtx *g)
 {
     const double sp = 3.5;
+    /* Scratch "already drawn here?" grid so two seeds don't fight over one
+     * cell. Freed before we return — owned entirely by this call. */
     bool *vis = calloc((size_t)(g->rows * g->cols), 1);
     if (!vis) return;
 
@@ -485,7 +377,8 @@ static void bg_sunflower_draw(const GridCtx *g)
     free(vis);
 }
 
-/* Mode 5 — equal-area sector grid (polar_grids/06_sector.c). */
+/* Mode 5 — rings spaced so every ring band has the same area, plus spokes
+ * (polar_grids/06_sector.c). */
 static void bg_equal_area_draw(const GridCtx *g)
 {
     const double two_pi = 2.0 * M_PI;
@@ -508,7 +401,7 @@ static void bg_equal_area_draw(const GridCtx *g)
     }
 }
 
-/* Mode 6 — elliptic ring grid (polar_grids/07_elliptic.c). */
+/* Mode 6 — rings squashed into ovals instead of circles (polar_grids/07_elliptic.c). */
 static void bg_elliptic_draw(const GridCtx *g)
 {
     const double A = 1.6, B = 1.0, sp = 20.0, rwu = 0.07;
@@ -527,11 +420,7 @@ static void bg_elliptic_draw(const GridCtx *g)
     }
 }
 
-/*
- * draw_polar_bg — dispatch on g->mode and draw the matching polar grid.
- * Routes to one of seven bg_*_draw helpers (rings_spokes, log_polar,
- * archimedean, log_spiral, sunflower, equal_area, elliptic).  No mutation.
- */
+/* Picks the right backdrop for the current mode and draws it. */
 static void draw_polar_bg(const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_GRID));
@@ -547,18 +436,13 @@ static void draw_polar_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_GRID));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  spiral                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 spiral ── */
 
 /*
- * spiral_place_archim — walk Archimedean spiral r=r0+a×t, placing one dot
- * per DENSITY_STEP radians up to n_turns full turns.
- *
- * THE FORMULA:
- *   a = pitch / (2π)        [radial advance per radian]
- *   r(t) = r0 + a × t      [linear growth]
- *   θ(t) = theta0 + t,  t ∈ [0, n_turns × 2π]
+ * Stamp an Archimedean spiral into the pool. Sweep the angle from the start
+ * around n_turns times; at each tiny step the radius grows by a fixed amount,
+ * so the arms stay evenly spaced. We drop a dot wherever the curve lands.
+ * (Archimedean spiral: en.wikipedia.org/wiki/Archimedean_spiral)
  */
 static void spiral_place_archim(Pool *pool, double r0, double theta0,
                                  double pitch, int n_turns, double density,
@@ -576,18 +460,17 @@ static void spiral_place_archim(Pool *pool, double r0, double theta0,
 }
 
 /*
- * spiral_place_log — walk log-spiral r=r0×e^(growth×t), placing one dot
- * per DENSITY_STEP radians up to n_turns full turns.
- *
- * THE FORMULA:
- *   r(t) = r0 × e^(growth × t)   [exponential radial growth]
- *   r0 clamped to ≥1.0: r0=0 would give r=0 for all t (0×eˣ=0 always)
- *   Radius after 1 full turn: r0 × e^(growth × 2π)
+ * Stamp a logarithmic spiral into the pool. Same sweep, but here the radius
+ * grows by a percentage of its current size each step, so the arms spread
+ * wider and wider — the nautilus-shell look.
+ * (Logarithmic spiral: en.wikipedia.org/wiki/Logarithmic_spiral)
  */
 static void spiral_place_log(Pool *pool, double r0, double theta0,
                                double growth, int n_turns, double density,
                                const GridCtx *g)
 {
+    /* A start radius of 0 would stay stuck at 0 forever (growing a percentage
+     * of nothing is still nothing), so nudge it up to at least 1. */
     if (r0 < 1.0) r0 = 1.0;
     double theta_max = (double)n_turns * 2.0 * M_PI;
     for (double t = 0.0; t <= theta_max; t += density) {
@@ -599,11 +482,10 @@ static void spiral_place_log(Pool *pool, double r0, double theta0,
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 scene ── */
 
-/* Bright bold yellow status (top-right) + bold cyan key hints (bottom). */
+/* Draws the on-screen readouts: spiral stats top-right, key hints along the
+ * bottom. Kept bright and bold so they stay readable over the animation. */
 static void hud_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
                      bool log_mode, double pitch, double growth,
                      int n_turns, double density,
@@ -636,7 +518,8 @@ static void preview_draw(const GridCtx *g, const Cursor *cur,
                          bool log_mode, double pitch, double growth,
                          int n_turns, double density)
 {
-    /* live spiral preview — redrawn every frame from current cursor position */
+    /* Ghost of the spiral you'd stamp right now — recomputed from the cursor
+     * every frame so it follows you, but never saved into the pool. */
     double r0 = (cur->r < 1.0) ? 1.0 : cur->r;
     double a  = pitch / (2.0 * M_PI);
     double theta_max = (double)n_turns * 2.0 * M_PI;
@@ -667,9 +550,7 @@ static void scene_draw(const GridCtx *g, const Pool *pool, const Cursor *cur,
     wnoutrefresh(stdscr); doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §10  screen                                                             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §10 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(int theme)
@@ -680,9 +561,7 @@ static void screen_init(int theme)
     color_init(theme); atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §11  app                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §11 app ── */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 static void on_signal(int s)
@@ -720,7 +599,8 @@ int main(void)
             g_need_resize = 0; endwin(); refresh();
             rows = LINES; cols = COLS;
             ctx_init(&ctx, ctx.mode, rows, cols);
-            /* re-anchor cursor: keep (cur.r, cur.theta), recompute cell */
+            /* Center moved, so keep the cursor at the same radius/angle and
+             * work out its new cell. */
             polar_to_screen(cur.r, cur.theta, ctx.ox, ctx.oy, &cur.col, &cur.row);
             if (cur.row < 0)          cur.row = 0;
             if (cur.row >= ctx.rows-1) cur.row = ctx.rows-2;
@@ -739,10 +619,10 @@ int main(void)
                                 : (ctx.mode + 1) % N_BG_TYPES;
             ctx_init(&ctx, m, rows, cols);
             /*
-             * Auto-snap spiral law to match the background where applicable:
-             *   mode 2 (archimedean grid): use the grid's pitch
-             *   mode 3 (log-spiral grid):  use the grid's golden growth
-             * Other backgrounds leave the user's last spiral params alone.
+             * When you switch to a spiral backdrop, match your spiral to it so
+             * the preview lines up: the Archimedean grid (mode 2) and the
+             * log-spiral grid (mode 3) each set their own shape. Other
+             * backdrops leave your current spiral settings untouched.
              */
             if (ctx.mode == 2) { log_mode = false; pitch  = 32.0; }
             if (ctx.mode == 3) { log_mode = true;  growth = GROWTH_GOLDEN; }

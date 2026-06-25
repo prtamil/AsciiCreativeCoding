@@ -1,143 +1,16 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 09_sierpinski.c — Sierpinski triangle (3-way midpoint subdivision)
+ * 09_sierpinski.c — the Sierpinski triangle, drawn by repeated splitting.
  *
- * DEMO: One big equilateral triangle is recursively split into 3 corner
- *       sub-triangles via midpoint subdivision — the classic Sierpinski
- *       fractal. The centre (inverted) triangle that 08_triforce.c keeps
- *       is dropped, leaving the famous self-similar gasket. Use +/- to
- *       change depth (0..9). Triangle count grows as 3^N — much sparser
- *       than the triforce at the same depth.
+ * Take one big triangle, split it into three smaller corner triangles,
+ * then split each of those the same way, and so on. The little middle
+ * triangle at each step is thrown away, which leaves the famous hole-filled
+ * "gasket" shape. +/- changes how many times we split (depth 0..9).
  *
- * Study alongside: 08_triforce.c — same midpoint split, but keeps all 4
- *                  children (4^N leaves vs 3^N here).
- *                  07_barycentric.c — 6-way split (centroid-anchored).
- *                  ../README.md — GridCtx primitive (this file builds a
- *                  mesh on demand instead of a per-pixel inverse).
- *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, DEPTH, SIZE_FRAC, EWMA constant
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — depth-keyed palette + HUD / hint
- *   §4 formula  — GridCtx + ctx_init + slope_char + Bresenham line_draw
- *   §5 mesh     — 3-way recursive subdivide (drops centre child)
- *                 (no Cursor — depth is the user-controlled parameter,
- *                  arrow keys go unused; +/- adjusts depth instead)
- *   §6 scene    — hud_draw + scene_draw (seed triangle + recursion)
- *   §7 screen   — ncurses init / cleanup
- *   §8 app      — signals, main loop
- *
- * Keys:  +/- depth   [/] size   r reset   t theme   p pause   q/ESC quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids/09_sierpinski.c \
- *       -o 09_sierpinski -lncurses -lm
+ * Sister files: 08_triforce.c keeps all four children at each split (a
+ *   denser figure); 07_barycentric.c splits each triangle six ways. See
+ *   ../README.md for the shared GridCtx idea.
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Sierpinski triangle (Sierpiński 1915). Take the
- *                  midpoint subdivision of 08_triforce, but keep ONLY
- *                  the three corner children — drop the inverted centre.
- *                  The fractal limit set has Hausdorff dimension log₂3
- *                  ≈ 1.585, area zero, infinite perimeter. At finite
- *                  depth N the drawn figure has 3^N triangles, each at
- *                  scale 2⁻ᴺ.
- *
- * Data-structure : GridCtx carries the recursion parameters (depth,
- *                  size_frac) and screen extent. No persistent mesh array
- *                  — the recursion emits each leaf's edges directly into
- *                  the framebuffer. See ../README.md "The two primitives".
- *
- * Formula        : Same midpoint subdivision as 08; only 3 of the 4
- *                  children are kept. Recursion depth controlled by +/-
- *                  keys (0..9).
- *
- * Edge chars     : Same Bresenham + slope_char as 07/08. Color keyed
- *                  to depth.
- *
- * Movement       : None — depth is the user-controlled parameter.
- *
- * References     :
- *   Sierpinski triangle  — https://en.wikipedia.org/wiki/Sierpinski_triangle
- *   Sierpiński 1915 — original construction (in French)
- *   Mandelbrot, "The Fractal Geometry of Nature" (1982) §6
- *   Iterated function systems — Hutchinson 1981
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Same midpoint split as the Triforce — but throw away the centre piece.
- * Three corner triangles remain at every step; recurse on each. The holes
- * left by all the discarded centres at every scale produce the famous
- * Sierpinski gasket — a fractal with finite circumference at any depth
- * but zero area in the limit.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Sierpinski is THE example of a self-similar fractal with non-integer
- * Hausdorff dimension. The dimension log₂3 ≈ 1.585 says the gasket is
- * "more than a 1-D curve, less than a 2-D area". Each refinement step
- * removes 1/4 of the remaining area, so after N steps the figure occupies
- * (3/4)^N of the original area, tending to zero — yet the perimeter
- * (sum of edge lengths) grows by a factor of 3/2 per step, tending to
- * infinity. Finite-area zero, infinite-length perimeter.
- *
- * Our renderer draws all leaves at chosen depth N. The "holes" in the
- * gasket are simply the regions not visited by any leaf — those are the
- * dropped centres at every level.
- *
- * DRAWING METHOD  (recursive emit)
- * ──────────────
- *  1. Pick DEPTH and SIZE_FRAC.
- *  2. Build seed equilateral triangle.
- *  3. subdivide(t, depth):
- *       if depth == max_depth: draw 3 edges
- *       else:
- *         compute 3 midpoints
- *         build 3 corner children — DROP the inverted centre
- *         recurse on each corner
- *  4. Bresenham line_draw per leaf edge.
- *
- * KEY FORMULAS
- * ────────────
- *  Edge midpoints, identical to 08_triforce:
- *    M01 = (V0+V1)/2,  M12 = (V1+V2)/2,  M20 = (V2+V0)/2
- *
- *  Three children kept (no centre):
- *    Corner-V0:  (V0, M01, M20)
- *    Corner-V1:  (M01, V1, M12)
- *    Corner-V2:  (M20, M12, V2)
- *
- *  Leaf count at depth N: 3^N
- *  Hausdorff dimension:   log₂3 = ln 3 / ln 2 ≈ 1.585
- *  Area at depth N:       (3/4)^N · A₀
- *  Perimeter at depth N:  (3/2)^N · P₀
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • The centre is "dropped" simply by NOT recursing into it. Nothing to
- *    erase — we just draw fewer leaves than 08.
- *  • Stack depth at N=9 is fine (3^9 = 19683 leaves; deepest path is 9
- *    frames).
- *  • At small DEPTH the figure looks like a hollow triangle. Pump DEPTH
- *    up and the recursive holes appear at every scale.
- *
- * HOW TO VERIFY
- * ─────────────
- *  At depth 0: 3^0 = 1 leaf — original triangle.
- *  At depth 1: 3 leaves — 3 corner triangles, centre HOLE visible.
- *  At depth 2: 9 leaves — each corner child further split into 3.
- *  At depth 5: 3^5 = 243 leaves; visible hole pattern at three scales.
- *
- *  Compare with 08_triforce at the same depth: triforce shows 4^5 = 1024
- *  leaves filling the entire triangle; sierpinski shows 243 leaves with
- *  the characteristic gasket holes.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -154,9 +27,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 
@@ -175,16 +46,14 @@
 #define MAX_DEPTH_LEVELS (DEPTH_MAX + 1)
 #define N_THEMES         3
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How much each new frame nudges the on-screen fps number. Small = steadier. */
 #define FPS_EWMA_ALPHA 0.05
 
 #define PAIR_DEPTH_BASE  1
 #define PAIR_HUD        (PAIR_DEPTH_BASE + MAX_DEPTH_LEVELS)
 #define PAIR_HINT       (PAIR_HUD + 1)
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -201,9 +70,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static const short PAL256[N_THEMES][MAX_DEPTH_LEVELS] = {
     /* electric */ { 15, 39, 82, 226, 196, 207, 21,  39,  15,  15 },
@@ -234,20 +101,19 @@ static void color_init(int theme)
     init_pair(PAIR_HINT, COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx + slope_char + Bresenham line                     */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula — triangle geometry + line drawing ── */
 
 /*
- * GridCtx — geometry + recursion parameters for the substitution mesh.
- * See 07_barycentric.c for the canonical version of this struct.
+ * GridCtx — everything we need to know to place and size the drawing on the
+ * current terminal. Rebuilt every frame so a window resize is handled for free.
+ * (07_barycentric.c has the original version of this struct.)
  */
 typedef struct {
-    int    rows, cols;
-    int    cw, ch;
-    int    ox, oy;
-    int    depth;
-    double size_frac;
+    int    rows, cols;   /* terminal size, in character cells               */
+    int    cw, ch;       /* sub-cell resolution: steps per cell, wide x tall */
+    int    ox, oy;       /* where the triangle is centred, in sub-cell units */
+    int    depth;        /* how many times to split (0..9)                  */
+    double size_frac;    /* how much of the screen the triangle fills (0..1) */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols, int depth, double size_frac)
@@ -291,14 +157,9 @@ static void line_draw(const GridCtx *g, double px0, double py0,
     attroff(attr);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  mesh — 3-way recursive subdivide                                    */
-/* ═══════════════════════════════════════════════════════════════════════ */
-/*
- * No Cursor struct: as in 07/08, the user navigates by changing DEPTH
- * and SIZE_FRAC, not by stepping through individual leaves.
- */
+/* ── §5 mesh — split each triangle into three corners ── */
 
+/* One triangle: its three corners, as x/y positions in sub-cell units. */
 typedef struct { double x[3], y[3]; } Tri;
 
 static void tri_draw_edges(const GridCtx *g, Tri t, int depth)
@@ -311,8 +172,9 @@ static void tri_draw_edges(const GridCtx *g, Tri t, int depth)
 }
 
 /*
- * subdivide — keep only the 3 corner children. The inverted centre
- * (the "hole") is silently dropped, producing the gasket.
+ * Split a triangle into its three corner triangles and recurse into each.
+ * We never recurse into the middle one, so it stays empty — that missing
+ * middle, repeated at every scale, is what makes the Sierpinski holes.
  */
 static void subdivide(const GridCtx *g, Tri t, int depth, int max_depth)
 {
@@ -345,15 +207,14 @@ static Tri scene_seed(const GridCtx *g)
     return t;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
+/* The handful of settings the keys change — all the live state we keep. */
 typedef struct {
-    int    depth;
-    double size_frac;
-    int    theme;
-    int    paused;
+    int    depth;        /* how many split levels to draw (0..9)        */
+    double size_frac;    /* how big the triangle is, as a fraction of screen */
+    int    theme;        /* which color set is active                   */
+    int    paused;       /* nothing animates here, but kept for the HUD */
 } Scene;
 
 static void scene_reset(Scene *s)
@@ -392,9 +253,7 @@ static void scene_draw(const GridCtx *g, const Scene *s, double fps)
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -409,9 +268,7 @@ static void screen_init(int theme)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;

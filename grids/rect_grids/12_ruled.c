@@ -1,144 +1,13 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 12_ruled.c — ruled lines only (horizontal stripes, no vertical lines)
+ * 12_ruled.c — ruled lines only, like the horizontal lines on notebook paper.
  *
- * DEMO: Only horizontal lines are drawn — like notebook ruled paper.
- *       The cursor snaps vertically to lines (rows), but moves freely
- *       along each line (free column). This is a degenerate 2-D grid:
- *       it divides the Y axis but leaves the X axis continuous.
+ * Only horizontal lines are drawn. The cursor jumps from line to line going
+ * up/down, but slides freely left/right anywhere along a line — so the up/down
+ * axis is stepped while the left/right axis is continuous.
  *
- * Study alongside: 01_uniform_rect.c (adds vertical lines), 13_dot.c
- *
- * Section map:
- *   §1 config   — LINE_STEP (row spacing), COL_STEP (free-axis step), EWMA
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 5 pairs (line, active, cursor, HUD, HINT)
- *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_grid_char / ctx_draw_bg
- *   §5 cursor   — Cursor (line, col) — two INDEPENDENT axes
- *   §6 scene    — hud_draw + scene_draw
- *   §7 screen   — ncurses init / cleanup
- *   §8 app      — signals, main loop
- *
- * Keys:  arrows move @   r reset   q/ESC quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/rect_grids/12_ruled.c \
- *       -o 12_ruled -lncurses
+ * Study alongside 01_uniform_rect.c (the same idea but with vertical lines too).
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : The 1-D lattice applied only to the Y axis (rows).
- *                  Grid lines at: sr % LINE_STEP == 0
- *                  No constraint on the X axis — cursor column is free.
- *
- * Degenerate grid: A "ruled" grid is a rectangular grid with CELL_W → ∞.
- *                  Each "cell" is an infinite horizontal strip.
- *                  Practical interpretation: LINE_STEP rows between lines.
- *
- * Cursor position: Two independent coordinates:
- *                    line  — which ruled line the cursor is on (integer)
- *                    col   — horizontal position along the line (integer, free)
- *
- *                  screen_row = line * LINE_STEP  (on a ruled line)
- *                  screen_col = col               (free: 0 .. COLS-1)
- *
- * Movement:
- *   UP/DOWN   → line ± 1        (jump to adjacent line)
- *   LEFT/RIGHT → col ± COL_STEP (move along the line)
- *
- * References     :
- *   Ruled paper — en.wikipedia.org/wiki/Ruled_paper
- *   1-D lattice  — en.wikipedia.org/wiki/Lattice_(group)
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ──────────
- * A ruled grid is a rectangular grid with CELL_W set to infinity.  There
- * is only ONE family of lines: horizontal.  The Y axis is divided into
- * discrete "lines" (rows); the X axis is continuous.  The cursor has two
- * INDEPENDENT coordinates: a discrete line index and a free column position.
- *
- * HOW TO THINK ABOUT IT — TWO INDEPENDENT AXES
- * ─────────────────────────────────────────────
- * Think of a musical staff, a notebook, or a time chart.  Lines divide
- * the vertical space; horizontal space is free.  The cursor sits ON a
- * ruled line, at any horizontal position along it.
- *
- * The two independent coordinates:
- *   line  (discrete):  which ruled line the cursor is on.
- *                      Ranges from 0 to (LINES-2)/LINE_STEP - 1.
- *   col   (integer):   horizontal position in screen columns.
- *                      Ranges from 0 to COLS-1.
- *
- * Movement is NOT symmetric:
- *   UP/DOWN keys → change line by ±1           (jump to next/prev line)
- *   LEFT/RIGHT   → change col  by ±COL_STEP    (slide along the line)
- *
- * There is no ctx_to_screen in the usual sense:
- *   screen_row = line * LINE_STEP      (discrete Y)
- *   screen_col = col                   (free X, no scaling needed)
- *
- * DRAWING METHOD
- * ──────────────
- *  Per screen row sr:
- *    on_line = (sr % LINE_STEP == 0)
- *    if on_line AND sr == active_line * LINE_STEP:
- *        draw the active line with ACTIVE color (different from inactive)
- *    else if on_line:
- *        draw a regular ruled line with GRID color
- *    else:
- *        skip (empty space between lines)
- *
- *  For each ruled line: fill the entire screen row with '-' characters.
- *  Then draw '@' at the cursor's (line*LINE_STEP, col) position on top.
- *
- * KEY FORMULAS
- * ────────────
- *  Line position:
- *    screen_row = line * LINE_STEP     (maps line index to screen row)
- *    line       = screen_row / LINE_STEP  (inverse: screen row -> line)
- *
- *  Line membership test (same formula as all other grids):
- *    is_ruled_line(sr) = (sr % LINE_STEP == 0)
- *
- *  Number of visible lines:
- *    num_lines = (LINES - 1) / LINE_STEP
- *
- *  Column movement:
- *    new_col = clamp(col + dc * COL_STEP, 0, COLS-1)
- *
- *  This is a degenerate rectangular grid:
- *    CELL_H = LINE_STEP,   CELL_W = ∞ (no vertical lines)
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • LINE_STEP=1: every screen row is a ruled line — solid horizontal
- *    fill.  Minimum: LINE_STEP=2 for visible inter-line space.
- *
- *  • COL_STEP=1: very slow left/right movement.  Increase COL_STEP
- *    for faster navigation across the line.  COL_STEP=4 or 8 works well.
- *
- *  • The cursor is always on a ruled line (screen_row = line*LINE_STEP).
- *    Never place '@' between lines.  The line index is always an integer.
- *
- *  • There is no column grid structure.  If you add a column marker or
- *    pointer it must be drawn explicitly — there is no modular condition
- *    for the column position.
- *
- *  • After terminal resize: recompute max_line = (LINES-1)/LINE_STEP - 1
- *    and clamp cursor.line to the new max.
- *
- * HOW TO VERIFY
- * ─────────────
- *  Count the number of ruled lines on a 24-row terminal with LINE_STEP=3:
- *    Lines at rows: 0, 3, 6, 9, 12, 15, 18, 21 -> 8 lines.
- *    floor((LINES-1) / LINE_STEP) + 1 = floor(23/3) + 1 = 7 + 1 = 8. ✓
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
@@ -150,25 +19,17 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS   30
 
-/*
- * LINE_STEP — rows between consecutive ruled lines.
- * Compare to CELL_H in 01_uniform_rect: same formula, only in Y.
- */
-#define LINE_STEP    3    /* screen rows between ruled lines */
+/* How many screen rows sit between one ruled line and the next. */
+#define LINE_STEP    3
 
-/*
- * COL_STEP — how many columns to advance per LEFT/RIGHT keypress.
- * With free column movement, a step > 1 makes navigation faster.
- */
+/* How far left/right one arrow press moves. Bigger = quicker travel. */
 #define COL_STEP     4
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How hard the shown FPS number is smoothed, so it doesn't jitter. */
 #define FPS_EWMA_ALPHA  0.05
 
 #define PAIR_LINE    1   /* ruled lines                    */
@@ -177,9 +38,7 @@
 #define PAIR_HUD     4
 #define PAIR_HINT    5
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -194,9 +53,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static void color_init(void)
 {
@@ -208,21 +65,24 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx and the ruled-line geometry                      */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula — where the ruled lines fall ── */
 
 /*
- * GridCtx — terminal extent + ruled-line spacing + cursor bounds.
+ * GridCtx — everything we need to place the lines and keep the cursor on screen.
  *
- * Note the asymmetry: line_step is the discrete Y-step; the X axis is free,
- * so no "cw" is carried.  max_line bounds the vertical line index;
- * max_col is just cols-1 (the cursor can sit anywhere along a line).
+ * The two axes are deliberately lopsided: up/down is stepped, left/right is free.
+ * So we keep a line_step (rows between lines) for the stepped axis but nothing
+ * similar for the free axis — the cursor can land on any column.
+ *
+ *   rows, cols  — current terminal size, in characters.
+ *   line_step   — screen rows from one ruled line to the next.
+ *   max_line    — highest line index the cursor may sit on (0-based).
+ *   max_col     — rightmost column the cursor may sit on (cols - 1).
  */
 typedef struct {
     int rows, cols;
-    int line_step;           /* screen rows between ruled lines */
-    int max_line, max_col;   /* cursor bounds */
+    int line_step;
+    int max_line, max_col;
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols)
@@ -233,27 +93,14 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->max_col  = cols - 1;
 }
 
-/*
- * RULED GRID FORMULA — the cursor's (line, col) maps directly to screen as:
- *
- *   screen_row = line * line_step
- *   screen_col = col                  (free — no CELL_W scale)
- *
- * Grid line detection: a screen row sr is a ruled line when:
- *   sr % line_step == 0
- *
- * No vertical line condition — that's what makes it "ruled" not "rect".
- */
+/* Is this screen row one of the ruled lines? Every line_step-th row is. */
 static char ctx_grid_char(const GridCtx *g, int sr, int sc)
 {
     (void)sc;
     return (sr % g->line_step == 0) ? '-' : ' ';
 }
 
-/*
- * ctx_draw_bg — paint each ruled row with '-', highlighting the active line.
- * The active line uses PAIR_ACTIVE; others use PAIR_LINE.
- */
+/* Draw all the ruled lines, painting the one the cursor is on in its own color. */
 static void ctx_draw_bg(const GridCtx *g, int active_line)
 {
     for (int sr = 0; sr < g->rows - 1; sr++) {
@@ -267,14 +114,13 @@ static void ctx_draw_bg(const GridCtx *g, int active_line)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 cursor ── */
 
 /*
- * Cursor — TWO INDEPENDENT AXES (kept separate from the (r,c) of other files):
- *   line — discrete vertical index (which ruled line)
- *   col  — free horizontal position in screen columns
+ * Cursor — the @ marker, tracked as two separate numbers because its two
+ * axes behave differently:
+ *   line — which ruled line it's on (a whole-number index, 0 = top line).
+ *   col  — its left/right spot, measured straight in screen columns.
  */
 typedef struct {
     int line;
@@ -287,11 +133,8 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->col  = g->cols / 2;
 }
 
-/*
- * cursor_move — two independent axes:
- *   UP/DOWN    → dline ± 1
- *   LEFT/RIGHT → dcol ± 1, scaled by COL_STEP, clamped to [0, max_col]
- */
+/* Move the cursor: up/down hops a whole line, left/right slides by COL_STEP.
+ * A move that would leave the screen is simply ignored. */
 static void cursor_move(Cursor *cur, const GridCtx *g, int dline, int dcol)
 {
     int nl = cur->line + dline;
@@ -308,9 +151,7 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
 {
@@ -338,9 +179,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
     wnoutrefresh(stdscr); doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(void)
@@ -351,9 +190,7 @@ static void screen_init(void)
     color_init(); atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 static void on_signal(int s)

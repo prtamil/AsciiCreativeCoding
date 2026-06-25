@@ -1,135 +1,16 @@
 /*
- * 03_axial.c — flat-top hex grid with axial labels and keyboard cursor
+ * 03_axial.c — a flat-top hex grid where every hexagon is labeled with its
+ * own coordinates. You drive a cursor around with the arrow keys; the three
+ * coordinate axes glow in different colors so you can see how hex space is
+ * laid out.
  *
- * DEMO: Each hexagon shows its "Q,R" axial coordinates. The cursor hex is
- *       highlighted white-on-blue with '@' at its center. Q=0/R=0/S=0 axes
- *       glow in cyan/green/yellow so you can trace them across the plane.
+ * Hexes use axial coordinates (Q, R): two numbers per hex. There's a third,
+ * S = -Q-R, but it's always derivable, so we only ever store Q and R.
  *
- * Study alongside: grids/hex_grids/01_flat_top.c (same Cursor + HEX_DIR;
- *                  this file adds a label pass)
- *
- * Section map:
- *   §1 config   — tunable constants, EWMA alpha
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — axis color pairs (Q/R/S/origin/cursor) + HUD/HINT
- *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_pixel_to_axial /
- *                 ctx_draw_bg (Pass 1) / ctx_draw_labels (Pass 2)
- *                 + cube_round + angle_char + hex_color
- *   §5 cursor   — Cursor + cursor_reset / cursor_move / cursor_draw, HEX_DIR
- *   §6 scene    — hud_draw + two-pass scene_draw
- *   §7 screen   — ncurses display layer
- *   §8 app      — signals, resize, main loop
- *
- * Keys:  q/ESC quit  p pause  r reset  arrows move  +/-:size  [/]:border
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/hex_grids/03_axial.c \
- *       -o 03_axial -lncurses -lm
+ * Sister file: grids/hex_grids/01_flat_top.c — same grid and cursor; this one
+ * adds the coordinate labels on top.
+ * Coordinate background: https://www.redblobgames.com/grids/hexagons/#coordinates-axial
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Two-pass render. Pass 1 (ctx_draw_bg): hex borders
- *                  colored by axis membership. Pass 2 (ctx_draw_labels):
- *                  enumerate visible hexes, print label at each center.
- *                  Labels land on interior cells (dist≈0) skipped in pass 1.
- *
- * Data-structure : Same GridCtx + Cursor as 01_flat_top. Pass 2 enumerates
- *                  the visible (Q,R) range derived from screen bounds +
- *                  hex_size to print labels. Axis membership (Q=0, R=0, S=0)
- *                  is a runtime test on the current (Q,R), not stored.
- *
- * Cursor movement : Same HEX_DIR[4][2] as 01_flat_top. '@' drawn in a third
- *                  pass so it always sits on top of the label. Cursor hex
- *                  border is drawn in PAIR_CURSOR in pass 1.
- *
- * References     :
- *   Axial vs cube — https://www.redblobgames.com/grids/hexagons/#coordinates-axial
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Axial coordinates (Q, R) are a 2-component alias for cube coordinates.
- * Since S = −Q−R is always derivable, you only need to store Q and R.
- * This file makes the coordinate structure visible: each hex displays its
- * own (Q,R) label, and the three coordinate axes are colored differently
- * so you can see how the hex plane is partitioned.
- *
- * The three axis planes of cube space slice the hex plane into six sectors:
- *   Q=0 axis  (cyan):   hexes where Q=0  — a diagonal band of hexes
- *   R=0 axis  (green):  hexes where R=0  — another diagonal band
- *   S=0 axis  (yellow): hexes where S=0, i.e., Q+R=0 — the third band
- *   Origin    (white):  the single hex where Q=R=0 (S=0 automatically)
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine the hexagonal plane as the diagonal cross-section of a 3-D cubic
- * lattice. Each hex corresponds to a unit cube whose (x,y,z) coordinates
- * satisfy x+y+z=0. The Q=0 axis is the set of cubes where x=0 — a plane
- * in 3-D that slices the hex plane as a line of hexes.
- *
- * Moving RIGHT (+Q): you climb along the Q-axis; the label's Q number
- *   increases by 1, R stays the same.
- * Moving DOWN (+R): R number increases by 1, Q stays the same.
- * Moving diagonally (would be NE or SW): both Q and R change.
- *
- * The label in each hex lets you directly read off the coordinate system
- * rather than counting from the origin — very useful when learning hex math.
- *
- * DRAWING METHOD  (two-pass rendering)
- * ─────────────────────────────────────
- *  PASS 1 — ctx_draw_bg (border rasterizer, same as 01_flat_top):
- *   For each screen cell, compute cube coords (Q,R) and cube distance.
- *   If border pixel: draw angle_char in the color given by hex_color(Q,R).
- *   hex_color priority: cursor > origin > Q-axis > R-axis > S-axis > default.
- *
- *  PASS 2 — ctx_draw_labels (label printer):
- *   Loop over all (Q,R) whose hex center would be on screen.
- *   Compute screen cell via ctx_to_screen. Print "Q,R" centered on that
- *   cell in the appropriate axis color. This pass only writes interior
- *   cells (never border cells), so pass 1 characters are not overwritten
- *   by labels.
- *
- *  PASS 3 — cursor_draw ('@'):
- *   Draw '@' on top of the label in the cursor hex. Must be last so '@'
- *   overwrites the label character at the cursor hex center.
- *
- * KEY FORMULAS
- * ────────────
- *  hex_color priority (highest wins):
- *    cursor      if Q==cur->q && R==cur->r
- *    origin      if Q==0  && R==0
- *    Q-axis      if Q==0
- *    R-axis      if R==0
- *    S-axis      if −Q−R==0  (i.e., Q+R=0)
- *    default     otherwise
- *
- *  Visible hex count (for label pass iteration bounds):
- *    Qmax ≈ cols × CELL_W / (1.5 × size)
- *    Rmax ≈ rows × CELL_H / (√3  × size)
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Label centering: "Q,R" has variable length (e.g., "-10,-3" is 7 chars).
- *    Use lx = sc − len/2 and guard lx >= 0 && lx+len < cols.
- *
- *  • At large sizes the label may be wider than the hex interior. Guard with
- *    sc > 2 && sc < cols-2 to avoid partial labels at screen edges.
- *
- *  • hex_color: cursor check must come FIRST — if cur->q=0, the cursor hex
- *    is also on the Q-axis; we want cursor color to win over axis color.
- *
- * HOW TO VERIFY  (80×24 terminal, HEX_SIZE=20)
- * ─────────────
- *  Origin hex (Q=0, R=0): label "0,0" drawn in white (PAIR_ORIGIN), '@' on top.
- *  Hex (1, 0): cx = 20×1.5=30 pixels → col = 40+15=55.  label "1,0" in green (R=0).
- *  Hex (0, 1): cy = 20×√3=34.6 px → row = 11+8=19.     label "0,1" in cyan (Q=0).
- *  Hex (1,-1): Q+R = 0 → S-axis color (yellow).         label "1,-1".
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -144,9 +25,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define CELL_W             2
 #define CELL_H             4
@@ -163,12 +42,10 @@
 
 #define TICK_NS           16666667LL
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How fast the on-screen FPS number reacts. Smaller = steadier, slower to move. */
 #define FPS_EWMA_ALPHA     0.05
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -184,16 +61,14 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&ts, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 #define PAIR_DEFAULT  1
-#define PAIR_Q_AXIS   2   /* cyan   — hexes where Q=0 */
-#define PAIR_R_AXIS   3   /* green  — hexes where R=0 */
-#define PAIR_S_AXIS   4   /* yellow — hexes where S=Q+R=0 */
-#define PAIR_ORIGIN   5   /* white  — the single hex (0,0,0) */
-#define PAIR_CURSOR   6   /* cursor hex: white-on-blue */
+#define PAIR_Q_AXIS   2   /* cyan   — the line of hexes where Q is 0 */
+#define PAIR_R_AXIS   3   /* green  — the line of hexes where R is 0 */
+#define PAIR_S_AXIS   4   /* yellow — the line where S is 0 (i.e. Q+R is 0) */
+#define PAIR_ORIGIN   5   /* white  — the one hex at the center, (0,0) */
+#define PAIR_CURSOR   6   /* the hex you're currently on: white on blue */
 #define PAIR_HUD      7   /* yellow status bar */
 #define PAIR_HINT     8   /* cyan key-hint footer */
 
@@ -212,15 +87,10 @@ static void color_init(void)
 }
 
 /*
- * hex_color — pick color pair for hex (Q,R) based on axis membership.
- *
- * Pure helper — keeps its domain name. THE PRIORITY ORDER (first match wins):
- *   1. cursor   — must be first so moving onto an axis hex shows cursor color
- *   2. origin   — (0,0) gets special white display
- *   3. Q=0 axis — cyan diagonal band
- *   4. R=0 axis — green band
- *   5. S=0 axis — yellow band (S = −Q−R, so S=0 means Q+R=0)
- *   6. default  — all other hexes
+ * Picks the color for one hex. Order matters: the first thing that matches
+ * wins. The cursor is checked first on purpose — if you park the cursor on a
+ * hex that also sits on an axis, you want it to look like the cursor, not the
+ * axis.
  */
 static int hex_color(int Q, int R, int cQ, int cR)
 {
@@ -232,29 +102,31 @@ static int hex_color(int Q, int R, int cQ, int cR)
     return PAIR_DEFAULT;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx and the hex ↔ screen mapping (flat-top)           */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula — turning hex coordinates into screen cells, and back ── */
 
 /*
- * GridCtx — geometry of the active flat-top hex grid (with axis labels).
- *
- * Same shape as 01_flat_top. The only file-specific extra would be label
- * formatting state, but that's stack-local in ctx_draw_labels.
+ * GridCtx — everything we need to know to draw the grid at its current size
+ * and position. Recomputed whenever the terminal resizes or the user changes
+ * the hex size. Same layout as 01_flat_top.c.
  */
 typedef struct {
-    /* terminal extent */
+    /* Size of the terminal, in character cells. */
     int rows, cols;
 
-    /* hex geometry */
+    /* How big each hexagon is and how thick its border looks.
+     * hex_size: roughly the corner-to-center distance, in sub-pixels.
+     * border_w: fraction of a hex (0..0.5) treated as "edge" rather than inside. */
     double hex_size;
     double border_w;
+    /* How many sub-pixels one terminal cell is worth, width and height.
+     * Terminal cells are taller than they are wide, so these differ. */
     int    cell_w, cell_h;
 
-    /* screen origin = pixel (0,0) */
+    /* The screen cell that the grid's center (hex 0,0) sits on. */
     int    ox, oy;
 
-    /* cursor bounds in axial space (advisory) */
+    /* Rough count of how far the grid reaches in each direction. Advisory only:
+     * used to bound loops, not to clip — the per-hex on-screen checks do that. */
     int    max_q, max_r;
 } GridCtx;
 
@@ -272,11 +144,7 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->max_r = (int)((double)rows * CELL_H / (sqrt(3.0) * g->hex_size)) + 1;
 }
 
-/*
- * ctx_to_screen — center cell of flat-top hex (Q, R) in screen coordinates.
- *   cx_pix = size × 3/2 × Q
- *   cy_pix = size × (√3/2 × Q + √3 × R)
- */
+/* Given a hex's (Q, R), find the screen cell its center lands on. */
 static void ctx_to_screen(const GridCtx *g, int Q, int R, int *sr, int *sc)
 {
     double sq3   = sqrt(3.0);
@@ -287,7 +155,8 @@ static void ctx_to_screen(const GridCtx *g, int Q, int R, int *sr, int *sc)
     *sr = g->oy + (int)(cy_pix / g->cell_h);
 }
 
-/* cube_round — see 01_flat_top for full documentation. */
+/* Snaps fractional hex coordinates to the nearest real hex. Full write-up
+ * lives in 01_flat_top.c. */
 static void cube_round(double fq, double fr, double fs, int *Q, int *R)
 {
     int rq = (int)round(fq), rr = (int)round(fr), rs = (int)round(fs);
@@ -299,6 +168,8 @@ static void cube_round(double fq, double fr, double fs, int *Q, int *R)
     *Q = rq; *R = rr;
 }
 
+/* The reverse of ctx_to_screen: which hex does a screen cell fall in?
+ * Kept for reference and symmetry; this demo doesn't currently call it. */
 __attribute__((unused))
 static void ctx_pixel_to_axial(const GridCtx *g, int sr, int sc, int *Q, int *R)
 {
@@ -311,7 +182,8 @@ static void ctx_pixel_to_axial(const GridCtx *g, int sr, int sc, int *Q, int *R)
     cube_round(fq, fr, fs, Q, R);
 }
 
-/* angle_char — same as 01_flat_top. */
+/* Picks a slash, dash or bar to suggest the slope of a hex edge at this point.
+ * Same as 01_flat_top.c. */
 static char angle_char(double theta)
 {
     double t = fmod(theta, M_PI);
@@ -324,19 +196,11 @@ static char angle_char(double theta)
 }
 
 /*
- * ctx_draw_bg — Pass 1: hex borders colored by axis membership.
- *
- * Same per-pixel pipeline as 01_flat_top ctx_draw_bg. The only difference:
- * instead of PAIR_BORDER/PAIR_CURSOR, the color is chosen by hex_color(),
- * which returns an axis-specific pair.
- *
- * Border cells are visited in raster order. Interior cells are skipped
- * (dist < limit). This means label pass 2 can safely write to interior
- * cells without colliding with border characters.
- *
- * Attribute selection:
- *   PAIR_ORIGIN or PAIR_CURSOR: A_BOLD for prominence
- *   Axis colors (Q/R/S):        no bold — dimmer than axis origin
+ * Pass 1: draw the hex outlines. We walk every screen cell, figure out which
+ * hex it belongs to and how close it is to that hex's edge, and only draw the
+ * cells near an edge — the insides are left blank on purpose so the labels in
+ * pass 2 have room. Each edge is tinted by which axis (if any) its hex is on.
+ * Same pixel-by-pixel approach as 01_flat_top.c.
  */
 static void ctx_draw_bg(const GridCtx *g, int cQ, int cR)
 {
@@ -387,24 +251,11 @@ static void ctx_draw_bg(const GridCtx *g, int cQ, int cR)
 }
 
 /*
- * ctx_draw_labels — Pass 2: print "Q,R" at each visible hex center.
- *
- * THE FORMULA (hex enumeration + forward projection via ctx_to_screen):
- *
- *   Iteration bounds (conservative — screens outside are clipped below):
- *     Qmax = cols×CELL_W / (1.5×size) + 3
- *     Rmax = rows×CELL_H / (√3×size)  + 3
- *
- *   For each (Q,R) in [−Qmax..Qmax] × [−Rmax..Rmax]:
- *     ctx_to_screen → (sr, sc)
- *     If on screen: format label, print centered.
- *     Label text: snprintf(buf, sizeof buf, "%d,%d", Q, R)
- *     Centering:  lx = sc - len/2
- *
- * Attribute selection:
- *   cursor hex: A_BOLD | A_REVERSE — very visible (inverted colors)
- *   origin:     A_BOLD
- *   axis hexes: A_DIM  — labels recede; borders dominate visually
+ * Pass 2: stamp each hex's "Q,R" label in its middle. We sweep a range of
+ * (Q,R) values wide enough to cover the screen (a little extra, then we just
+ * skip any whose center lands off-screen), and print the text centered on the
+ * hex. The cursor and origin labels are made bold so they stand out; ordinary
+ * axis labels are dimmed so the colored outlines stay the star of the show.
  */
 static void ctx_draw_labels(const GridCtx *g, int cQ, int cR)
 {
@@ -435,12 +286,12 @@ static void ctx_draw_labels(const GridCtx *g, int cQ, int cR)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 cursor ── */
 
 /*
- * Cursor — just (q, r) in axial hex space. Same struct as 01_flat_top.
+ * Cursor — where the '@' currently sits, as a hex coordinate (q, r). That's
+ * all the state we need; everything else about it is computed from the grid.
+ * Same struct as 01_flat_top.c.
  */
 typedef struct { int q, r; } Cursor;
 
@@ -452,13 +303,9 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
 }
 
 /*
- * HEX_DIR — 4-direction axial movement (same as 01_flat_top §5).
- *
- * Navigating axial labels:
- *   RIGHT (+Q): Q value on label increases by 1, R unchanged.
- *   DOWN  (+R): R value on label increases by 1, Q unchanged.
- * The axis highlighting follows the cursor — moving onto a Q=0 hex while
- * the cursor is there shows PAIR_CURSOR, not PAIR_Q_AXIS.
+ * HEX_DIR — how each arrow key nudges (Q, R). Right/left change Q, down/up
+ * change R, so you can watch a label's two numbers tick up and down as you
+ * move. Same table as 01_flat_top.c.
  */
 static const int HEX_DIR[4][2] = {
     { 0, -1 },   /* UP    */
@@ -474,12 +321,8 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dq, int dr)
     cur->r += dr;
 }
 
-/*
- * cursor_draw — '@' at cursor hex center, drawn last (on top of label).
- *
- * Drawn AFTER ctx_draw_labels so '@' overwrites the label character at
- * the center cell. The label is still partially visible in adjacent cells.
- */
+/* Drops the '@' on the cursor hex. Called after the labels so it lands on top
+ * of the label's middle character instead of being hidden under it. */
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc;
@@ -491,9 +334,7 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, int paused, double fps)
 {
@@ -525,9 +366,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, int paused, double f
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -541,9 +380,7 @@ static void screen_init(void)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;

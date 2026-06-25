@@ -1,137 +1,14 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 11_checkerboard.c — checkerboard pattern (alternating cell fill)
+ * 11_checkerboard.c — a grid of cells coloured like a chessboard.
  *
- * DEMO: Same rectangular grid as 01_uniform_rect but cells alternate
- *       between filled ('#') and empty (' '). The fill rule is
- *       (r + c) % 2 — the parity of the cell address. The cursor '@'
- *       can only stand on light cells (parity 0); arrow keys skip over
- *       dark cells, moving two steps at once in the correct direction.
+ * Same rectangular grid as 01_uniform_rect, but every other cell is shaded
+ * dark. The light/dark choice comes from one rule: a cell is dark when its
+ * row + column is odd. The '@' cursor only sits on light cells, so the arrows
+ * jump two cells at a time to skip past the dark ones.
  *
- * Study alongside: 01_uniform_rect.c (grid formula), 13_dot.c
- *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, fill characters, EWMA
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 6 pairs (dark, light, cursor, border, HUD, HINT)
- *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_grid_char / ctx_draw_bg
- *   §5 cursor   — Cursor + cursor_reset / cursor_move (parity-preserving) / cursor_draw
- *   §6 scene    — hud_draw + scene_draw
- *   §7 screen   — ncurses init / cleanup
- *   §8 app      — signals, main loop
- *
- * Keys:  arrows move @   r reset   q/ESC quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/rect_grids/11_checkerboard.c \
- *       -o 11_checkerboard -lncurses
+ * Study alongside: 01_uniform_rect.c (the plain grid this builds on).
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Standard rectangular grid with a parity-based cell fill.
- *                  The grid lines are identical to 01_uniform_rect.
- *                  The fill rule adds visual structure without changing geometry.
- *
- * Fill formula   :
- *   parity = (r + c) % 2
- *   parity == 0 → light cell   (cursor can stand here)
- *   parity == 1 → dark cell    (blocked / filled)
- *
- *   Why (r+c)%2? Moving right (+c=1) flips parity. Moving down (+r=1) also
- *   flips parity. So every neighbour has the opposite parity — checkerboard.
- *
- * Movement rule  : The cursor only occupies light cells (parity 0).
- *   Since every 1-step move flips parity, the cursor moves 2 steps at a time:
- *   new_r = r + 2*dr,  new_c = c + 2*dc
- *   This keeps (new_r + new_c) % 2 == (r + c) % 2 == 0.
- *
- * Alternative    : Let cursor move 1 step (to dark cells too) — remove the
- *   *2 multiplier in cursor_move and change the step in cursor_reset.
- *
- * References     :
- *   Checkerboard pattern — en.wikipedia.org/wiki/Checkerboard
- *   Chess board colouring — en.wikipedia.org/wiki/Chessboard
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * The grid lines are IDENTICAL to 01_uniform_rect.  The only new thing is
- * a FILL RULE that colours alternating cells: parity = (r + c) % 2.  Even-
- * parity cells are light; odd-parity cells are dark.  The structure of the
- * grid is unchanged — only the interior of each cell gets shaded.
- *
- * HOW TO THINK ABOUT IT — PARITY AND NEIGHBOURS
- * ───────────────────────────────────────────────
- * Parity is additive: every step that changes exactly one of (r, c) by ±1
- * flips the parity.  This is why a checkerboard works:
- *
- *   parity(r,   c  ) = (r + c)     % 2
- *   parity(r+1, c  ) = (r + c + 1) % 2 = 1 - parity(r,c)   <- flipped!
- *   parity(r,   c+1) = (r + c + 1) % 2 = 1 - parity(r,c)   <- flipped!
- *   parity(r+1, c+1) = (r + c + 2) % 2 = parity(r,c)        <- same!
- *
- * Therefore: every orthogonal neighbour has opposite parity (checkerboard).
- *            every diagonal  neighbour has the same parity.
- *
- * This is a fundamental property used in:
- *   - Chess/checkers boards
- *   - Graph bipartite colouring
- *   - Cellular automata parity rules
- *   - Maze generation (walls on odd cells)
- *
- * DRAWING METHOD
- * ──────────────
- *  Phase 1 — cell fill:
- *    For each cell (r, c):
- *      if (r + c) % 2 == 1:  fill interior with DARK_FILL character ('#')
- *      else:                 leave interior empty
- *
- *  Phase 2 — grid lines (on top of fill):
- *    Exactly as 01_uniform_rect: raster scan, sr%CH==0 or sc%CW==0.
- *    Drawing grid lines AFTER fill ensures borders are always visible.
- *
- * KEY FORMULAS
- * ────────────
- *  Parity:        parity(r, c) = (r + c) % 2       (0=light, 1=dark)
- *  Fill condition: if parity == 1 -> fill interior
- *
- *  Cursor parity stays constant during movement (by design):
- *    parity(r + 2*dr, c + 2*dc) = (r+2dr + c+2dc) % 2
- *                                = (r+c + 2*(dr+dc)) % 2
- *                                = (r+c) % 2          <- same!
- *    Moving 2 steps preserves parity. Moving 1 step flips it.
- *
- *  Cursor always starts on a light cell (parity=0):
- *    r=0, c=0 -> (0+0)%2 = 0 (light) ✓
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Draw order: if you draw fill after grid lines, the fill overwrites
- *    the border characters.  Fix: draw fill first, then borders on top.
- *
- *  • Cursor start cell: cursor_reset() sets r and c to even values so
- *    parity is 0 (light cell).  The mask `& ~1` rounds down to even.
- *
- *  • The 2-step movement means the cursor jumps over dark cells entirely.
- *    If you want the cursor to enter dark cells too, remove the *2 factor
- *    in cursor_move and the & ~1 mask in cursor_reset.
- *
- *  • On resize, if the new grid_rows/cols is odd, max_r/max_c may be
- *    odd.  The & ~1 mask in cursor_reset keeps the cursor on even coords.
- *
- * HOW TO VERIFY
- * ─────────────
- *  Cell (0,0): even parity -> light (empty interior).
- *  Cell (0,1): odd  parity -> dark (filled with '#').
- *  Cell (1,0): odd  parity -> dark.
- *  Cell (1,1): even parity -> light.
- *  The pattern should look exactly like a physical checkerboard.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
@@ -143,16 +20,14 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS   30
 #define CELL_W        8
 #define CELL_H        4
-#define DARK_FILL   '#'    /* character used to fill dark cells */
+#define DARK_FILL   '#'    /* what we paint inside a dark cell */
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How fast the on-screen FPS number reacts: smaller = steadier, less jumpy. */
 #define FPS_EWMA_ALPHA  0.05
 
 #define PAIR_DARK    1
@@ -162,9 +37,7 @@
 #define PAIR_HUD     5
 #define PAIR_HINT    6
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -179,9 +52,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static void color_init(void)
 {
@@ -194,19 +65,23 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx and the cell ↔ screen mapping                    */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula — turning a cell address into a screen position ── */
 
+/*
+ * Everything we need to know about the grid's current layout. Recomputed from
+ * the terminal size at startup and on every resize, then passed around so the
+ * drawing code never has to guess where a cell sits on screen.
+ */
 typedef struct {
-    int rows, cols;
-    int cw, ch;
-    int max_r, max_c;
+    int rows, cols;     /* terminal size in characters */
+    int cw, ch;         /* one cell's width and height in characters */
+    int max_r, max_c;   /* furthest cell the cursor may reach; kept even so
+                           it always lands on a light cell (see cursor_reset) */
 } GridCtx;
 
 /*
- * ctx_init — derive geometry from terminal size.
- * max_r/max_c are masked to even so the cursor always lands on parity-0 cells.
+ * Works out the grid layout from the terminal size. max_r/max_c are rounded
+ * down to even so the cursor can never get stuck on a dark cell.
  */
 static void ctx_init(GridCtx *g, int rows, int cols)
 {
@@ -214,13 +89,11 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->cw = CELL_W; g->ch = CELL_H;
     int gr = (rows - 1) / CELL_H - 1;
     int gc = cols / CELL_W - 1;
-    g->max_r = gr & ~1;    /* round down to even so end cell is parity-0 */
+    g->max_r = gr & ~1;    /* round down to even so the last cell stays light */
     g->max_c = gc & ~1;
 }
 
-/*
- * ctx_to_screen — unchanged from 01_uniform_rect.
- */
+/* Where does cell (r,c) start on the screen? Same mapping as the plain grid. */
 static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
     *sr = r * g->ch;
@@ -238,23 +111,20 @@ static char ctx_grid_char(const GridCtx *g, int sr, int sc)
 }
 
 /*
- * cell_parity — CHECKERBOARD FILL FORMULA:
- *
- *   parity(r, c) = (r + c) % 2     0 → light cell   1 → dark cell
- *
- * Every orthogonal neighbour has opposite parity — true checkerboard.
+ * Light or dark? A cell is dark (returns 1) when its row + column is odd,
+ * light (returns 0) when even. Because each step sideways or down flips that
+ * even/odd-ness, neighbouring cells always come out opposite — a chessboard.
  */
 static int cell_parity(int r, int c) { return (r + c) % 2; }
 
-/*
- * ctx_draw_bg — paint dark-cell fill, then grid borders on top.
- */
+/* Paint the dark squares first, then lay the grid lines over the top so the
+ * borders are never swallowed by the fill. */
 static void ctx_draw_bg(const GridCtx *g)
 {
     int gr = (g->rows - 1) / g->ch;
     int gc = g->cols / g->cw;
 
-    /* Fill cell interiors first */
+    /* shade the dark cells */
     for (int r = 0; r < gr; r++) {
         for (int c = 0; c < gc; c++) {
             int sr, sc; ctx_to_screen(g, r, c, &sr, &sc);
@@ -269,7 +139,7 @@ static void ctx_draw_bg(const GridCtx *g)
         }
     }
 
-    /* Draw grid borders on top */
+    /* draw the grid lines over the fill */
     attron(COLOR_PAIR(PAIR_BORDER));
     for (int sr = 0; sr < g->rows - 1; sr++)
         for (int sc = 0; sc < g->cols; sc++) {
@@ -280,12 +150,12 @@ static void ctx_draw_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_BORDER));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 cursor ── */
 
+/* Which cell the '@' currently sits on, as a (row, column) address. */
 typedef struct { int r, c; } Cursor;
 
+/* Drop the cursor near the middle, snapped to even coords so it lands light. */
 static void cursor_reset(Cursor *cur, const GridCtx *g)
 {
     cur->r = (g->max_r / 2) & ~1;
@@ -293,12 +163,8 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
 }
 
 /*
- * cursor_move — PARITY-PRESERVING MOVEMENT:
- *
- *   new_r = r + 2*dr,  new_c = c + 2*dc
- *
- *   Moving 2 steps keeps parity: (r+2dr + c+2dc) % 2 == (r+c) % 2 ✓
- *   The cursor always stays on light (parity-0) cells.
+ * Move two cells per keypress, not one. A single step would land on a dark
+ * cell; stepping by two skips it and keeps the cursor on light cells only.
  */
 static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
 {
@@ -315,9 +181,7 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
 {
@@ -344,9 +208,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
     wnoutrefresh(stdscr); doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(void)
@@ -357,9 +219,7 @@ static void screen_init(void)
     color_init(); atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 static void on_signal(int s)

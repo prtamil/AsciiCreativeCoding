@@ -1,156 +1,15 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 02_right_isosceles.c — square grid bisected by one diagonal
+ * 02_right_isosceles.c — a square grid where every square is cut in half
+ * by one diagonal slash, giving two right-triangle halves per square.
+ * A '@' cursor walks between the half-triangles with the arrow keys.
  *
- * DEMO: Each terminal-screen square is split by a single '\' diagonal into
- *       an upper-right (UR) and lower-left (LL) right-isosceles triangle.
- *       A '@' cursor sits on the origin triangle. Arrow keys move it
- *       across edges — UP/DOWN cross horizontal, LEFT/RIGHT cross vertical,
- *       and a toggle across the diagonal where the geometry has no edge
- *       in that direction.
+ * Sister files: 01_equilateral.c (same draw + cursor idea, but a slanted
+ * grid) and 03_double_diagonal.c (both diagonals, four triangles per cell).
  *
- * Study alongside: 01_equilateral.c — same pixel-rasterize + cursor pattern;
- *                  this file uses an axis-aligned (NOT skew) lattice.
- *                  03_double_diagonal.c — both diagonals (4 tris/cell).
- *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, CELL_SIZE, BORDER_W, FPS_EWMA_ALPHA
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 4 pairs: border / cursor / HUD / HINT
- *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_pixel_to_tri /
- *                 ctx_draw_bg + tri_centroid_pixel + tri_edge_char
- *   §5 cursor   — Cursor + cursor_reset / cursor_move / cursor_draw, TRI_DIR
- *   §6 scene    — hud_draw + scene_draw
- *   §7 screen   — ncurses init / cleanup
- *   §8 app      — signals, main loop
- *
- * Keys:  arrows move @   r reset   t theme   p pause
- *        +/- size        [/] border thickness   q/ESC quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids/02_right_isosceles.c \
- *       -o 02_right_isosceles -lncurses -lm
+ * Wikipedia: "Triangular tiling", "Tetrakis square tiling", and
+ * "Barycentric coordinate system" cover the geometry used here.
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Half-rect tiling. Square cell of side `cell_size` split
- *                  by the '\' diagonal into two right-isosceles triangles
- *                  (legs equal, hypotenuse = leg·√2). Pixel→lattice is
- *                  axis-aligned — no shear.
- *
- * Data-structure : Two structs — GridCtx (terminal extent, cell_size,
- *                  CELL_W/CELL_H, screen origin ox/oy, border_w) and
- *                  Cursor (col, row, up). No grid array; every pixel
- *                  resolves its (col, row, up) per frame.
- *
- * Formula        : pixel → lattice (square cell):
- *                    a = px / size
- *                    b = py / size
- *                  (col, row) = (⌊a⌋, ⌊b⌋), and inside the unit square the
- *                  diagonal fa = fb separates UR (fa ≥ fb) from LL (fa < fb).
- *
- * Edge chars     : Barycentric weights pick the edge character.
- *                  UR (vertices A=(0,0), B=(1,0), C=(1,1)):
- *                    l_A → '|' (right edge), l_B → '\\' (diagonal),
- *                    l_C → '_' (top edge)
- *                  LL (vertices A=(0,0), C=(1,1), D=(0,1)):
- *                    l_A → '_' (bottom),    l_C → '|' (left edge),
- *                    l_D → '\\' (diagonal)
- *
- * Movement       : (col, row, up) walked by lookup table TRI_DIR[4][2].
- *                  Each square is reachable from any starting triangle in
- *                  at most 2 presses; the diagonal toggle is what handles
- *                  the directions that have no matching edge.
- *
- * References     :
- *   Right-isosceles tiling — https://en.wikipedia.org/wiki/Triangular_tiling
- *   Tetrakis (companion)   — https://en.wikipedia.org/wiki/Tetrakis_square_tiling
- *   Barycentric coords     — https://en.wikipedia.org/wiki/Barycentric_coordinate_system
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * The plane is tiled with square cells, just like a chessboard. Inside
- * every square is a single diagonal — the '\' line — splitting it into
- * two right-angled triangles. To find which triangle owns a pixel, ask
- * "which square am I in?" then "am I above or below the diagonal?". Two
- * cheap modulo-style tests; no data structure, no array.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Picture the rectangular grid from rect_grids/01 — same uniform squares.
- * Then draw the '\' diagonal in each square. Now each square is split in
- * half. The upper-right half (UR) lives ABOVE the diagonal in screen
- * y-down terms (i.e., where x > y in fractional cell coords); the lower-
- * left half (LL) lives BELOW (where x < y).
- *
- * The same skew-free lattice as the rect grid: a = px/size, b = py/size.
- * No basis vectors needed because the cells are axis-aligned squares.
- *
- * DRAWING METHOD  (raster scan, the approach used here)
- * ──────────────
- *  1. Pick CELL_SIZE — the side length of one square in pixels.
- *  2. Loop every screen cell (row, col); convert to centred pixel.
- *  3. Lattice inverse:  a = px/size,  b = py/size.
- *  4. Floor + fractional split: tC=⌊a⌋, tR=⌊b⌋, fa=a−tC, fb=b−tR.
- *  5. Diagonal split:  tU = (fa ≥ fb) ? UR : LL.
- *  6. Compute barycentric weights (l1, l2, l3) for the chosen half.
- *  7. m = min(l1, l2, l3). If m ≥ BORDER_W → interior, skip.
- *     Otherwise pick the edge character by which weight is smallest.
- *  8. Draw in cursor color if (tC,tR,tU) matches cursor, else border.
- *
- * KEY FORMULAS
- * ────────────
- *  Forward  (cell (col, row) → pixel of upper-left corner):
- *    px = col · size,  py = row · size
- *
- *  Inverse  (pixel → cell + fractional offset):
- *    a = px / size,  b = py / size
- *    col = ⌊a⌋,  row = ⌊b⌋
- *    fa  = a − col,  fb = b − row
- *    up  = (fa ≥ fb) ? UR : LL
- *
- *  Barycentric weights:
- *    UR (A=(0,0), B=(1,0), C=(1,1)):
- *      l_A = 1−fa,  l_B = fa−fb,  l_C = fb
- *    LL (A=(0,0), C=(1,1), D=(0,1)):
- *      l_A = 1−fb,  l_C = fa,     l_D = fb−fa
- *
- *  Centroid for placing '@' cursor:
- *    UR: (col + 2/3, row + 1/3)
- *    LL: (col + 1/3, row + 2/3)
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Floating-point exactness on the diagonal: when fa==fb the test
- *    "fa ≥ fb" arbitrarily picks UR. Either side works because the
- *    diagonal pixel is always a border anyway.
- *  • Last terminal row reserved for HUD; raster stops at row < rows−1.
- *  • Resize: ox/oy recompute each frame from rows/cols → grid recentres.
- *  • UP from LL has no horizontal top edge (LL's top is the diagonal).
- *    The toggle to UR in same square is geometrically a small up-right
- *    step, providing visual "up" motion via two presses of UP·UP.
- *  • CELL_SIZE measured in pixels (CELL_W·CELL_H sub-pixels per cell);
- *    minimum readable size is ~6 pixels for the diagonal to render.
- *
- * HOW TO VERIFY
- * ─────────────
- *  At cursor (col, row, up) = (0, 0, LL):
- *    centroid lattice = (1/3, 2/3) → pixel (size/3, 2·size/3).
- *    For CELL_SIZE = 16: centroid ≈ (5.3, 10.7) px →
- *      cell column ≈ 5/CELL_W = 2, cell row ≈ 10/CELL_H = 2.
- *
- *  Quick edge-char sanity inside LL at (fa, fb) = (0.5, 0.6):
- *    l_A = 1−0.6 = 0.4   (far from bottom edge)
- *    l_C = 0.5           (far from left edge)
- *    l_D = 0.6−0.5 = 0.1 (close to diagonal)
- *  → min is l_D, character is '\\' — sitting near the diagonal. ✓
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -163,15 +22,15 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 
 /*
- * Cell sub-pixel model (see 01_equilateral.c §1 for derivation).
- * CELL_W=2, CELL_H=4 keeps shapes geometrically isotropic.
+ * Terminal characters are taller than they are wide, so we treat each one
+ * as a 2-wide, 4-tall block of "sub-pixels". Measuring in those units keeps
+ * the triangles looking square instead of stretched. (01_equilateral.c §1
+ * works through where these numbers come from.)
  */
 #define CELL_W 2
 #define CELL_H 4
@@ -188,7 +47,8 @@
 
 #define N_THEMES 4
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How much each new frame nudges the on-screen FPS number. Small = steadier,
+ * slower-to-react reading instead of a jittery one. */
 #define FPS_EWMA_ALPHA 0.05
 
 #define PAIR_BORDER 1
@@ -196,9 +56,7 @@
 #define PAIR_HUD    3
 #define PAIR_HINT   4
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -215,9 +73,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static const short THEME_FG[N_THEMES]   = {  75,  207, 214,  15 };
 static const short THEME_FG_8[N_THEMES] = {
@@ -235,29 +91,29 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx and the pixel ↔ lattice ↔ triangle mapping       */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula — turning a screen position into "which triangle is here" ── */
 
 /*
- * GridCtx — geometry of the active right-isosceles grid.
- *
- * Same centring scheme as 01_equilateral.c: ox = cols/2, oy = (rows-1)/2.
- * cell_size and border_w are tunable per frame from the main loop.
+ * GridCtx — everything we need to know about the grid right now: how big
+ * the terminal is, how large each square is, where the grid is centred, and
+ * how thick to draw the triangle edges. The main loop tweaks the size and
+ * border live, so this bundle is recomputed whenever those change or the
+ * window resizes.
  */
 typedef struct {
-    /* terminal extent */
+    /* How many rows and columns of characters the terminal has. */
     int rows, cols;
 
-    /* square geometry */
-    double cell_size;      /* side length in pixels                          */
-    double border_w;       /* barycentric threshold for edge proximity       */
-    int    cw, ch;         /* sub-pixel scaling — CELL_W, CELL_H             */
+    /* The square itself. */
+    double cell_size;      /* side of one square, in sub-pixels               */
+    double border_w;       /* how close to an edge counts as "on the edge"
+                              (0 = hairline, bigger = fatter border lines)    */
+    int    cw, ch;         /* sub-pixels per character — copies of CELL_W/H   */
 
-    /* screen origin = pixel (0,0) */
+    /* Where pixel (0,0) lands on screen, so the grid sits centred. */
     int    ox, oy;
 
-    /* advisory cursor bounds in lattice space */
+    /* Rough how-far-the-grid-reaches counts; just a hint, not a hard fence. */
     int    max_col, max_row;
 } GridCtx;
 
@@ -276,16 +132,11 @@ static void ctx_init(GridCtx *g, int rows, int cols)
 }
 
 /*
- * ctx_pixel_to_tri — axis-aligned lattice inverse + diagonal split.
- *
- * THE FORMULA (right-isosceles half-rect):
- *
- *   a = px / size,   b = py / size              ← unit-square coords
- *   col = ⌊a⌋,       row = ⌊b⌋
- *   fa  = a − col,   fb  = b − row              ← in [0, 1)
- *   up  = (fa ≥ fb) ? UR : LL                   ← '\' diagonal split
- *
- * UR has its right angle at (1,0); LL has its right angle at (0,1).
+ * Given a point on screen, work out which square it's in and which half of
+ * that square. Dividing by the square size tells us the column/row; the
+ * leftover fractions say where inside the square we landed. If we're more to
+ * the right than down (fa >= fb) we're in the upper-right half, otherwise the
+ * lower-left half — that's just asking which side of the '\' diagonal we're on.
  */
 static void ctx_pixel_to_tri(const GridCtx *g, double px, double py,
                              int *col, int *row, int *up,
@@ -303,10 +154,8 @@ static void ctx_pixel_to_tri(const GridCtx *g, double px, double py,
 }
 
 /*
- * tri_centroid_pixel — pure forward map for cursor mark.
- *
- *   UR centroid lattice = ((0+1+1)/3, (0+0+1)/3) = (2/3, 1/3)
- *   LL centroid lattice = ((0+1+0)/3, (0+1+1)/3) = (1/3, 2/3)
+ * Find the middle (centroid) of a triangle, in sub-pixels — the spot where
+ * we drop the '@' so the cursor sits visually inside the right half.
  */
 static void tri_centroid_pixel(int col, int row, int up, double size,
                                double *cx_pix, double *cy_pix)
@@ -318,7 +167,8 @@ static void tri_centroid_pixel(int col, int row, int up, double size,
 }
 
 /*
- * ctx_to_screen — terminal cell of the centroid of triangle (col, row, up).
+ * Which character cell on screen holds the middle of a given triangle —
+ * used to place the cursor mark.
  */
 static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
                           int *sr, int *sc)
@@ -330,25 +180,21 @@ static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
 }
 
 /*
- * tri_edge_char — barycentric → edge character.
- *
- * UR weights:  l1 = 1−fa  → '|'   (right edge)
- *              l2 = fa−fb → '\\'  (diagonal)
- *              l3 = fb    → '_'   (top edge)
- *
- * LL weights:  l1 = 1−fb  → '_'   (bottom edge)
- *              l2 = fa    → '|'   (left edge)
- *              l3 = fb−fa → '\\'  (diagonal)
+ * Decide which border character a point should be, and how far it is from the
+ * nearest edge. Each triangle has three edges; we measure the distance to all
+ * three, and the closest one wins. The character names that edge: '|' for a
+ * vertical side, '_' for a horizontal side, '\\' for the slanted diagonal.
+ * The caller uses the returned distance to tell border pixels from interior.
  */
 static char tri_edge_char(int up, double fa, double fb, double *out_min)
 {
     double l1, l2, l3;
     char   ch1, ch2, ch3;
-    if (up == 1) {           /* UR */
+    if (up == 1) {           /* upper-right half */
         l1 = 1.0 - fa;       ch1 = '|';
         l2 = fa - fb;        ch2 = '\\';
         l3 = fb;             ch3 = '_';
-    } else {                 /* LL */
+    } else {                 /* lower-left half */
         l1 = 1.0 - fb;       ch1 = '_';
         l2 = fa;             ch2 = '|';
         l3 = fb - fa;        ch3 = '\\';
@@ -362,8 +208,10 @@ static char tri_edge_char(int up, double fa, double fb, double *out_min)
 }
 
 /*
- * ctx_draw_bg — raster scan: pixel→triangle→edge character at every cell.
- * Cursor highlight folded into the same loop.
+ * Draw the whole grid: walk every character cell, figure out which triangle
+ * it falls in, and if it's close enough to an edge, print that edge's
+ * character. The triangle the cursor is sitting on gets the highlight colour,
+ * so we check for it in the same pass instead of a second loop.
  */
 static void ctx_draw_bg(const GridCtx *g, int cC, int cR, int cU)
 {
@@ -388,30 +236,24 @@ static void ctx_draw_bg(const GridCtx *g, int cC, int cR, int cU)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 cursor ── */
 
 /*
- * Cursor — just (col, row, up) in lattice triangle space.
- *
- * up ∈ {0=LL (lower-left), 1=UR (upper-right)} within the square (col, row).
+ * Cursor — where the '@' is right now: which square (col, row) and which
+ * half of it (up: 0 = lower-left triangle, 1 = upper-right triangle).
  */
 typedef struct { int col, row, up; } Cursor;
 
 /*
- * TRI_DIR — arrow-key transitions.
- *   index 0:LEFT  1:RIGHT  2:UP  3:DOWN
- *   row   0:LL    1:UR
+ * TRI_DIR — the movement rulebook. Look up [direction][which half you're in]
+ * and it tells you the new square and half: the first two numbers add to your
+ * column and row, the third sets the new half.
  *
- *   LEFT:   LL → UR(col-1, row)        — across left edge
- *           UR → LL same square         — across diagonal (fits "left")
- *   RIGHT:  UR → LL(col+1, row)        — across right edge
- *           LL → UR same square         — across diagonal (fits "right")
- *   UP:     UR → LL(col, row-1)        — across top edge
- *           LL → UR same square         — toggle (LL has no top edge)
- *   DOWN:   LL → UR(col, row+1)        — across bottom edge
- *           UR → LL same square         — toggle (UR has no bottom edge)
+ * Directions are 0:LEFT 1:RIGHT 2:UP 3:DOWN; the inner pair is your current
+ * half (0:lower-left, 1:upper-right). Most moves just step across the edge
+ * facing that way. But a triangle doesn't have an edge in every direction —
+ * e.g. the lower-left half has no flat top — so those presses instead flip you
+ * to the other half of the same square, which lands you on the side you wanted.
  */
 static const int TRI_DIR[4][2][3] = {
     /* LEFT  */ { { -1,  0,  1 }, {  0,  0,  0 } },
@@ -448,9 +290,7 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, int theme,
                      int paused, double fps)
@@ -482,9 +322,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, int theme,
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -498,9 +336,7 @@ static void screen_init(void)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;

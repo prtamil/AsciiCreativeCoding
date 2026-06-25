@@ -1,140 +1,15 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 02_patterns.c — pattern-fill placement on all 14 grid types
+ * 02_patterns.c — stamp shapes onto any of 14 grid styles.
  *
- * DEMO: Move a cursor and press a key to stamp a pattern centred on the
- *       cursor cell.  Patterns: B=border rect, F=solid fill, H=hollow frame,
- *       R=row strip, V=col strip.  Pattern size is tunable with +/-.
- *       Works on all 14 grid backgrounds (keys 1-9, a-f).
+ * Move the @ cursor, pick a shape (border / fill / hollow box / row / column),
+ * and stamp it. A shape is just a rule that says "fill the cell at this offset
+ * from the cursor" — so the same shape works on every grid and grows or shrinks
+ * with one number. Before you stamp, the cursor shows a dotted preview of what
+ * will land.
  *
- * Study alongside: 01_direct.c (single-cell toggle), 03_path.c (two-point)
- *
- * Section map:
- *   §1 config   — per-mode geometry, pattern-size range
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 6 pairs
- *   §4 gridctx  — GridCtx, per-mode geom (ctx_geom_*) + bg drawers
- *                 (bg_draw_*), ctx_to_screen, ctx_draw_bg (same as 01)
- *   §5 pool     — Pool (same as 01)
- *   §6 patterns — pattern generators: border, fill, hollow, row, col
- *   §7 cursor   — Cursor struct, move, reset, draw
- *   §8 scene    — hud_draw + scene_draw
- *   §9 screen   — ncurses init/cleanup
- *   §10 app     — signals, main loop
- *
- * Keys:  arrows:move  B:border  F:fill  H:hollow  R:row  V:col
- *        spc:stamp  +:grow  -:shrink  C:clear  r:reset  q/ESC:quit
- *        a:prev-grid  e:next-grid
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/rect_grids_placement/02_patterns.c \
- *       -o 02_patterns -lncurses
+ * Sister files: 01_direct.c (toggle one cell), 03_path.c (draw between two points).
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Pattern-fill placement.  Each pattern is a PREDICATE over
- *                  relative offsets (dr,dc) from the cursor: the pattern
- *                  places an object at every (cursor.r+dr, cursor.c+dc) for
- *                  which the predicate returns true.  Five predicates:
- *
- *   border(dr,dc,N): |dr|==N || |dc|==N  — the N-ring perimeter
- *   fill  (dr,dc,N): |dr|<=N && |dc|<=N  — the (2N+1)²  square
- *   hollow(dr,dc,N): fill(N) && !fill(N-1) — only the outermost ring
- *   row   (dr,dc,N): dr==0 && |dc|<=N    — horizontal strip
- *   col   (dr,dc,N): dc==0 && |dr|<=N    — vertical strip
- *
- * Data-structure : Same ObjectPool as 01_direct.c — flat array, swap-last
- *                  removal, O(n) membership test.  Stamping a pattern calls
- *                  pool_place() for each cell in the shape.
- *
- * Rendering      : Background → objects → cursor → HUD.  Cursor shows the
- *                  PREVIEW outline of the pattern before stamping.
- *
- * References     :
- *   Flood-fill and region-fill — en.wikipedia.org/wiki/Flood_fill
- *   Stamp/brush tools in raster editors — Inkscape source, GIMP paintbrush
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA — PATTERNS AS PREDICATES
- * ─────────────────────────────────────
- * A "pattern" is not a fixed bitmap.  It is a RULE that answers the question:
- * "Should a cell at offset (dr,dc) from the anchor be filled?"
- *
- * This representation has three advantages:
- *   1. Patterns scale with a single integer N.
- *   2. Patterns compose: hollow = fill(N) AND NOT fill(N-1).
- *   3. The same predicate works on any grid type — no special-casing.
- *
- * HOW STAMPING WORKS
- * ───────────────────
- * When you press B/F/H/R/V, the program iterates a bounding box of offsets
- * (-N..N, -N..N), evaluates the predicate for each (dr,dc), and calls
- * pool_place() for every cell that passes.  The pool silently ignores
- * duplicates (cells that already have an object).
- *
- * PREVIEW OVERLAY
- * ────────────────
- * Before stamping, the cursor_draw() function shows a preview: it evaluates
- * the SAME predicate and highlights matching cells in a different colour.
- * The user sees exactly what will be stamped before pressing the key.
- *
- * PATTERN SIZE
- * ─────────────
- * N is the "half-size" of the pattern.  N=1 gives a 3×3 region; N=3 gives
- * 7×7.  Keys + and - increment/decrement N in [1, MAX_PAT_N].
- *
- * SWITCHING GRIDS
- * ────────────────
- * The pool persists across grid switches.  Objects placed in one mode remain
- * stored at (r,c) values; they render via ctx_to_screen() using the new mode's
- * formula, so they appear at different screen positions.  Press C to clear.
- *
- * KEY FORMULAS
- * ────────────
- * pat_test — five predicate rules (ar=|dr|, ac=|dc|):
- *
- *   border(dr,dc,N): (ar==N || ac==N) && ar<=N && ac<=N
- *     → cells on the outermost row or column of an N-ring square perimeter
- *     Count = 8N cells
- *
- *   fill(dr,dc,N): ar<=N && ac<=N
- *     → all cells in the (2N+1)×(2N+1) square
- *     Count = (2N+1)²
- *
- *   hollow(dr,dc,N): fill(N) && NOT fill(N−1)
- *     ≡ cells with max(ar, ac) == N  (L∞ distance = N)
- *     Count = (2N+1)² − (2N−1)² = 8N  (same as border)
- *
- *   row(dr,dc,N): dr==0 && ac<=N
- *     → horizontal strip of 2N+1 cells
- *
- *   col(dr,dc,N): dc==0 && ar<=N
- *     → vertical strip of 2N+1 cells
- *
- * Note: border and hollow are numerically equal because for a square both
- * definitions select the same cells (the outermost shell).
- *
- * HOW TO VERIFY
- * ─────────────
- * Uniform grid (U_CW=8, U_CH=4), terminal 80×24.
- * Cursor at (r=2, c=3), N=2.
- *
- * border (N=2): outer ring of a 5×5 box.
- *   Count = 8×2 = 16 cells placed.
- *   Top-left offset (dr=−2, dc=−2) → grid cell (0,1)
- *   screen: sr=0×4+1=1, sc=1×8+1=9  ✓
- *
- * fill (N=1): 3×3 = 9 cells.
- *   Centre (dr=0, dc=0) → grid (2,3); screen: sr=9, sc=25  ✓
- *
- * hollow (N=2): 5×5 minus 3×3 = 25−9 = 16 = 8×2 cells.
- *   Identical to border count — the outermost shell of a square.  ✓
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
@@ -146,19 +21,18 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS  30
 #define MAX_OBJ    512
-#define MAX_PAT_N   8    /* maximum pattern half-size */
+#define MAX_PAT_N   8    /* biggest a shape can grow (half-size) */
 #define MIN_PAT_N   1
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How much to trust the newest frame when smoothing the fps number. Small =
+ * steady reading that doesn't jump around. */
 #define FPS_EWMA_ALPHA  0.05
 
-/* Per-mode geometry (same values as 01_direct.c) */
+/* Cell width/height for each grid style, in characters (same as 01_direct.c). */
 #define U_CW  8
 #define U_CH  4
 #define SQ_CS 3
@@ -195,9 +69,7 @@
 #define PAIR_HUD     5   /* status bar (yellow)  */
 #define PAIR_HINT    6   /* key-hint footer (cyan) */
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -212,9 +84,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static void color_init(void)
 {
@@ -227,10 +97,10 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx                                                             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx ── */
 
+/* The 14 grid styles you can stamp onto. GM_COUNT is the total, used for the
+ * a/e cycle and for sizing name arrays — keep it last. */
 typedef enum {
     GM_UNIFORM=0, GM_SQUARE, GM_FINE, GM_COARSE,
     GM_HIER, GM_BRICK_H, GM_BRICK_V, GM_DIAMOND,
@@ -246,13 +116,20 @@ static const char *const gm_name[GM_COUNT] = {
     "13 dot","14 origin"
 };
 
+/* Everything we need to know about the currently chosen grid: its size on
+ * screen, how big one cell is, and which (row,col) coordinates are valid. One
+ * of these is rebuilt whenever you switch grids or the terminal resizes. */
 typedef struct {
-    GridMode mode;
-    int rows, cols, cw, ch, ox, oy, range;
-    int min_r, max_r, min_c, max_c;
+    GridMode mode;              /* which of the 14 styles is active */
+    int rows, cols;             /* terminal size in characters */
+    int cw, ch;                 /* one cell's width and height in characters */
+    int ox, oy;                 /* screen centre — the origin for rotated grids */
+    int range;                  /* rotated grids run from -range..+range cells */
+    int min_r, max_r;           /* valid row range for the cursor and stamps */
+    int min_c, max_c;           /* valid column range */
 } GridCtx;
 
-/* Per-mode geometry setters — one tiny function per GridMode. */
+/* Each grid style just needs its own cell size; one tiny setter per style. */
 
 static void ctx_geom_uniform (GridCtx *g) { g->cw = U_CW;    g->ch = U_CH;  }
 static void ctx_geom_square  (GridCtx *g) { g->cw = SQ_CS*2; g->ch = SQ_CS; }
@@ -261,18 +138,19 @@ static void ctx_geom_coarse  (GridCtx *g) { g->cw = CO_CW;   g->ch = CO_CH; }
 static void ctx_geom_hier    (GridCtx *g) { g->cw = HI_CW;   g->ch = HI_CH; }
 static void ctx_geom_brick_h (GridCtx *g) { g->cw = BH_CW;   g->ch = BH_CH; }
 static void ctx_geom_brick_v (GridCtx *g) { g->cw = BV_CW;   g->ch = BV_CH; }
-/* rotated grids carry an extra `range` for the centred ±range bounds */
+/* The 45°-rotated grids count cells outward from the centre, so they need range. */
 static void ctx_geom_diamond (GridCtx *g) { g->cw = DM_IW; g->ch = DM_IH; g->range = DM_RNG; }
 static void ctx_geom_iso     (GridCtx *g) { g->cw = IS_IW; g->ch = IS_IH; g->range = IS_RNG; }
 static void ctx_geom_cross   (GridCtx *g) { g->cw = CR_CW;   g->ch = CR_CH; }
 static void ctx_geom_check   (GridCtx *g) { g->cw = CK_CW;   g->ch = CK_CH; }
-/* ruled has only horizontal lines — no column step */
+/* Ruled is just horizontal lines, so there's no column width to set. */
 static void ctx_geom_ruled   (GridCtx *g) { g->ch = RL_LS; }
 static void ctx_geom_dot     (GridCtx *g) { g->cw = DT_CW;   g->ch = DT_CH; }
 static void ctx_geom_origin  (GridCtx *g) { g->cw = OR_CW;   g->ch = OR_CH; }
 
-/* Bounds depend on coordinate system: rotated grids use ±range; ruled
- * grids count whole lines; rect grids count whole cells. */
+/* Work out which (row,col) coordinates actually fit on screen. Each family
+ * counts differently: rotated grids spread out from the centre, ruled grids
+ * count whole horizontal lines, and the rest count whole rectangular cells. */
 static void ctx_set_bounds(GridCtx *g, GridMode m, int rows, int cols)
 {
     if (m == GM_DIAMOND || m == GM_ISO) {
@@ -287,8 +165,8 @@ static void ctx_set_bounds(GridCtx *g, GridMode m, int rows, int cols)
     }
 }
 
-/* Dispatcher: routes all 14 GridMode values to their per-mode geometry
- * setter, then computes coordinate bounds once. */
+/* Build the context for one grid style: pick its cell size, then figure out
+ * its valid coordinate range. Call this on startup and on every grid switch. */
 static void ctx_init(GridCtx *g, GridMode m, int rows, int cols)
 {
     memset(g, 0, sizeof *g);
@@ -315,6 +193,9 @@ static void ctx_init(GridCtx *g, GridMode m, int rows, int cols)
     ctx_set_bounds(g, m, rows, cols);
 }
 
+/* Turn a grid coordinate (row,col) into the screen spot to draw it. This is
+ * the one place that knows each style's layout, so objects placed in one grid
+ * reappear in the right spot when you switch to another. */
 static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
     switch (g->mode) {
@@ -327,14 +208,13 @@ static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
     }
 }
 
+/* Remainder that's never negative, so a%b wraps cleanly for negative coords. */
 static int safe_mod(int a, int b) { return ((a%b)+b)%b; }
 
-/* ── per-mode background drawers ───────────────────────────────────────── *
- * One function per grid style.  Pulled out of ctx_draw_bg so a reader
- * can study one style at a time.
- * ─────────────────────────────────────────────────────────────────────── */
+/* Background drawers — one per grid style, so you can read each in isolation. */
 
-/* Plain rect lattice; GM_ORIGIN overlays a highlighted central cross. */
+/* Plain rectangular grid. The origin style also paints a bright cross at the
+ * centre row and column so you can see where (0,0) is. */
 static void bg_draw_rect_family(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch, ox=g->ox, oy=g->oy;
@@ -348,7 +228,8 @@ static void bg_draw_rect_family(const GridCtx *g)
     }
 }
 
-/* Three-tier lattice (major / semi / minor); glyph encodes the tier. */
+/* Grid with three line weights — major, semi, minor — like graph paper. The
+ * glyph tells you which weight each line is. */
 static void bg_draw_hier(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch;
@@ -363,7 +244,7 @@ static void bg_draw_hier(const GridCtx *g)
     }
 }
 
-/* Brick courses offset every other row by half a brick width. */
+/* Brick wall: every other row is shoved sideways by half a brick. */
 static void bg_draw_brick_h(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch;
@@ -378,7 +259,7 @@ static void bg_draw_brick_h(const GridCtx *g)
     }
 }
 
-/* Vertical brick courses — bricks staggered by half-height per column. */
+/* Brick wall turned on its side: every other column is shoved up by half a brick. */
 static void bg_draw_brick_v(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch;
@@ -390,7 +271,7 @@ static void bg_draw_brick_v(const GridCtx *g)
     }
 }
 
-/* Two diagonal line families intersect on a 45°-rotated lattice. */
+/* Diamond grid: two sets of diagonal lines crossing, like a grid tilted 45°. */
 static void bg_draw_diamond(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, ox=g->ox, oy=g->oy;
@@ -404,7 +285,7 @@ static void bg_draw_diamond(const GridCtx *g)
     }
 }
 
-/* Same diagonal scheme as diamond but with a wider (2:1) cell aspect. */
+/* Like diamond, but the cells are twice as wide as tall — the isometric look. */
 static void bg_draw_iso(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, ox=g->ox, oy=g->oy;
@@ -418,7 +299,7 @@ static void bg_draw_iso(const GridCtx *g)
     }
 }
 
-/* Rect lattice with two extra diagonal families overlaid (axes + X). */
+/* Rectangular grid with diagonals laid over it too, so each cell gets an X. */
 static void bg_draw_cross(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch;
@@ -433,7 +314,7 @@ static void bg_draw_cross(const GridCtx *g)
     }
 }
 
-/* Lines plus filled "black" squares on alternating cells (chessboard). */
+/* Grid lines plus filled-in squares on alternating cells — a chessboard. */
 static void bg_draw_check(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch;
@@ -444,7 +325,7 @@ static void bg_draw_check(const GridCtx *g)
     }
 }
 
-/* Horizontal rules only — no column structure (row-based grid). */
+/* Just horizontal lines, like ruled notebook paper — no columns. */
 static void bg_draw_ruled(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, ch=g->ch;
@@ -454,7 +335,7 @@ static void bg_draw_ruled(const GridCtx *g)
     }
 }
 
-/* Sparse marker at every grid intersection — no connecting lines. */
+/* Just a dot at each crossing point, with no lines drawn between them. */
 static void bg_draw_dot(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch;
@@ -464,10 +345,8 @@ static void bg_draw_dot(const GridCtx *g)
     }
 }
 
-/*
- * ctx_draw_bg — dispatcher.  Routes all 14 GridMode values to a per-mode
- * bg_draw_*() helper.  The five rect-family modes share one drawer.
- */
+/* Draw whichever grid is active. The five rectangular styles share one drawer;
+ * the rest get their own. */
 static void ctx_draw_bg(const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_GRID));
@@ -488,12 +367,21 @@ static void ctx_draw_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_GRID));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool ── */
 
-typedef struct { int r, c; char glyph; bool alive; } Obj;
-typedef struct { Obj items[MAX_OBJ]; int count; } Pool;
+/* One stamped object: where it sits on the grid and what character to draw. */
+typedef struct {
+    int  r, c;      /* grid coordinate, not screen coordinate */
+    char glyph;     /* the character drawn for this object */
+    bool alive;     /* false means this slot is unused */
+} Obj;
+
+/* The bag of all stamped objects — a plain fixed array, no allocation. We never
+ * remove objects here (only Clear wipes them), so count just grows up to MAX_OBJ. */
+typedef struct {
+    Obj items[MAX_OBJ];
+    int count;      /* how many slots are in use */
+} Pool;
 
 static int pool_find(const Pool *p, int r, int c)
 {
@@ -523,20 +411,18 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_OBJ)|A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  patterns                                                            */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 patterns ── */
 
+/* The five shapes you can stamp. */
 typedef enum { PAT_BORDER=0, PAT_FILL, PAT_HOLLOW, PAT_ROW, PAT_COL } PatMode;
 
 static const char *const pat_name[] = {
     "border","fill","hollow","row","col"
 };
 
-/*
- * pat_test — predicate: should offset (dr,dc) be included in pattern pat of
- * half-size N?  Returns true if the cell belongs to the pattern.
- */
+/* The heart of the file: given an offset from the cursor, does this shape fill
+ * that spot? N is the shape's half-size. Each shape is just a yes/no rule, which
+ * is why one function covers all of them and they all scale with N. */
 static bool pat_test(PatMode pat, int dr, int dc, int N)
 {
     int ar = dr<0?-dr:dr, ac = dc<0?-dc:dc;
@@ -550,10 +436,8 @@ static bool pat_test(PatMode pat, int dr, int dc, int N)
     return false;
 }
 
-/*
- * pattern_stamp — place objects for all offsets where pat_test is true.
- * Clamps to grid bounds so out-of-range cells are silently skipped.
- */
+/* Walk every spot the shape covers and drop an object there. Anything that falls
+ * off the grid is quietly ignored. */
 static void pattern_stamp(Pool *p, const GridCtx *g, int cr, int cc,
                            PatMode pat, int N, char glyph)
 {
@@ -565,10 +449,8 @@ static void pattern_stamp(Pool *p, const GridCtx *g, int cr, int cc,
     }
 }
 
-/*
- * preview_draw — highlight cells that WOULD be placed if stamped now.
- * Uses the cursor colour with reverse video so the user sees the preview.
- */
+/* Show a dotted outline of where the shape would land if you stamped right now,
+ * using the same rule as the real stamp so the preview is always honest. */
 static void preview_draw(const GridCtx *g, int cr, int cc, PatMode pat, int N)
 {
     attron(COLOR_PAIR(PAIR_CURSOR)|A_REVERSE);
@@ -585,10 +467,9 @@ static void preview_draw(const GridCtx *g, int cr, int cc, PatMode pat, int N)
     attroff(COLOR_PAIR(PAIR_CURSOR)|A_REVERSE);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 cursor ── */
 
+/* Where the @ sits, in grid coordinates. Shapes are stamped centred here. */
 typedef struct { int r, c; } Cursor;
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
@@ -611,11 +492,9 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_CURSOR)|A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 scene ── */
 
-/* Bright bold yellow fps readout (top-right) + bold cyan key hints (bottom). */
+/* The status line (top-right) and the key reminder (bottom). */
 static void hud_draw(const GridCtx *g, const Pool *p, PatMode pat, int N,
                      double fps)
 {
@@ -646,9 +525,7 @@ static void scene_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
     wnoutrefresh(stdscr); doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(void)
@@ -659,10 +536,10 @@ static void screen_init(void)
     color_init(); atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §10 app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §10 app ── */
 
+/* Set from signal handlers, so they must be the safe-to-touch-from-a-signal type.
+ * The main loop reads them and reacts: stop, or rebuild after a terminal resize. */
 static volatile sig_atomic_t g_running=1, g_need_resize=0;
 static void on_signal(int s)
 {

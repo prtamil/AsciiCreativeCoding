@@ -1,131 +1,18 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 03_double_diagonal_path.c — line-of-sight path on the tetrakis grid
+ * 03_double_diagonal_path.c — draw a straight path across an X-cut square grid
  *
- * DEMO: Two markers — START (S) and END (E) — sit on a tetrakis grid
- *       (each square split by both diagonals into N/E/S/W wedges).
- *       Move '@' with arrows; 's' sets START at cursor, 'e' sets END.
- *       The path is computed by walking pixel coordinates along the
- *       centroid-to-centroid line and recording which wedge each
- *       sampled pixel lies in.
+ * Each square is split by both diagonals into four triangular wedges
+ * (N/E/S/W). You set a START and an END, and the program lights up every
+ * wedge a straight line between them passes through. Move '@' with the
+ * arrows; 's' drops START where the cursor is, 'e' drops END.
  *
- * Study alongside: 03_double_diagonal_direct.c (manual placement),
- *                  grids/tri_grids/03_double_diagonal.c (rasterizer),
- *                  02_right_isosceles_path.c (1-diagonal sibling).
+ * Sister files: 03_double_diagonal_direct.c (manual placement),
+ *               grids/tri_grids/03_double_diagonal.c (the grid drawer),
+ *               02_right_isosceles_path.c (the one-diagonal version).
  *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, TRI_SIZE, MAX_OBJ
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 7 pairs: edge / cursor / start / end / path / HUD / hint
- *   §4 gridctx  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg
- *   §5 pool     — Pool: place / find / clear / draw  (used as path)
- *   §6 cursor   — Cursor + TETRA_DIR + reset / move / draw + START / END
- *   §7 mode     — pixel walk between two centroids → wedge list
- *   §8 scene    — hud_draw + scene_draw
- *   §9 screen   — ncurses init / cleanup
- *  §10 app      — signals, main loop
- *
- * Keys:  arrows:move  s:set-start  e:set-end  spc:clear-path
- *        +/-:size  t:theme  r:reset  q/ESC:quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/03_double_diagonal_path.c \
- *       -o 03_double_diagonal_path -lncurses -lm
+ * Tetrakis square tiling — https://en.wikipedia.org/wiki/Tetrakis_square_tiling
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Line-rasterize between two wedge centroids in PIXEL
- *                  space; for each sampled pixel, ask pixel_to_tri
- *                  "which (col, row, wedge) triangle owns me?" and record
- *                  uniques. The result is the ordered set of N/E/S/W
- *                  wedges traversed by the straight line.
- *
- * Data-structure : Pool — flat array of Obj{col, row, wedge, glyph,
- *                  alive}. pool_place deduplicates via pool_find.
- *
- * Sampling step  : ~size/4 pixels — fine enough that no wedge is
- *                  skipped. Wedges are smaller than the underlying
- *                  square (4 per square), so the step must stay tight.
- *
- * References     :
- *   Tetrakis square tiling — https://en.wikipedia.org/wiki/Tetrakis_square_tiling
- *   Bresenham line — https://en.wikipedia.org/wiki/Bresenham%27s_line_algorithm
- *   Line-of-sight on grids — Red Blob Games
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Stretch a string from S to E across an X-cut grid of squares. The
- * path is the ordered list of wedges the string passes through. Sample
- * the string finely in pixel space; at each sample, classify the
- * underlying wedge with the same formula ctx_draw_bg uses.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * The grid is a square lattice with both diagonals drawn — every
- * square holds 4 triangular wedges. Where the line crosses a side
- * it changes square; where it crosses a diagonal it changes wedge
- * inside the same square. The path captures every such transition
- * by sampling more often than half the wedge size.
- *
- * DRAWING METHOD  (per frame)
- * ──────────────
- *  1. erase()
- *  2. ctx_draw_bg — raster scan: pixel_to_tri → tri_edge_char draws
- *     '/', '\\', '|', '_' near edges of each wedge.
- *  3. pool_draw — '*' at each path entry's centroid screen cell.
- *  4. marker_draw — 'S' at start, 'E' at end.
- *  5. cursor_draw — '@' at the cursor address.
- *  6. hud_draw — top-right status, bottom-row hint.
- *
- *  path_compute runs only on START/END change or size change.
- *
- * KEY FORMULAS
- * ────────────
- *  Pixel → wedge:
- *    a = px / size,   b = py / size
- *    col = ⌊a⌋,        row = ⌊b⌋
- *    dx = fa-0.5,      dy = fb-0.5
- *    wedge = (|dx|>|dy|) ? (dx>0?E:W) : (dy>0?S:N)
- *
- *  Wedge centroid (1/3 of the way from apex to opposite edge midpoint):
- *    N: a = col+1/2,  b = row+1/6
- *    E: a = col+5/6,  b = row+1/2
- *    S: a = col+1/2,  b = row+5/6
- *    W: a = col+1/6,  b = row+1/2
- *    px = a · size,   py = b · size
- *
- *  Walk parameters: dist, n, step = size/4 — same as 02_*_path.
- *
- *  Walk loop:
- *    for i in 0..n:
- *      t  = i / n
- *      px = sx + t·dx,  py = sy + t·dy
- *      pixel_to_tri(px, py) → (tC, tR, tW)
- *      pool_place(tC, tR, tW)         // dedup
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Wedge density: 4 wedges per square means a horizontal line of
- *    one-square length can record 2–3 wedges. Keep step ≤ size/4.
- *  • Apex point: at the centre of any square the line passes through
- *    a single pixel where all 4 wedges meet. The classifier breaks
- *    the tie deterministically by ≥ on |dy|, so the path won't
- *    "flicker" between wedges.
- *  • Recompute on size change: '+'/'-' must call path_compute.
- *  • Zero-length, MAX_OBJ cap: identical to 02_*_path.
- *
- * HOW TO VERIFY
- * ─────────────
- *  START and END both at N wedge of (0,0): path size = 1.
- *  END at E wedge of (0,0): path size ≥ 2 (passes through the apex).
- *  END at N wedge of (1,0): path size = 2 (one square step right).
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -138,9 +25,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 #define CELL_W 2
@@ -172,9 +57,7 @@
 
 static const char *DIR_NAME[4] = { "N", "E", "S", "W" };
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -191,9 +74,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static const short THEME_FG[N_THEMES][3] = {
     {  82,  82, 196 }, {  39, 226, 207 },
@@ -224,9 +105,7 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx                                                             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx ── */
 
 typedef struct {
     int    rows, cols;
@@ -333,11 +212,16 @@ static void ctx_draw_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_BORDER));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool ── */
 
+/* One wedge the path touches: which square (col,row), which of the four
+ * triangles in it (wedge: N/E/S/W), what character to draw, and whether
+ * this slot is in use. 'alive' lets us mark a slot empty without shuffling
+ * the array. */
 typedef struct { int col, row, wedge; char glyph; bool alive; } Obj;
+
+/* The whole path as a plain list of wedges. 'count' is how many we've added;
+ * MAX_OBJ caps it so a long line can't overflow the fixed array. */
 typedef struct { Obj items[MAX_OBJ];  int count; } Pool;
 
 static int pool_find(const Pool *p, int col, int row, int wedge)
@@ -374,19 +258,23 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_PATH) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 cursor ── */
 
+/* Everything the user is steering. The '@' you move lives at (col,row,wedge).
+ * When you press 's' or 'e' we copy that spot into the START or END fields and
+ * flip the matching has_* flag, so the program knows the endpoint is set. */
 typedef struct {
-    int col, row, wedge;
-    int sCol, sRow, sWedge;     /* START marker */
-    int eCol, eRow, eWedge;     /* END   marker */
-    int has_start, has_end;
-    int theme;
+    int col, row, wedge;        /* where the '@' cursor currently sits */
+    int sCol, sRow, sWedge;     /* the START point, once 's' is pressed */
+    int eCol, eRow, eWedge;     /* the END point, once 'e' is pressed */
+    int has_start, has_end;     /* have START / END been set yet? */
+    int theme;                  /* which color set is active */
     int paused;
 } Cursor;
 
+/* Lookup table for moving the cursor. Pressing an arrow from a given wedge
+ * either flips to a neighbouring wedge in the same square or steps into the
+ * next square; each entry says how much to change (col, row, wedge). */
 static const int TETRA_DIR[4][4][3] = {
     { {  0,  0, DIR_W }, {  0,  0, DIR_W }, {  0,  0, DIR_W }, { -1,  0, DIR_E } },
     { {  0,  0, DIR_E }, { +1,  0, DIR_W }, {  0,  0, DIR_E }, {  0,  0, DIR_E } },
@@ -431,9 +319,7 @@ static void marker_draw(const GridCtx *g, int col, int row, int wedge,
     attroff(COLOR_PAIR(pair) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  mode — pixel walk between START and END centroids                   */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 mode — walk a straight line from START to END, noting each wedge ── */
 
 static void path_compute(Pool *p, const Cursor *cur, const GridCtx *g)
 {
@@ -458,13 +344,11 @@ static void path_compute(Pool *p, const Cursor *cur, const GridCtx *g)
         double py = sy + t * dy;
         int    tC, tR, tW; double fa, fb;
         pixel_to_tri(px, py, g->tri_size, &tC, &tR, &tW, &fa, &fb);
-        pool_place(p, tC, tR, tW, '*');
+        pool_place(p, tC, tR, tW, '*');   /* pool_place ignores repeats */
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, const Pool *path,
                      double fps)
@@ -501,9 +385,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, const Pool *path,
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -516,9 +398,7 @@ static void screen_init(int theme)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §10 app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §10 app ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;

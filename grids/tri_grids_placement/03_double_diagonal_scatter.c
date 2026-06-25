@@ -1,129 +1,18 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 03_double_diagonal_scatter.c — distance-colored scatter on the tetrakis grid
+ * 03_double_diagonal_scatter.c
  *
- * DEMO: A random scatter of N wedges fills a square region around the
- *       cursor on the tetrakis grid (each square split by both
- *       diagonals into 4 N/E/S/W wedges). Each wedge is colored on a
- *       6-stop gradient by its cell-distance from the cursor — closer
- *       = warm, farther = cool. SPACE reseeds; +/- changes density.
+ * Sprinkle a cloud of random dots near the cursor on a grid where each
+ * square is cut by both diagonals into four wedges (N/E/S/W). Each dot
+ * is colored by how far it sits from the cursor — close is warm, far is
+ * cool. Moving the cursor just recolors the same dots; SPACE makes a new
+ * cloud; +/- changes how many dots.
  *
- * Study alongside: 03_double_diagonal_direct.c (manual placement),
- *                  03_double_diagonal_patterns.c (preset stamps),
- *                  02_right_isosceles_scatter.c (1-diagonal sibling).
- *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, TRI_SIZE, SCATTER_RADIUS, DENSITY
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 6-bucket gradient palette + cursor / HUD / hint
- *   §4 gridctx  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg
- *   §5 pool     — Pool: place / find / clear / draw  (no toggle, scatter mode)
- *   §6 cursor   — Cursor + TETRA_DIR + reset / move / draw
- *   §7 mode     — random spawn + cell-distance bucket
- *   §8 scene    — hud_draw + scene_draw
- *   §9 screen   — ncurses init / cleanup
- *  §10 app      — signals, main loop
- *
- * Keys:  arrows:move  spc:reseed  +/-:density  r:reset
- *        t:theme  q/ESC:quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/03_double_diagonal_scatter.c \
- *       -o 03_double_diagonal_scatter -lncurses -lm
+ * Grid shape: tetrakis square tiling
+ *   https://en.wikipedia.org/wiki/Tetrakis_square_tiling
+ * Sister files: 03_double_diagonal_direct.c, 03_double_diagonal_patterns.c,
+ *               02_right_isosceles_scatter.c.
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Random scatter. Pick N random (Δcol, Δrow, wedge)
- *                  within ±SCATTER_RADIUS of the cursor; color by
- *                  cell distance from cursor, bucketed into 6 gradient
- *                  slots.
- *
- * Data-structure : Pool — flat array of (col, row, wedge) entries.
- *                  Bucket assignment is recomputed every frame from the
- *                  cursor's CURRENT position; entries themselves only
- *                  change on reseed.
- *
- * Distance metric: |Δcol| + |Δrow| + (wedge-distance mod 4). The wedge
- *                  term is 0 for same wedge, 1 or 2 for adjacent /
- *                  opposite — cheap and visually "right".
- *
- * Re-seeding     : SPACE re-randomises with a new seed (xor'd by clock).
- *                  +/- density also reseeds. Moving the cursor does
- *                  NOT re-seed — only re-colours.
- *
- * References     :
- *   Tetrakis square tiling — https://en.wikipedia.org/wiki/Tetrakis_square_tiling
- *   Linear congruential generator — Numerical Recipes ch. 7
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Two halves: STORAGE (random wedge addresses, one shot per reseed)
- * and COLOURING (a pure function of cursor distance, recomputed every
- * frame). Moving the cursor never reseeds; it only repaints the same
- * scatter through a different distance lens.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Sprinkle salt on X-cut graph paper — grains land in random wedges
- * inside a small square region around the cursor. Now point a
- * coloured spotlight at the cloth: grains close to the beam glow
- * warm, farther ones cool. Move the spotlight: same grains, different
- * colours.
- *
- * DRAWING METHOD  (per frame)
- * ──────────────
- *  1. erase()
- *  2. ctx_draw_bg — raster scan: pixel_to_tri → tri_edge_char draws
- *     '/', '\\', '|', '_' on each wedge boundary.
- *  3. For each scatter object:
- *       d = |obj.col - cur.col| + |obj.row - cur.row| + wedge_dist
- *       bucket = min(d, N_BUCKETS - 1)
- *       attron(COLOR_PAIR(PAIR_BUCK0 + bucket))
- *       mvaddch(centroid_screen, '*')
- *  4. cursor_draw — '@' on top.
- *  5. hud_draw — top-right status, bottom-row hint.
- *
- *  Reseed (only on SPACE or +/- density):
- *    pool->count = 0
- *    g_seed ^= clock_ns()
- *    for i in 0..density:
- *      dC = floor(frand·(2·R+1)) - R    ; dR = same
- *      w  = (int)floor(frand · 4)       // 0..3  → N/E/S/W
- *      pool_place(cur.col+dC, cur.row+dR, w)
- *
- * KEY FORMULAS
- * ────────────
- *  Pixel → wedge: see §4 (wedge classifier above the centre offsets).
- *
- *  Wedge-aware cell distance:
- *    d = |Δcol| + |Δrow| + wedge_dist
- *    wedge_dist = |aW - bW| if ≤ 2 else 4 - |aW - bW|
- *
- *  LCG step (Numerical Recipes ch. 7):
- *    g_seed = g_seed · 1103515245 + 12345
- *    frand  = ((g_seed >> 16) & 0x7FFF) / 32767.0
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Density vs MAX_OBJ: at high density the dedup pass may give
- *    fewer visible dots than the requested count.
- *  • Manhattan vs true distance: each square has 4 wedges and the
- *    true edge-walk distance involves crossing diagonals; Manhattan
- *    is a fast proxy that under-counts intra-square hops by 0–1.
- *  • Reseed-on-cursor-move: not triggered by design.
- *
- * HOW TO VERIFY
- * ─────────────
- *  Place cursor at the centre of a fresh scatter — colours warmest
- *  near '@'. Walk the cursor outward: same dots, the warm/cool
- *  boundary follows the cursor.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -136,9 +25,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 #define CELL_W 2
@@ -168,16 +55,13 @@
 
 #define PAIR_BORDER 1
 #define PAIR_CURSOR 2
-#define PAIR_BUCK0  3   /* nearest, hottest */
-/* PAIR_BUCK0..PAIR_BUCK0+5 = 6 gradient slots */
+#define PAIR_BUCK0  3   /* first of 6 gradient colors; bucket 0 = closest/warmest */
 #define PAIR_HUD    9
 #define PAIR_HINT   10
 
 static const char *DIR_NAME[4] = { "N", "E", "S", "W" };
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -194,9 +78,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static const short THEME_GRAD[N_THEMES][N_BUCKETS] = {
     { 196, 202, 214, 226,  82,  39 },
@@ -222,16 +104,17 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx                                                             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx ── */
 
+/* Everything needed to turn a grid square+wedge into a screen spot, and
+ * back. Holds the screen size and where we pin the grid's origin, so the
+ * grid stays centered as the terminal resizes. */
 typedef struct {
-    int    rows, cols;
-    int    cw, ch;
-    int    ox, oy;
-    double tri_size;
-    double border_w;
+    int    rows, cols;     /* terminal size, in character cells */
+    int    cw, ch;         /* how many pixels one character cell is worth (width, height) */
+    int    ox, oy;         /* screen cell that grid coordinate (0,0) maps to */
+    double tri_size;       /* size of one grid square in pixels; bigger = zoomed in */
+    double border_w;       /* how close to an edge counts as "on the line" when drawing borders */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols, double tri_size)
@@ -331,11 +214,13 @@ static void ctx_draw_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_BORDER));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool ── */
 
+/* One scattered dot: which square (col,row), which of the 4 wedges, the
+ * character to draw, and whether the slot is in use. */
 typedef struct { int col, row, wedge; char glyph; bool alive; } Obj;
+/* The whole cloud of dots in one fixed array — no allocation, just fill
+ * up to count. A reseed resets count to 0 and refills. */
 typedef struct { Obj items[MAX_OBJ];  int count; } Pool;
 
 static int pool_find(const Pool *p, int col, int row, int wedge)
@@ -358,17 +243,21 @@ static void pool_place(Pool *p, int col, int row, int wedge, char glyph)
 
 static void pool_clear(Pool *p) { p->count = 0; }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 cursor ── */
 
+/* The user-driven marker. Its position is the center the dot cloud is
+ * sprinkled around and measured from, so moving it recolors everything. */
 typedef struct {
-    int col, row, wedge;
-    int density;
-    int theme;
-    int paused;
+    int col, row, wedge;   /* where the '@' sits: square + which of the 4 wedges */
+    int density;           /* how many dots to scatter on the next reseed */
+    int theme;             /* which color palette is active (0..N_THEMES-1) */
+    int paused;            /* unused here, kept so all the sister demos share one struct */
 } Cursor;
 
+/* Move lookup: given an arrow key and the wedge you're in, what's the next
+ * spot? Each entry is the step (dcol, drow, new-wedge). Pressing an arrow
+ * sometimes just flips to the neighboring wedge in the same square, and
+ * sometimes hops into the next square — this table bakes in both. */
 static const int TETRA_DIR[4][4][3] = {
     { {  0,  0, DIR_W }, {  0,  0, DIR_W }, {  0,  0, DIR_W }, { -1,  0, DIR_E } },
     { {  0,  0, DIR_E }, { +1,  0, DIR_W }, {  0,  0, DIR_E }, {  0,  0, DIR_E } },
@@ -402,10 +291,10 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  mode — random scatter + distance bucket                             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 mode — random scatter + distance bucket ── */
 
+/* Our own tiny random-number generator so the demo is self-contained and
+ * repeatable from a given seed; returns a value in [0,1). */
 static unsigned int g_seed = 1;
 static double frand(void)
 {
@@ -416,7 +305,8 @@ static double frand(void)
 static int triangle_distance(int aC, int aR, int aW, int bC, int bR, int bW)
 {
     int d  = abs(aC - bC) + abs(aR - bR);
-    /* wedge distance: 0 same, 1 adjacent (mod 4), 2 opposite */
+    /* add a small bump for facing different ways: 0 same wedge, 1 a
+     * quarter-turn apart, 2 facing opposite (the 4 wedges wrap around) */
     int dd = abs(aW - bW); if (dd > 2) dd = 4 - dd;
     return d + dd;
 }
@@ -432,8 +322,10 @@ static int distance_bucket(int dist, int max_d)
 static void scatter_seed(Pool *p, const Cursor *cur)
 {
     pool_clear(p);
-    g_seed ^= (unsigned int)clock_ns();
+    g_seed ^= (unsigned int)clock_ns();   /* stir in the clock so each reseed differs */
     int max = (cur->density < MAX_OBJ) ? cur->density : MAX_OBJ;
+    /* the tries cap stops us looping forever when duplicates keep getting
+     * rejected and the cloud can't reach the requested count */
     int tries = 0;
     while (p->count < max && tries < max * 4) {
         int dC    = (int)(frand() * (2*SCATTER_RADIUS+1)) - SCATTER_RADIUS;
@@ -461,9 +353,7 @@ static void scatter_draw(const Pool *p, const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, const Pool *p,
                      double fps)
@@ -496,9 +386,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, const Pool *p,
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -511,9 +399,7 @@ static void screen_init(int theme)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §10 app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §10 app ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;

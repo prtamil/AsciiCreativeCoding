@@ -1,143 +1,15 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 07_half_brick_vert.c — vertical brick (staggered column) grid
+ * 07_half_brick_vert.c — a grid of bricks stacked in columns, like a wall
+ * turned on its side. Every other column of cells is nudged down by half a
+ * cell, so the horizontal joints zig-zag instead of lining up.
  *
- * DEMO: Odd-numbered columns shift down by half a cell height. This is
- *       the exact transpose of 06_brick_stagger: the row formula gets the
- *       (col % 2) offset, while the column formula stays linear.
- *       Compare the two files side-by-side to see the symmetry.
+ * It's file 06_brick_stagger with the axes swapped: there the rows shift
+ * sideways; here the columns shift up/down. Worth reading the two together.
+ * Also see 01_uniform_rect.c for the plain, un-shifted grid this builds on.
  *
- * Study alongside: 06_brick_stagger.c (horizontal version), 01_uniform_rect.c
- *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, HALF_H = CELL_H/2, EWMA constant
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — grid / active / cursor / HUD / HINT pairs
- *   §4 formula  — GridCtx (with HALF_H) + ctx_init / ctx_to_screen
- *                 / ctx_grid_char / ctx_draw_bg
- *   §5 cursor   — Cursor + cursor_reset / cursor_move / cursor_draw
- *   §6 scene    — hud_draw + scene_draw
- *   §7 screen   — ncurses init / cleanup
- *   §8 app      — signals, main loop
- *
- * Keys:  arrows move @   r reset   q/ESC quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/rect_grids/07_half_brick_vert.c \
- *       -o 07_half_brick_vert -lncurses
+ * Move the @ with the arrow keys, r resets, q/ESC quits.
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Transpose of 06_brick_stagger.
- *                  Even cols align normally.
- *                  Odd  cols shift DOWN by HALF_H = CELL_H / 2.
- *
- * Stagger formula: ONLY the vertical part of ctx_to_screen changes:
- *
- *   screen_row = r * CELL_H + (c % 2) * HALF_H   ← +HALF_H on odd cols
- *   screen_col = c * CELL_W                        ← unchanged from 01
- *
- * Grid line draw : Horizontal lines are now column-dependent:
- *                    even cols: h_line at sr % CELL_H == 0
- *                    odd  cols: h_line at sr % CELL_H == HALF_H
- *                  Vertical lines: sc % CELL_W == 0 (unchanged)
- *
- * Symmetry       : 06_brick_stagger swaps (r,c) and (CELL_H,CELL_W) roles.
- *                  The only code difference is:
- *                    06: screen_col += (r%2)*HALF_W   v-lines row-dependent
- *                    07: screen_row += (c%2)*HALF_H   h-lines col-dependent
- *
- * References     :
- *   Vertical brick bond — same concept as 06, transposed axis
- *   Offset hex grids (flat-top orientation) — redblobgames.com/grids/hexagons
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * This is the EXACT transpose of 06_brick_stagger.  Swap "row" and "col"
- * everywhere in file 06, swap CELL_H and CELL_W, swap HALF_W and HALF_H,
- * and you get this file.  The vertical lines don't move; the horizontal
- * lines stagger up/down based on which column band you are in.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Rotate the brick wall 90°.  Now the bricks are stacked vertically and
- * each column of bricks shifts up or down by half a cell height.
- *
- * The two modes:
- *   Mode 0 (even column bands): horizontal lines at sr % CELL_H == 0
- *   Mode 1 (odd  column bands): horizontal lines at sr % CELL_H == HALF_H
- *
- * Column band: col_band = sc / CELL_W.  Parity of col_band selects mode.
- *
- * Symmetry table — all code differences between 06 and 07:
- *   06 (brick horiz)       07 (brick vert)
- *   ──────────────         ──────────────
- *   stagger on rows        stagger on cols
- *   screen_col += (r%2)*HALF_W    screen_row += (c%2)*HALF_H
- *   on_h = sr%CH==0  (fixed)      on_v = sc%CW==0  (fixed)
- *   on_v  depends on row_band     on_h  depends on col_band
- *   max_c = (cols-HALF_W)/CW      max_r = (rows-HALF_H)/CH
- *
- * DRAWING METHOD
- * ──────────────
- *  Per screen position (sr, sc):
- *
- *  1. Vertical lines (unchanged from uniform rect):
- *       on_v = (sc % CELL_W == 0)
- *
- *  2. Horizontal lines (column-band dependent):
- *       col_band = sc / CELL_W
- *       if (col_band % 2 == 0):
- *           on_h = (sr % CELL_H == 0)
- *       else:
- *           on_h = (sr % CELL_H == HALF_H)
- *
- *  3. Character: on_h && on_v -> '+',  on_h -> '-',  on_v -> '|'
- *
- * KEY FORMULAS
- * ────────────
- *  Forward (cell -> screen top-left):
- *    screen_row = r * CELL_H + (c % 2) * HALF_H
- *    screen_col = c * CELL_W                        <- unchanged
- *
- *  Horizontal line condition at (sr, sc):
- *    col_band = sc / CELL_W
- *    on_h     = (sr % CELL_H == (col_band % 2) * HALF_H)
- *
- *  HALF_H = CELL_H / 2     (CELL_H must be even)
- *
- *  Cursor row bound (odd cols extend further down):
- *    max_r = (rows - 1 - HALF_H) / CELL_H - 1
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • CELL_H must be even for a symmetric stagger.  Odd CELL_H gives
- *    HALF_H = CELL_H/2 rounded down — the shift is asymmetric.
- *
- *  • The bottom of odd columns extends HALF_H rows further than even
- *    columns.  Subtract HALF_H from available height in ctx_init().
- *
- *  • Vertical lines span the FULL screen height regardless of col band.
- *    Do NOT stagger the vertical lines (sc%CELL_W==0 always, no shift).
- *
- *  • The ambiguity at vertical lines (sc%CELL_W==0) is the same as the
- *    horizontal ambiguity in 06: the line "belongs" to the col_band to
- *    its right (sc/CELL_W gives the next band index).
- *
- * HOW TO VERIFY
- * ─────────────
- *  Look at the first two columns of cells:
- *    Col 0 (even): horizontal line at rows 0, CELL_H, 2*CELL_H, ...
- *    Col 1 (odd):  horizontal line at rows HALF_H, CELL_H+HALF_H, ...
- *  The odd-col joints should be exactly between the even-col joints.
- *  Compare visually with 06_brick_stagger rotated 90°.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
@@ -149,28 +21,25 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS  30
-#define CELL_W       8   /* cols per cell */
-#define CELL_H       6   /* rows per cell; must be even for HALF_H */
-#define HALF_H      (CELL_H / 2)   /* = 3: the vertical stagger offset */
+#define CELL_W       8   /* how wide one cell is, in screen columns */
+#define CELL_H       6   /* how tall one cell is, in screen rows; keep it even */
+#define HALF_H      (CELL_H / 2)   /* how far odd columns slide down: half a cell */
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* The on-screen FPS number jumps around frame to frame, so we smooth it:
+   each frame nudges the shown value a little toward the latest reading. */
 #define FPS_EWMA_ALPHA  0.05
 
-/* Color pair IDs */
-#define PAIR_GRID    1   /* grid lines                   */
-#define PAIR_ACTIVE  2   /* highlighted cell fill        */
-#define PAIR_CURSOR  3   /* bright '@'                   */
+/* Names for the five color slots we set up below. */
+#define PAIR_GRID    1   /* the grid lines               */
+#define PAIR_ACTIVE  2   /* fill inside the selected cell */
+#define PAIR_CURSOR  3   /* the bright '@'               */
 #define PAIR_HUD     4   /* status bar (yellow)          */
 #define PAIR_HINT    5   /* key-hint footer (cyan)       */
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -185,9 +54,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static void color_init(void)
 {
@@ -199,27 +66,26 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx and the cell ↔ screen mapping                    */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula — turning a cell's (row, col) into a spot on screen ── */
 
 /*
- * GridCtx — geometry of the vertically-staggered grid plus cursor bounds.
- *
- * half_h is the column-stagger offset = ch / 2.  It is carried as a field
- * so ctx_to_screen / ctx_grid_char don't depend on file-level macros.
+ * GridCtx — everything we need to know to draw the grid and keep the cursor
+ * inside it: the terminal size, the cell size, how far odd columns slide down,
+ * and the furthest cell the cursor is allowed to reach. We bundle it into one
+ * struct and pass it around, so the drawing code reads these values from here
+ * instead of reaching for the file-level #defines — that keeps the math in one
+ * place and makes it easy to swap in a different grid size later.
  */
 typedef struct {
-    /* terminal extent */
-    int rows, cols;
+    int rows, cols;   /* terminal size, in screen rows and columns */
 
-    /* cell size in screen characters */
-    int cw, ch;
+    int cw, ch;       /* one cell's size: cw wide, ch tall (screen chars) */
 
-    /* vertical stagger offset applied to odd cols (= ch / 2) */
-    int half_h;
+    int half_h;       /* the down-shift on odd columns; always ch / 2 */
 
-    /* cursor bounds — last whole cell that fits, accounting for stagger */
+    /* Furthest cell the cursor may sit on. We stop one short of the edge so a
+       whole cell always fits; max_r already leaves room for the odd-column
+       overhang at the bottom. */
     int max_r, max_c;
 } GridCtx;
 
@@ -228,21 +94,16 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->rows = rows; g->cols = cols;
     g->cw = CELL_W; g->ch = CELL_H;
     g->half_h = HALF_H;
-    /* Odd columns extend HALF_H further down, so reduce max row */
+    /* Odd columns hang HALF_H lower, so leave that much extra room at the
+       bottom or the lowest cell would run off the screen. */
     g->max_r = (rows - 1 - HALF_H) / CELL_H - 1;
     g->max_c = cols / CELL_W - 1;
 }
 
 /*
- * ctx_to_screen — THE VERTICAL STAGGER FORMULA:
- *
- *   screen_row = r * ch + (c % 2) * half_h   ← row shifts on odd cols
- *   screen_col = c * cw                        ← unchanged from 01
- *
- * Compare to 06_brick_stagger:
- *   06:  screen_col = c * cw + (r % 2) * half_w   ← col shifts on odd rows
- *   07:  screen_row = r * ch + (c % 2) * half_h   ← row shifts on odd cols
- * Perfect axis swap.
+ * Find where a cell's top-left corner lands on screen. The trick of this whole
+ * demo lives here: odd-numbered columns get pushed down by half a cell, which
+ * is what makes the bricks stagger. Even columns sit at their plain position.
  */
 static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
@@ -251,15 +112,11 @@ static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 }
 
 /*
- * ctx_grid_char — grid line detection for vertically staggered grid.
- *
- * Vertical lines: same as 01 — sc % cw == 0
- *
- * Horizontal lines depend on which column band sc falls in:
- *   col_index = sc / cw
- *   even col: h_line at sr % ch == 0
- *   odd  col: h_line at sr % ch == half_h
- *             (because the cell is shifted DOWN by half_h)
+ * For one screen spot, decide which line character (if any) belongs there.
+ * Vertical lines fall on the same even spacing everywhere. Horizontal lines
+ * are the staggered part: in odd columns the cells sit half a cell lower, so
+ * their joints land half a cell lower too. We pick the line position based on
+ * which column we're in.
  */
 static char ctx_grid_char(const GridCtx *g, int sr, int sc)
 {
@@ -288,10 +145,10 @@ static void ctx_draw_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_GRID));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 cursor ── */
 
+/* Where the @ is right now, given as a cell (row, col) rather than a screen
+   spot — ctx_to_screen turns it into pixels when it's time to draw. */
 typedef struct { int r, c; } Cursor;
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
@@ -323,9 +180,7 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
 {
@@ -355,9 +210,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(void)
@@ -368,9 +221,7 @@ static void screen_init(void)
     color_init(); atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 static void on_signal(int s)

@@ -1,122 +1,27 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 04_30_60_90_direct.c — direct object placement on the kisrhombille grid (equilaterals + 3 medians)
+ * 04_30_60_90_direct.c — place objects on a triangle grid that also shows
+ * each triangle split into six 30-60-90 wedges.
  *
- * DEMO: An equilateral triangular grid fills the screen. Move '@' between
- *       triangles with arrow keys. Press SPACE to toggle a '*' object at
- *       the cursor triangle. Objects are stored by lattice address
- *       (col, row, up) and survive resize — they follow their triangle
- *       when the terminal changes size. 'g' cycles the placed glyph.
+ * A triangle grid fills the screen. Move '@' between triangles with the
+ * arrow keys; SPACE drops or removes an object on the triangle under it.
+ * Objects are remembered by which triangle they sit on, so they stay put
+ * when the terminal resizes.
  *
- * Study alongside: grids/tri_grids/04_30_60_90.c (background rasterizer),
- *                  grids/hex_grids_placement/01_hex_direct.c (same idea on hex).
- *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, TRI_SIZE, MAX_OBJ
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 6 pairs: edge / median / cursor / object / HUD / hint
- *   §4 gridctx  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg
- *   §5 pool     — Pool: place / remove / toggle / find / clear / draw
- *   §6 cursor   — Cursor + TRI_DIR + reset / move / draw
- *   §7 mode     — direct toggle (lives in main loop)
- *   §8 scene    — hud_draw + scene_draw
- *   §9 screen   — ncurses init / cleanup
- *  §10 app      — signals, main loop
- *
- * Keys:  arrows:move  spc:toggle  g:glyph  C:clear  r:reset
- *        +/-:size  t:theme  q/ESC:quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/04_30_60_90_direct.c \
- *       -o 04_30_60_90_direct -lncurses -lm
+ * Sister files: tri_grids/04_30_60_90.c draws the same background;
+ * hex_grids_placement/01_hex_direct.c is this same idea on a hex grid.
+ * Kisrhombille tiling: https://en.wikipedia.org/wiki/Kisrhombille_tiling
  */
 
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Direct placement using a movable cursor. The cursor
- *                  holds (col, row, up) in TRIANGLE-lattice space. SPACE
- *                  toggles an object at that address; the object's screen
- *                  position is recomputed each frame from tri_centroid_pixel.
- *
- * Data-structure : Pool — flat array of Obj{col, row, up, glyph, alive}.
- *                  Removal swaps the dead slot with the last item (O(1)).
- *
- * Rendering      : Three-pass per frame:
- *                    (1) ctx_draw_bg rasterizes equilaterals + medians
- *                    (2) pool_draw renders each placed object at its centroid
- *                    (3) cursor_draw places '@' at the cursor centroid
- *                  The cursor draws over objects so the user always sees it.
- *
- * References     :
- *   Triangular tiling — https://en.wikipedia.org/wiki/Triangular_tiling
- *   Object pool pattern — gameprogrammingpatterns.com/object-pool.html
- *   Kisrhombille tiling — https://en.wikipedia.org/wiki/Kisrhombille_tiling
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Same lattice and cursor mechanic as 01_equilateral_direct, with one
- * twist: each equilateral triangle is dressed with its three medians
- * (vertex → opposite-edge midpoint), splitting it into 6 right
- * 30-60-90 sub-triangles. The cursor still addresses WHOLE equilaterals
- * — placement is by (col, row, up), not by sub-triangle. The medians
- * are visual decoration that ctx_draw_bg renders automatically per cell.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Picture the equilateral tiling, then over-print three thin lines
- * inside every triangle joining each vertex to the midpoint of the
- * opposite side. The cursor walks parent triangles; the medians are
- * just paint. Pool stores the same 3-tuple (col, row, up) and
- * draws glyphs at the parent's centroid — which happens to be the
- * concurrent point of the three medians.
- *
- * DRAWING METHOD  (per frame)
- * ──────────────
- *  1. erase()
- *  2. ctx_draw_bg — raster scan: pixel_to_tri → tri_edge_char (edges)
- *     AND a median-proximity test for each of the 3 medians inside
- *     the parent triangle → render '/' '\\' '|' near a median.
- *  3. pool_draw — glyph at each placed object's centroid screen cell.
- *  4. cursor_draw — '@' on top.
- *  5. hud_draw — top-right status, bottom-row hint.
- *
- * KEY FORMULAS
- * ────────────
- *  Cursor step (4-direction lookup): same TRI_DIR as 01_equilateral.
- *
- *  Centroid lattice → pixel  (h = size · √3 / 2):
- *    ▽: a = col + 1/3,  b = row + 1/3
- *    △: a = col + 2/3,  b = row + 2/3
- *    px = (a + 0.5·b) · size,   py = b · h
- *
- *  Median proximity (visual only, inside ctx_draw_bg):
- *    distance from (fa, fb) to each of the 3 median segments;
- *    if any < MEDIAN_T → render the median character.
- *
- *  Pool toggle: swap-with-last; same as 01_equilateral_direct.
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Centroid lands ON a median: every parent's centroid is the
- *    medians' concurrent point. The glyph drawn there sits exactly
- *    on top of the median character. By draw order, the glyph wins.
- *  • MEDIAN_T tuning: too thin → medians look dashed; too thick →
- *    medians thicken into noise.
- *  • MAX_OBJ cap and resize behaviour: identical to
- *    01_equilateral_direct.c.
- *
- * HOW TO VERIFY
- * ─────────────
- *  Place a glyph; the three medians of its parent triangle should
- *  meet under the glyph. Press +/- to resize the grid: glyph and
- *  medians scale together because both derive from the same cell
- *  math.
- *
- * ─────────────────────────────────────────────────────────────────────── */
+/* The trick here: take the plain equilateral-triangle grid and draw three
+ * thin lines inside every triangle, each running from a corner to the
+ * middle of the opposite side. Those lines (medians) cut each triangle into
+ * six little 30-60-90 wedges. They are decoration only — the cursor still
+ * walks whole triangles, and objects are placed by whole triangle, never by
+ * wedge. All three medians happen to cross at the triangle's centre, which
+ * is exactly where an object's glyph lands, so a placed glyph always sits
+ * over the meeting point of its triangle's three lines.
+ */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -133,9 +38,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 #define CELL_W 2
@@ -164,9 +67,7 @@
 
 static const char GLYPHS[N_GLYPHS] = { '*', 'o', '+', '#', 'X', '%' };
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -183,9 +84,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static const short THEME_FG[N_THEMES][2] = {
     {  75, 226 }, {  82, 207 }, { 207,  82 }, {  15,  39 },
@@ -210,17 +109,19 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx — kisrhombille pixel↔skew lattice + background raster       */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx ── */
 
+/* Everything needed to map between screen cells and triangles. Holds the
+ * current terminal size, the size of one cell in sub-pixels, where the grid
+ * origin sits on screen, and the tunables that decide how thick the triangle
+ * outlines and inner lines are drawn. */
 typedef struct {
-    int    rows, cols;
-    int    cw, ch;
-    int    ox, oy;
-    double tri_size;
-    double border_w;
-    double median_t;
+    int    rows, cols;   /* terminal size in cells                          */
+    int    cw, ch;       /* sub-pixels per cell, width and height           */
+    int    ox, oy;       /* screen cell the grid's (0,0) point lands on     */
+    double tri_size;     /* edge length of one triangle, in sub-pixels      */
+    double border_w;     /* how close to an edge counts as "on the edge"    */
+    double median_t;     /* how close to an inner line counts as "on it"    */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols, double tri_size)
@@ -279,10 +180,9 @@ static char tri_edge_char(int up, double fa, double fb, double *out_min)
     return ch;
 }
 
-/*
- * tri_median_char — three median signed distances inside the triangle.
- * See grids/tri_grids/04_30_60_90.c §4 for the line equations.
- */
+/* Picks the inner line nearest this point and reports how close it is, so the
+ * caller can decide whether to paint a line character here. Line equations
+ * come from grids/tri_grids/04_30_60_90.c §4. */
 static char tri_median_char(int up, double fa, double fb, double *out_min)
 {
     static const double INV_SQRT2 = 0.70710678118654752440;
@@ -336,11 +236,16 @@ static void ctx_draw_bg(const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool ── */
 
+/* One placed object: which triangle it sits on (col, row, and up = whether
+ * that triangle points up or down) and the character to draw. 'alive' marks a
+ * slot as in use. */
 typedef struct { int col, row, up; char glyph; bool alive; } Obj;
+
+/* The bag of all placed objects — a plain fixed array plus how many are used.
+ * When one is removed we move the last item into its slot, which keeps the
+ * used items packed at the front. */
 typedef struct { Obj items[MAX_OBJ];  int count; } Pool;
 
 static int pool_find(const Pool *p, int col, int row, int up)
@@ -390,10 +295,11 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_OBJECT) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 cursor ── */
 
+/* The user's current state: which triangle the '@' is on (col, row, up),
+ * which glyph SPACE will drop, the active colour theme, and whether the demo
+ * is paused. */
 typedef struct {
     int col, row, up;
     int glyph_idx;
@@ -401,6 +307,9 @@ typedef struct {
     int paused;
 } Cursor;
 
+/* Moving by one triangle isn't a simple +1/-1 because the lattice alternates
+ * up- and down-pointing triangles. This table gives, for each arrow key and
+ * for the two starting orientations, the new (col, row, up). */
 static const int TRI_DIR[4][2][3] = {
     /* LEFT  */ { { -1,  0,  1 }, {  0,  0,  0 } },
     /* RIGHT */ { {  0,  0,  1 }, { +1,  0,  0 } },
@@ -432,16 +341,13 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  mode — direct toggle (logic in main loop)                           */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 mode ── */
 
-/* SPACE toggles a single object at the cursor's (col, row, up).
- * Mode logic lives entirely in the main loop's switch. */
+/* The only placement rule: SPACE drops or removes one object under the
+ * cursor. There's nothing to keep here — the handling lives in main's key
+ * switch. */
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, const Pool *pool,
                      double fps)
@@ -474,9 +380,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, const Pool *pool,
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -489,9 +393,7 @@ static void screen_init(int theme)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §10 app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §10 app ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;

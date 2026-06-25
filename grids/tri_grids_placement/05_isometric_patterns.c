@@ -1,126 +1,39 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 05_isometric_patterns.c — preset stamps on the iso (solid-fill) grid
+ * 05_isometric_patterns.c — drop preset shapes onto a colour-filled
+ * triangular grid.
  *
- * DEMO: Iso solid-colour triangular grid (6-cycle palette). Cursor moves
- *       with arrows. Press 1..5 to STAMP a preset pattern at the cursor:
- *         1 = RING    (6 triangles surrounding the cursor)
- *         2 = LINE    (8 triangles in a horizontal strip)
- *         3 = STAR    (RING + 6 outer triangles)
- *         4 = TRI     (cursor + 3 corner triangles forming a triforce)
- *         5 = SCATTER (10 random within 4-step radius)
- *       SPACE clears all objects. 'g' cycles the placed glyph.
+ * Move the cursor with the arrows, then press 1..5 to stamp a ready-made
+ * shape (a ring, a line, a star, a small triforce, or a random scatter) at
+ * that spot. The grid itself is painted in solid colour blocks; the stamped
+ * characters sit on top in reverse video so they show up on any colour.
  *
- * Study alongside: grids/tri_grids/05_isometric.c (rasterizer),
- *                  05_isometric_direct.c (manual SPACE-toggle on iso),
- *                  01_equilateral_patterns.c (same patterns, edges).
- *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, TRI_SIZE, MAX_OBJ
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — fill palette + cursor / HUD / hint
- *   §4 gridctx  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg
- *   §5 pool     — Pool: place / find / draw
- *   §6 cursor   — Cursor + cursor_reset / cursor_move / cursor_draw
- *   §7 mode     — pattern offset tables + pattern_stamp + pattern_scatter
- *   §8 scene    — hud_draw + scene_draw
- *   §9 screen   — ncurses init / cleanup
- *  §10 app      — signals, main loop
- *
- * Keys:  arrows:move  1..5:stamp  spc:clear  g:glyph
- *        +/-:size  t:theme  r:reset  q/ESC:quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/05_isometric_patterns.c \
- *       -o 05_isometric_patterns -lncurses -lm
+ * Sister files: grids/tri_grids/05_isometric.c (the plain solid-fill grid),
+ * 05_isometric_direct.c (place one triangle at a time), and
+ * 01_equilateral_patterns.c (same stamps drawn as edges, not fills).
  */
 
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
+/* The big idea:
  *
- * Algorithm      : Stamp-based placement. Each pattern is a STATIC array
- *                  of (Δcol, Δrow, target_up) triples relative to the
- *                  cursor. Pressing a digit translates the array by the
- *                  cursor and inserts each entry into the pool.
+ * Each preset shape is just a little list of "go this many columns over, this
+ * many rows down, and land on the up- or down-pointing triangle." Pressing a
+ * digit shifts that whole list to wherever the cursor is and drops a character
+ * at every spot. The shapes don't care what colour anything is — they only
+ * deal in grid addresses (column, row, which way the triangle points).
  *
- * Data-structure : Pool — flat array of Obj{col, row, up, glyph, alive}.
- *                  Pattern tables are read-only in §7.
+ * One thing that catches people out: each list stores the FINAL orientation
+ * it wants (up or down), not a relative flip. In this grid whether a triangle
+ * points up or down depends on its position, so a relative flip would make the
+ * shape look different every other spot you stamp it.
  *
- * The trick      : target_up is ABSOLUTE — orientation depends on (col +
- *                  row) parity in the equilateral lattice, so storing a
- *                  delta would flip the stamp's silhouette every other
- *                  position.
+ * To check it works: press '1' (the ring) anywhere and you should see six
+ * characters around the cursor on different background colours. Press 't' to
+ * recolour the grid — the same triangles keep their characters.
  *
- * Iso twist      : The background is solid-filled by palette_index.
- *                  Stamped glyphs render in REVERSE on the cell's palette
- *                  pair so they pop on any colour.
- *
- * References     :
- *   Triangular tiling — https://en.wikipedia.org/wiki/Triangular_tiling
- *   Object pool pattern — gameprogrammingpatterns.com/object-pool.html
- *   Linear congruential generator — Numerical Recipes ch. 7
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Same stamp mechanic as 01_equilateral_patterns; the underlying paint is
- * solid colour fills instead of edge characters. Patterns are unaware of
- * paint — they manipulate addresses (col, row, up). The iso colour wheel
- * decorates the background; stamped glyphs sit on top in REVERSE.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Rubber stamps on an iso "wall of cubes". Each pattern (RING, LINE,
- * STAR, TRI, SCATTER) is a fixed-offset list; pressing the stamp at the
- * cursor lands a glyph at every offset address. Cubes underneath keep
- * their colours; the glyph row pops in reverse video.
- *
- * DRAWING METHOD  (per frame)
- * ──────────────
- *  1. erase()
- *  2. ctx_draw_bg paints every cell with its palette colour.
- *  3. pool_draw — every placed object's glyph at its centroid cell using
- *     the same palette pair plus REVERSE.
- *  4. cursor_draw — '@' on top.
- *
- *  Stamping (only on key press):
- *    pattern_stamp(pool, PAT_xxx, cur.col, cur.row, glyph)
- *      for each entry (Δc, Δr, up_abs):
- *        pool_place(pool, cur.col+Δc, cur.row+Δr, up_abs, glyph)
- *
- * KEY FORMULAS
- * ────────────
- *  Pattern entry shape:  (Δcol, Δrow, target_up)        [3-tuple]
- *  Sentinel:             { 0xDEAD, 0, 0 }
- *
- *  Centroid lattice → pixel  (h = size · √3 / 2):
- *    ▽: a = col + 1/3,  b = row + 1/3
- *    △: a = col + 2/3,  b = row + 2/3
- *    px = (a + 0.5·b) · size,  py = b · h
- *
- *  Palette hash (paints background only):
- *    k = (col + 2·row + up) mod N_PALETTE
- *
- *  LCG step:
- *    g_seed = g_seed · 1103515245 + 12345
- *    frand  = ((g_seed >> 16) & 0x7FFF) / 32767.0
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Theme cycle: 't' rebuilds palette pairs; objects keep addresses.
- *  • Glyph cycle, MAX_OBJ cap, dedup: identical to the equilateral file.
- *  • SCATTER at high density on top of patterns can fill MAX_OBJ quickly.
- *    SPACE clears.
- *
- * HOW TO VERIFY
- * ─────────────
- *  Press '1' (RING) at origin: 6 stamped glyphs around the cursor on
- *  visibly different palette colours. Press 't': background recolours but
- *  the same triangles still hold the glyphs.
- *
- * ─────────────────────────────────────────────────────────────────────── */
+ * References: triangular tiling (en.wikipedia.org/wiki/Triangular_tiling),
+ * the object-pool idea (gameprogrammingpatterns.com/object-pool.html), and the
+ * simple random-number recipe from Numerical Recipes ch. 7.
+ */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -133,9 +46,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 
@@ -161,9 +72,7 @@
 
 static const char GLYPHS[N_GLYPHS] = { '*', 'o', '+', '#', 'X', '%' };
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -178,9 +87,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static const short PAL256[N_THEMES][N_PALETTE] = {
     { 196, 214, 226, 118,  39, 129 },
@@ -205,16 +112,17 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx — GridCtx + pixel ↔ lattice + palette                       */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx — grid layout, address↔screen, and the colour picker ── */
 
+/* Everything we need to know about where the triangular grid sits on screen.
+ * Holds the terminal size, how big each triangle is, where the grid's origin
+ * lands, and how far the cursor is allowed to roam from that origin. */
 typedef struct {
-    int    rows, cols;
-    int    cw, ch;
-    double tri_size;
-    int    ox, oy;
-    int    max_col, max_row;
+    int    rows, cols;      /* terminal size, in character cells            */
+    int    cw, ch;          /* how many sub-units make one character cell    */
+    double tri_size;        /* edge length of a triangle, in those sub-units */
+    int    ox, oy;          /* screen cell the grid's (0,0) is centred on    */
+    int    max_col, max_row;/* how far the cursor may move from the origin    */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols, double tri_size)
@@ -286,16 +194,18 @@ static void ctx_draw_bg(const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool ── */
 
+/* One stamped character living on a single triangle. */
 typedef struct {
-    int  col, row, up;
-    char glyph;
-    bool alive;
+    int  col, row, up;  /* which triangle: column, row, and up- vs down-pointing */
+    char glyph;         /* the character drawn there                             */
+    bool alive;         /* false means this slot is free to overwrite            */
 } Obj;
 
+/* All the stamped characters, kept in one fixed-size array so we never need to
+ * allocate memory while running. We only ever fill up to `count`; clearing the
+ * screen just resets count back to zero. */
 typedef struct {
     Obj items[MAX_OBJ];
     int count;
@@ -336,17 +246,23 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 cursor ── */
 
+/* Where the user is pointing, plus the few settings the arrow keys and toggles
+ * change. Kept separate from the grid so we can recolour or resize without
+ * losing the cursor's spot. */
 typedef struct {
-    int col, row, up;
-    int glyph_idx;
-    int theme;
-    int paused;
+    int col, row, up;   /* the triangle the cursor sits on                  */
+    int glyph_idx;      /* which character 'g' will stamp next (into GLYPHS)*/
+    int theme;          /* current colour theme                             */
+    int paused;         /* set by 'p' (this demo has nothing to pause, but
+                           the HUD shows the state)                         */
 } Cursor;
 
+/* Moving the cursor one step isn't a simple +/-1: stepping off an up triangle
+ * lands you somewhere different than stepping off a down one. This table gives,
+ * for each arrow and each starting orientation, the (column shift, row shift,
+ * new orientation) that lands on the neighbour. */
 static const int TRI_DIR[4][2][3] = {
     /* LEFT  */ { { -1,  0,  1 }, {  0,  0,  0 } },
     /* RIGHT */ { {  0,  0,  1 }, { +1,  0,  0 } },
@@ -384,13 +300,15 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     attroff(COLOR_PAIR(pair) | A_BOLD | A_REVERSE);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  mode — pattern stamps (offset tables + scatter LCG)                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 mode — the preset shapes and the random scatter ── */
 
+/* Each shape list ends with this marker so the stamping loop knows to stop
+ * (0xDEAD is just a value that never shows up as a real column offset). */
 #define PAT_END   { 0xDEAD, 0, 0 }
 #define IS_END(p) ((p)[0] == 0xDEAD)
 
+/* The presets. Each row is (columns over, rows down, final orientation),
+ * measured from the cursor. */
 static const int PAT_RING[][3] = {
     {  0,  0,  0 }, {  0,  0,  1 }, { -1,  0,  1 }, { +1,  0,  0 },
     {  0, -1,  1 }, {  0, +1,  0 }, PAT_END
@@ -415,6 +333,9 @@ static void pattern_stamp(Pool *pool, const int (*pat)[3],
         pool_place(pool, cC + pat[i][0], cR + pat[i][1], pat[i][2], glyph);
 }
 
+/* A tiny home-grown random number generator: returns a value in [0,1). Plenty
+ * good enough for sprinkling characters; not for anything that needs real
+ * randomness. */
 static unsigned int g_seed = 1;
 static double frand(void)
 {
@@ -424,6 +345,7 @@ static double frand(void)
 
 static void pattern_scatter(Pool *pool, int cC, int cR, char glyph)
 {
+    /* mix in the clock so each scatter looks different */
     g_seed ^= (unsigned int)clock_ns();
     int n = 10, tries = 0;
     while (n > 0 && tries < 100) {
@@ -437,9 +359,7 @@ static void pattern_scatter(Pool *pool, int cC, int cR, char glyph)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, const Pool *p,
                      double fps)
@@ -471,9 +391,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, const Pool *p,
     wnoutrefresh(stdscr); doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(int theme)
@@ -484,9 +402,7 @@ static void screen_init(int theme)
     color_init(theme); atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §10 app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §10 app ── */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 static void on_signal(int s)

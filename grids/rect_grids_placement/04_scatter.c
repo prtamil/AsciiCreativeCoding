@@ -1,149 +1,29 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 04_scatter.c — procedural object scattering on all 14 grid types
+ * 04_scatter.c — scatter objects across a grid four different ways.
  *
- * DEMO: Press keys to scatter objects procedurally across the grid.
- *       R=random scatter, M=min-distance (Poisson-ish), F=BFS flood fill
- *       from cursor, G=gradient density (denser near grid centre).
- *       Each scatter uses the cursor as the seed/anchor point.
- *       Works on all 14 grid backgrounds (keys 1-9, a-f).
+ * Move the @ cursor and press a key to drop a crowd of 'o' objects onto any
+ * of 14 grid backgrounds. The four scatter styles differ in how they pick
+ * which cells get an object: pure random, evenly-spaced, a spreading flood
+ * from the cursor, or a cloud that's densest at the middle.
  *
- * Study alongside: 02_patterns.c (stamp-based placement), 01_direct.c
+ * Study alongside: 01_direct.c (one object at a time), 02_patterns.c (stamps).
  *
- * Section map:
- *   §1 config   — per-mode geometry, scatter parameters
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 6 pairs
- *   §4 gridctx  — GridCtx, per-mode geom (ctx_geom_*) + bg drawers
- *                 (bg_draw_*), ctx_to_screen, ctx_draw_bg
- *   §5 pool     — Pool
- *   §6 scatter  — random, min-distance, BFS flood fill, gradient
- *   §7 cursor   — Cursor struct, move, reset, draw
- *   §8 scene    — hud_draw + scene_draw
- *   §9 screen   — ncurses init/cleanup
- *   §10 app     — signals, main loop
+ * The four styles, in a sentence each:
+ *   Random   — toss N objects at random cells; you'll get clumps and gaps.
+ *   Min-dist — same toss, but throw away any pick too close to one already
+ *              down. Gives the even, "blue-noise" look of Poisson-disk
+ *              sampling (Bridson 2007). We brute-force the distance check,
+ *              which is fine for a few hundred objects.
+ *   Flood    — spread outward from the cursor one ring at a time, like a
+ *              breadth-first search, filling cells as we reach them.
+ *   Gradient — walk every cell and roll the dice; cells near the grid centre
+ *              are more likely to win, so the result is dense in the middle.
  *
- * Keys:  arrows:move  R:random  M:min-dist  F:flood  G:gradient
- *        C:clear  r:reset  q/ESC:quit
- *        a:prev-grid  e:next-grid
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/rect_grids_placement/04_scatter.c \
- *       -o 04_scatter -lncurses
+ * "Distance" here means Chebyshev distance: how many king-moves apart two
+ * cells are, i.e. max(row gap, col gap). It's cheap (no square roots) and its
+ * idea of a "circle" is a square, which suits a character grid.
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Four procedural placement strategies.
- *
- *   Random scatter (R):
- *     Uniformly pick N random (r,c) pairs from the valid grid range.
- *     Simple but may produce clusters and large voids.
- *
- *   Min-distance / Poisson-ish (M):
- *     Repeat up to MAX_TRIES times: pick a random candidate, accept it
- *     only if it is at least MIN_DIST cells (Chebyshev distance) from
- *     every existing object.  Produces more even spacing than pure random.
- *     This is a simplified Bridson Poisson-disk sample — O(n²) per attempt
- *     rather than O(1) with spatial hashing, but correct for n≤256.
- *
- *   BFS flood fill (F):
- *     Starting from the cursor cell, expand outward in breadth-first order.
- *     Place an object at each visited cell.  Stop after FLOOD_MAX cells.
- *     Shows how BFS naturally produces an even radial expansion pattern.
- *
- *   Gradient density (G):
- *     Sweep all cells; place an object with probability P(r,c) that depends
- *     on the Chebyshev distance from the grid centre.  Cells near the centre
- *     have higher probability — produces a cloud denser at the middle.
- *
- * Data-structure : Same ObjectPool as 01_direct.c.  BFS uses a small
- *                  circular queue (ring buffer) sized to the max grid area.
- *
- * References     :
- *   Poisson disk sampling — Bridson 2007 "Fast Poisson Disk Sampling"
- *                           ACM SIGGRAPH Sketches
- *   BFS — en.wikipedia.org/wiki/Breadth-first_search
- *   Chebyshev distance — en.wikipedia.org/wiki/Chebyshev_distance
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA — PLACEMENT AS SAMPLING
- * ───────────────────────────────────
- * All four algorithms are SAMPLING strategies: they select a subset of grid
- * cells to receive objects.  The difference is in how they define "which
- * cells" — the sampling distribution:
- *
- *   Random:    uniform distribution over all valid cells.
- *   Min-dist:  uniform with rejection: reject any sample within MIN_DIST of
- *              an existing object.  Produces blue-noise distribution.
- *   Flood:     BFS-order from a seed: the "distribution" is determined by
- *              graph distance from the cursor, not randomness.
- *   Gradient:  Bernoulli trial per cell with P proportional to 1/(dist+1).
- *              Produces higher density near the centre.
- *
- * WHY CHEBYSHEV DISTANCE
- * ───────────────────────
- * Chebyshev distance = max(|Δr|, |Δc|).  It measures the minimum number of
- * king-moves (8-connected steps) between two cells.  It is used because:
- *   (a) It is fast to compute — no sqrt, no multiplication.
- *   (b) It defines the natural "ball" shape for grid movement (a square,
- *       not a circle), which matches the grid aesthetics of this project.
- *   (c) The Chebyshev ball of radius k = all cells within a k×k square,
- *       making the MIN_DIST check visually intuitive.
- *
- * BFS FLOOD FILL ON A GRID
- * ─────────────────────────
- * A BFS from cell (cr,cc) visits cells in order of their shortest graph
- * distance from (cr,cc).  On a rectangular grid with 4-connectivity, this
- * produces concentric "diamonds"; with 8-connectivity, concentric squares.
- * This file uses 4-connectivity for clarity.
- * The visited[] array prevents re-queuing cells.  It is zeroed before each
- * flood and acts as both the "seen" and "placed" marker.
- *
- * KEY FORMULAS
- * ────────────
- * cheb — Chebyshev distance (king-moves):
- *   cheb(r0,c0,r1,c1) = max(|r1−r0|, |c1−c0|)
- *   No sqrt, no multiply.  Chebyshev ball of radius k = (2k+1)² square.
- *
- * scatter_mindist — Poisson-ish rejection sampling:
- *   Accept candidate (r,c) iff cheb(r,c, p.r[i], p.c[i]) >= MIN_DIST
- *   for all i in pool.  O(n × MAX_TRIES) overall.
- *
- * scatter_gradient — Bernoulli per cell, higher P near grid centre:
- *   dist = cheb(r, c, cr, cc)   where (cr,cc) = grid centre
- *   P(place) = GRAD_SCALE / (dist + GRAD_SCALE)
- *   threshold = (long)GRAD_SCALE × RAND_MAX / (dist + GRAD_SCALE)
- *   place if rand() < threshold
- *   At dist=0: P=1.0.  At dist=GRAD_SCALE: P=0.5.  At dist=5×GS: P≈17%.
- *   long cast prevents overflow: GRAD_SCALE×RAND_MAX > INT_MAX.
- *
- * scatter_flood — BFS ring buffer:
- *   Queue size = grid_area = gw × gh.  Never overflows (each cell enters once).
- *   Visited index: idx = (r − min_r) × gw + (c − min_c)
- *   Ring buffer: head/tail mod area; head!=tail means non-empty.
- *   Stop condition: placed >= FLOOD_MAX || pool.count >= MAX_OBJ.
- *
- * HOW TO VERIFY
- * ─────────────
- * Uniform grid, terminal 80×24 → max_r=5, max_c=9 (6×10=60 cells).
- *
- * scatter_mindist (MIN_DIST=3, first object placed at (3,5)):
- *   Candidate (3,6): cheb=max(0,1)=1 < 3 → REJECTED  ✓
- *   Candidate (1,1): cheb=max(2,4)=4 >= 3 → ACCEPTED  ✓
- *   Candidate (3,2): cheb=max(0,3)=3 >= 3 → ACCEPTED (boundary)  ✓
- *   Candidate (3,3): cheb=max(0,2)=2 < 3 → REJECTED  ✓
- *
- * scatter_gradient (GRAD_SCALE=6, grid centre cr=2, cc=4):
- *   Cell (2,4): dist=0, P=6/(0+6)=1.0  → always placed  ✓
- *   Cell (2,8): dist=max(0,4)=4, P=6/10=0.60  ✓
- *   Cell (0,0): dist=max(2,4)=4, P=0.60  ✓
- *   Cell (5,9): dist=max(3,5)=5, P=6/11≈0.55  ✓
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
@@ -155,23 +35,21 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS   30
 #define MAX_OBJ     256
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How fast the on-screen fps number reacts: small = smooth, slow to change. */
 #define FPS_EWMA_ALPHA  0.05
 
-#define RAND_N       40     /* objects placed by R (random scatter) */
-#define MAX_TRIES   400     /* rejection-sampling attempts for M */
-#define MIN_DIST      3     /* Chebyshev min-distance for M */
-#define FLOOD_MAX   120     /* max cells filled by F (BFS flood) */
-#define GRAD_SCALE    6     /* gradient: probability denominator scale */
+#define RAND_N       40     /* how many objects the random scatter drops */
+#define MAX_TRIES   400     /* how many picks min-dist tries before giving up */
+#define MIN_DIST      3     /* min-dist: keep objects this many cells apart */
+#define FLOOD_MAX   120     /* flood stops after filling this many cells */
+#define GRAD_SCALE    6     /* gradient: bigger = the dense middle spreads wider */
 
-/* Per-mode geometry (same as 01_direct.c) */
+/* Cell size in characters for each grid style (same numbers as 01_direct.c). */
 #define U_CW  8
 #define U_CH  4
 #define SQ_CS 3
@@ -208,9 +86,7 @@
 #define PAIR_HUD     5   /* status bar (yellow)  */
 #define PAIR_HINT    6   /* key-hint footer (cyan) */
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -225,9 +101,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static void color_init(void)
 {
@@ -240,10 +114,10 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx                                                             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx ── */
 
+/* Which of the 14 background grid styles is on screen. GM_COUNT is the total,
+ * handy for wrapping when you cycle styles. */
 typedef enum {
     GM_UNIFORM=0, GM_SQUARE, GM_FINE, GM_COARSE,
     GM_HIER, GM_BRICK_H, GM_BRICK_V, GM_DIAMOND,
@@ -257,13 +131,24 @@ static const char *const gm_name[GM_COUNT] = {
     "09 iso","10 cross","11 check","12 ruled","13 dot","14 origin"
 };
 
+/* Everything we need to know to draw and address one grid style:
+ * its type, the terminal size, cell width/height, and the valid cell range.
+ *
+ *   mode               which style this is
+ *   rows, cols         terminal size in characters
+ *   cw, ch             one cell's width and height in characters
+ *   ox, oy             screen centre (origin for the rotated grids)
+ *   range              for diamond/iso: cells run from -range to +range
+ *   min_r/max_r,
+ *   min_c/max_c        the legal cell coordinates; everything else clamps
+ *                      cursor moves and scatter picks to these bounds. */
 typedef struct {
     GridMode mode;
     int rows, cols, cw, ch, ox, oy, range;
     int min_r, max_r, min_c, max_c;
 } GridCtx;
 
-/* Per-mode geometry setters — one tiny function per GridMode. */
+/* One tiny setter per style fills in that style's cell size. */
 
 static void ctx_geom_uniform (GridCtx *g) { g->cw = U_CW;    g->ch = U_CH;  }
 static void ctx_geom_square  (GridCtx *g) { g->cw = SQ_CS*2; g->ch = SQ_CS; }
@@ -272,18 +157,19 @@ static void ctx_geom_coarse  (GridCtx *g) { g->cw = CO_CW;   g->ch = CO_CH; }
 static void ctx_geom_hier    (GridCtx *g) { g->cw = HI_CW;   g->ch = HI_CH; }
 static void ctx_geom_brick_h (GridCtx *g) { g->cw = BH_CW;   g->ch = BH_CH; }
 static void ctx_geom_brick_v (GridCtx *g) { g->cw = BV_CW;   g->ch = BV_CH; }
-/* rotated grids carry an extra `range` for the centred ±range bounds */
+/* The rotated grids also set `range` so cells run from -range to +range. */
 static void ctx_geom_diamond (GridCtx *g) { g->cw = DM_IW; g->ch = DM_IH; g->range = DM_RNG; }
 static void ctx_geom_iso     (GridCtx *g) { g->cw = IS_IW; g->ch = IS_IH; g->range = IS_RNG; }
 static void ctx_geom_cross   (GridCtx *g) { g->cw = CR_CW;   g->ch = CR_CH; }
 static void ctx_geom_check   (GridCtx *g) { g->cw = CK_CW;   g->ch = CK_CH; }
-/* ruled has only horizontal lines — no column step */
+/* Ruled is just horizontal lines, so it has a row height but no column width. */
 static void ctx_geom_ruled   (GridCtx *g) { g->ch = RL_LS; }
 static void ctx_geom_dot     (GridCtx *g) { g->cw = DT_CW;   g->ch = DT_CH; }
 static void ctx_geom_origin  (GridCtx *g) { g->cw = OR_CW;   g->ch = OR_CH; }
 
-/* Bounds depend on coordinate system: rotated grids use ±range; ruled
- * grids count whole lines; rect grids count whole cells. */
+/* Work out the legal cell coordinates. Rotated grids count out from the
+ * centre (±range); ruled grids count horizontal lines; the rest count whole
+ * cells that fit on screen. */
 static void ctx_set_bounds(GridCtx *g, GridMode m, int rows, int cols)
 {
     if (m==GM_DIAMOND||m==GM_ISO) {
@@ -298,8 +184,8 @@ static void ctx_set_bounds(GridCtx *g, GridMode m, int rows, int cols)
     }
 }
 
-/* Dispatcher: routes all 14 GridMode values to their per-mode geometry
- * setter, then computes coordinate bounds once. */
+/* Set up the whole context for a style: clear it, pick the cell size for the
+ * style, then work out the legal coordinate range once. */
 static void ctx_init(GridCtx *g, GridMode m, int rows, int cols)
 {
     memset(g,0,sizeof *g);
@@ -326,6 +212,8 @@ static void ctx_init(GridCtx *g, GridMode m, int rows, int cols)
     ctx_set_bounds(g, m, rows, cols);
 }
 
+/* Turn a grid cell (r,c) into a screen spot (sr,sc). Each style lays its cells
+ * out differently, so this is the one place that knows the geometry. */
 static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
     switch (g->mode) {
@@ -338,14 +226,13 @@ static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
     }
 }
 
+/* Remainder that's never negative — handy when coordinates go below zero. */
 static int safe_mod(int a, int b) { return ((a%b)+b)%b; }
 
-/* ── per-mode background drawers ───────────────────────────────────────── *
- * One function per grid style.  Pulled out of ctx_draw_bg so a reader
- * can study one style at a time.
- * ─────────────────────────────────────────────────────────────────────── */
+/* Background drawers: one function per grid style so each can be read on its
+ * own. They only paint the faint grid lines behind the scattered objects. */
 
-/* Plain rect lattice; GM_ORIGIN overlays a highlighted central cross. */
+/* Plain box grid; the "origin" style also draws a bright cross at the centre. */
 static void bg_draw_rect_family(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch, ox=g->ox, oy=g->oy;
@@ -358,7 +245,7 @@ static void bg_draw_rect_family(const GridCtx *g)
     }
 }
 
-/* Three-tier lattice (major / semi / minor); glyph encodes the tier. */
+/* Grid with three line weights; the character shows which weight a line is. */
 static void bg_draw_hier(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch;
@@ -373,7 +260,7 @@ static void bg_draw_hier(const GridCtx *g)
     }
 }
 
-/* Brick courses offset every other row by half a brick width. */
+/* Brick wall: shift every other row sideways by half a brick. */
 static void bg_draw_brick_h(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch;
@@ -388,7 +275,7 @@ static void bg_draw_brick_h(const GridCtx *g)
     }
 }
 
-/* Vertical brick courses — bricks staggered by half-height per column. */
+/* Sideways brick wall: shift every other column down by half a brick. */
 static void bg_draw_brick_v(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch;
@@ -400,7 +287,7 @@ static void bg_draw_brick_v(const GridCtx *g)
     }
 }
 
-/* Two diagonal line families intersect on a 45°-rotated lattice. */
+/* A grid turned 45 degrees, so the lines run as two sets of diagonals. */
 static void bg_draw_diamond(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, ox=g->ox, oy=g->oy;
@@ -413,7 +300,7 @@ static void bg_draw_diamond(const GridCtx *g)
     }
 }
 
-/* Same diagonal scheme as diamond but with a wider (2:1) cell aspect. */
+/* Like diamond, but the cells are twice as wide for that flatter iso look. */
 static void bg_draw_iso(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, ox=g->ox, oy=g->oy;
@@ -426,7 +313,7 @@ static void bg_draw_iso(const GridCtx *g)
     }
 }
 
-/* Rect lattice with two extra diagonal families overlaid (axes + X). */
+/* Box grid with both diagonals drawn on top, so every cell gets an X. */
 static void bg_draw_cross(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch;
@@ -440,7 +327,7 @@ static void bg_draw_cross(const GridCtx *g)
     }
 }
 
-/* Lines plus filled "black" squares on alternating cells (chessboard). */
+/* Grid lines plus filled squares on alternating cells, like a chessboard. */
 static void bg_draw_check(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch;
@@ -451,7 +338,7 @@ static void bg_draw_check(const GridCtx *g)
     }
 }
 
-/* Horizontal rules only — no column structure (row-based grid). */
+/* Just evenly spaced horizontal lines, like ruled notebook paper. */
 static void bg_draw_ruled(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, ch=g->ch;
@@ -461,7 +348,7 @@ static void bg_draw_ruled(const GridCtx *g)
     }
 }
 
-/* Sparse marker at every grid intersection — no connecting lines. */
+/* Just a dot where each grid crossing would be, with no lines between them. */
 static void bg_draw_dot(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch;
@@ -471,10 +358,8 @@ static void bg_draw_dot(const GridCtx *g)
     }
 }
 
-/*
- * ctx_draw_bg — dispatcher.  Routes all 14 GridMode values to a per-mode
- * bg_draw_*() helper.  The five rect-family modes share one drawer.
- */
+/* Draw the background for whichever style is active. The five plain box
+ * styles all look the same, so they share one drawer. */
 static void ctx_draw_bg(const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_GRID));
@@ -495,11 +380,16 @@ static void ctx_draw_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_GRID));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool ── */
 
+/* One scattered object sitting on a grid cell.
+ *   r, c    which cell it's on
+ *   glyph   the character drawn for it
+ *   alive   false means this slot is empty / removed */
 typedef struct { int r, c; char glyph; bool alive; } Obj;
+
+/* All the objects on screen, kept in a plain fixed-size array. `count` is how
+ * many slots are in use; we never grow past MAX_OBJ, so no allocation needed. */
 typedef struct { Obj items[MAX_OBJ]; int count; } Pool;
 
 static int pool_find(const Pool *p, int r, int c)
@@ -521,6 +411,8 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     for (int i=0; i<p->count; i++) {
         if (!p->items[i].alive) continue;
         int sr,sc; ctx_to_screen(g,p->items[i].r,p->items[i].c,&sr,&sc);
+        /* nudge into the cell's interior so the object doesn't sit on a line;
+         * the rotated and ruled grids have no interior, so skip them */
         if (g->mode!=GM_DIAMOND&&g->mode!=GM_ISO&&g->mode!=GM_RULED)
             { sr+=(g->ch>1?1:0); sc+=(g->cw>1?1:0); }
         if (sr>=0&&sr<g->rows-1&&sc>=0&&sc<g->cols)
@@ -529,10 +421,10 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_OBJ)|A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scatter                                                             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scatter ── */
 
+/* King-move distance between two cells: the bigger of the row gap and column
+ * gap. Cheap, and it treats a "circle" as a square — fitting for a grid. */
 static int cheb(int r0, int c0, int r1, int c1)
 {
     int dr=r0-r1; int dc=c0-c1;
@@ -548,9 +440,7 @@ static int rand_range(int lo, int hi)
     return lo + (int)((unsigned)rand() % (unsigned)(hi - lo + 1));
 }
 
-/*
- * scatter_random — place RAND_N objects at uniformly random grid cells.
- */
+/* Toss RAND_N objects at random cells. Expect clumps and bare patches. */
 static void scatter_random(Pool *p, const GridCtx *g, char glyph)
 {
     for (int i=0; i<RAND_N; i++) {
@@ -560,10 +450,8 @@ static void scatter_random(Pool *p, const GridCtx *g, char glyph)
     }
 }
 
-/*
- * scatter_mindist — Poisson-ish: reject candidates within MIN_DIST
- * Chebyshev distance of any existing object.
- */
+/* Same random toss, but throw away any pick closer than MIN_DIST to an object
+ * already down. The keep-or-toss rule gives the even, no-clumps look. */
 static void scatter_mindist(Pool *p, const GridCtx *g, char glyph)
 {
     for (int attempt=0; attempt<MAX_TRIES && p->count<MAX_OBJ; attempt++) {
@@ -576,10 +464,9 @@ static void scatter_mindist(Pool *p, const GridCtx *g, char glyph)
     }
 }
 
-/*
- * scatter_flood — BFS from (cr,cc); place objects at visited cells.
- * Uses 4-connectivity.  Stops after FLOOD_MAX placements.
- */
+/* Spread out from the cursor one ring at a time (a breadth-first search),
+ * dropping an object on each new cell, until FLOOD_MAX cells are filled.
+ * We only step up/down/left/right, so it spreads as a growing diamond. */
 static void scatter_flood(Pool *p, const GridCtx *g, int cr, int cc, char glyph)
 {
     static const int dr4[]={-1,+1,0,0}, dc4[]={0,0,-1,+1};
@@ -587,6 +474,8 @@ static void scatter_flood(Pool *p, const GridCtx *g, int cr, int cc, char glyph)
     int area=gw*gh;
     if (area<=0) return;
 
+    /* vis marks cells we've already reached; qr/qc are the to-visit queue.
+     * Freed at the end of this call — they don't outlive the flood. */
     bool *vis=(bool*)calloc((size_t)area, sizeof(bool));
     int  *qr =(int*) malloc((size_t)area * sizeof(int));
     int  *qc =(int*) malloc((size_t)area * sizeof(int));
@@ -594,7 +483,9 @@ static void scatter_flood(Pool *p, const GridCtx *g, int cr, int cc, char glyph)
 
     int head=0, tail=0, placed=0;
 
-    /* inline enqueue: bounds-check then push to ring buffer */
+    /* Add a cell to the queue if it's on the grid and we haven't seen it yet.
+     * tail wraps around the array (a ring buffer); each cell enters at most
+     * once, so the array is always big enough. */
 #define ENQUEUE(R,C) do { \
     int _r=(R), _c=(C); \
     if (_r>=g->min_r&&_r<=g->max_r&&_c>=g->min_c&&_c<=g->max_c) { \
@@ -614,18 +505,19 @@ static void scatter_flood(Pool *p, const GridCtx *g, int cr, int cc, char glyph)
     free(vis); free(qr); free(qc);
 }
 
-/*
- * scatter_gradient — Bernoulli trial per cell: P = GRAD_SCALE/(dist+GRAD_SCALE).
- * Cells closer to grid centre have higher probability of receiving an object.
- */
+/* Walk every cell and roll the dice for each one. Cells near the grid centre
+ * win more often, so the scatter comes out densest in the middle and thins
+ * toward the edges. */
 static void scatter_gradient(Pool *p, const GridCtx *g, char glyph)
 {
     int cr=(g->min_r+g->max_r)/2, cc=(g->min_c+g->max_c)/2;
     for (int r=g->min_r; r<=g->max_r && p->count<MAX_OBJ; r++) {
         for (int c=g->min_c; c<=g->max_c && p->count<MAX_OBJ; c++) {
             int dist=cheb(r,c,cr,cc);
-            /* probability: GRAD_SCALE/(dist+GRAD_SCALE) in [0,1] */
-            /* use long to avoid overflow: GRAD_SCALE*RAND_MAX exceeds INT_MAX */
+            /* chance of placing here: full odds at the centre, fading with
+             * distance. We scale that chance up to RAND_MAX so a single
+             * rand() roll decides it. The long cast keeps the big
+             * multiplication from overflowing an int. */
             int threshold = (int)((long)GRAD_SCALE * RAND_MAX / (dist + GRAD_SCALE));
             if (rand() < threshold)
                 pool_place(p,r,c,glyph);
@@ -633,10 +525,9 @@ static void scatter_gradient(Pool *p, const GridCtx *g, char glyph)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 cursor ── */
 
+/* Where the @ marker sits, as a grid cell. Flood scatter starts from here. */
 typedef struct { int r, c; } Cursor;
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
@@ -660,11 +551,10 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_CURSOR)|A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 scene ── */
 
-/* Bright bold yellow fps readout (top-right) + bold cyan key hints (bottom). */
+/* Draw the on-screen labels: fps and object count in the top-right, the list
+ * of keys along the bottom. */
 static void hud_draw(const GridCtx *g, const Pool *p, double fps)
 {
     char buf[96];
@@ -693,9 +583,7 @@ static void scene_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
     wnoutrefresh(stdscr); doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(void)
@@ -706,9 +594,7 @@ static void screen_init(void)
     color_init(); atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §10 app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §10 app ── */
 
 static volatile sig_atomic_t g_running=1, g_need_resize=0;
 static void on_signal(int s)

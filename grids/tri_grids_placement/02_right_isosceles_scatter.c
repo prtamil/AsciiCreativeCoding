@@ -1,140 +1,16 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 02_right_isosceles_scatter.c — distance-colored scatter on the half-rect grid
+ * 02_right_isosceles_scatter.c
  *
- * DEMO: A random scatter of N triangles fills a square region around
- *       the cursor on the UR/LL right-isosceles grid. Each triangle
- *       is colored on a 6-stop gradient by its cell-distance from the
- *       cursor — closer = warm, farther = cool. Press SPACE to reseed;
- *       +/- to change density (N).
+ * Sprinkles a cloud of random triangles around the cursor on a grid of
+ * right-isosceles triangles, then colors each one by how far it sits from
+ * the cursor — near is warm, far is cool. Move the cursor to repaint the
+ * same cloud through a new "distance" lens; SPACE sprinkles a fresh cloud.
  *
- * Study alongside: 02_right_isosceles_direct.c (manual placement),
- *                  02_right_isosceles_patterns.c (preset stamps),
- *                  01_equilateral_scatter.c (same idea, equilateral).
- *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, TRI_SIZE, SCATTER_RADIUS, DENSITY
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 6-bucket gradient palette + cursor / HUD / hint
- *   §4 gridctx  — GridCtx + pixel/centroid/edge formula
- *   §5 pool     — Pool: clear / draw + LCG / distance helpers
- *   §6 cursor   — Cursor + TRI_DIR + reset / move / draw
- *   §7 scatter  — scatter_seed spawn + scatter_draw bucket coloring
- *   §8 scene    — hud_draw + scene_draw
- *   §9 screen   — ncurses init / cleanup
- *  §10 app      — signals, main loop
- *
- * Keys:  arrows:move  spc:reseed  +/-:density  r:reset
- *        t:theme  q/ESC:quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/02_right_isosceles_scatter.c \
- *       -o 02_right_isosceles_scatter -lncurses -lm
+ * Sister files: 02_right_isosceles_direct.c (place triangles by hand),
+ *               02_right_isosceles_patterns.c (preset stamps),
+ *               01_equilateral_scatter.c (same idea on equilateral triangles).
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Random scatter. Pick N random (Δcol, Δrow, up) within
- *                  ±SCATTER_RADIUS of the cursor; color by Manhattan-
- *                  style cell distance from cursor, bucketed into 6
- *                  gradient slots.
- *
- * Data-structure : Pool — flat array of Obj{col, row, up, glyph, alive}.
- *                  Bucket assignment is recomputed every frame from the
- *                  cursor's CURRENT position; the entries themselves
- *                  only change on reseed.
- *
- * Distance metric: |Δcol| + |Δrow| + (Δup ? 1 : 0). Cheap, monotonic
- *                  enough for a colouring demo on the half-rect grid.
- *
- * Re-seeding     : SPACE re-randomises with a new seed (xor'd by clock).
- *                  +/- density ALSO triggers a reseed. Moving the
- *                  cursor does NOT re-seed — but recolours the existing
- *                  scatter as the cursor moves.
- *
- * References     :
- *   Linear congruential generator — Numerical Recipes ch. 7
- *   Half-rect tiling — https://en.wikipedia.org/wiki/Triangular_tiling
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Two halves: STORAGE (random scatter of half-square addresses,
- * generated once per reseed) and COLOURING (a pure function of cursor
- * distance, recomputed every frame). Moving the cursor never re-seeds;
- * it only re-paints the existing scatter through a different distance
- * lens.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine sprinkling salt on graph-paper-with-diagonals — grains land
- * randomly inside a small square region. Now point a coloured
- * spotlight (the cursor) at the cloth; grains close to the beam glow
- * warm, grains farther away cool. Move the spotlight: same grains,
- * different colours. SPACE re-sprinkles.
- *
- * DRAWING METHOD  (per frame)
- * ──────────────
- *  1. erase()
- *  2. ctx_draw_bg — raster scan: pixel_to_tri → tri_edge_char ('|','_',
- *     '\\').
- *  3. For each scatter object:
- *       d = |obj.col - cur.col| + |obj.row - cur.row|
- *           + (obj.up != cur.up ? 1 : 0)
- *       bucket = min(d, N_BUCKETS - 1)
- *       attron(COLOR_PAIR(PAIR_BUCKET_0 + bucket))
- *       mvaddch(centroid_screen, '*')
- *  4. cursor_draw — '@' on top.
- *
- *  Reseed (only on SPACE or +/- density):
- *    pool->count = 0
- *    g_seed ^= clock_ns()
- *    for i in 0..density:
- *      dC = floor(frand·(2·R+1)) - R    ; dR = same
- *      up = (frand > 0.5) ? UR : LL
- *      pool entry ← (cur.col+dC, cur.row+dR, up)
- *
- * KEY FORMULAS
- * ────────────
- *  Pixel → lattice  (axis-aligned):
- *    a = px / size,  b = py / size
- *    col = ⌊a⌋,      row = ⌊b⌋
- *    up  = (fa ≥ fb) ? UR : LL
- *
- *  Centroid lattice → pixel:
- *    UR centroid:  a = col + 2/3,  b = row + 1/3
- *    LL centroid:  a = col + 1/3,  b = row + 2/3
- *    px = a · size,  py = b · size
- *
- *  Manhattan-style cell distance:
- *    d = |Δcol| + |Δrow| + (Δup ? 1 : 0)
- *
- *  LCG step (Numerical Recipes ch. 7):
- *    g_seed = g_seed · 1103515245 + 12345
- *    frand  = ((g_seed >> 16) & 0x7FFF) / 32767.0
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Density saturation: at density values approaching MAX_OBJ the
- *    pool fills. The visible scatter may look thinner than the
- *    requested density.
- *  • Manhattan vs true edge distance: on the half-rect lattice the
- *    actual edge-walk distance involves the diagonal; Manhattan is a
- *    fast proxy for short ranges.
- *  • Reseed on cursor move: NOT triggered by design — moving the
- *    cursor "rotates the spotlight" without disturbing the scatter.
- *
- * HOW TO VERIFY
- * ─────────────
- *  Place cursor in the middle of a freshly-seeded scatter — colours
- *  are warmest near '@', cooling outward. Walk the cursor to the
- *  edge: same dots remain, but the warm/cool boundary follows the
- *  cursor.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -147,9 +23,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 #define CELL_W 2
@@ -176,9 +50,7 @@
 #define PAIR_HUD    9
 #define PAIR_HINT   10
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -193,10 +65,11 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
+/* The six color stops each theme paints triangles with, ordered near-to-far
+ * from the cursor. THEME_GRAD is the rich 256-color version; THEME_GRAD_8 is
+ * the fallback for terminals that only have 8 colors. */
 static const short THEME_GRAD[N_THEMES][N_BUCKETS] = {
     { 196, 202, 214, 226,  82,  39 },
     {  39,  82, 226, 214, 202, 196 },
@@ -221,20 +94,21 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx — half-rect lattice                                         */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx — the triangle grid ── */
 
+/* Everything the grid needs to know to draw itself and to turn a triangle's
+ * grid address into a spot on the screen. One of these lives for the whole
+ * run; resizing the terminal just refreshes a few of its fields. */
 typedef struct {
-    int    rows, cols;
-    double tri_size;
-    int    cell_w, cell_h;
-    int    ox, oy;
-    double border_w;
-    int    theme;
-    int    paused;
-    int    density;
-    int    scatter_radius;
+    int    rows, cols;      /* size of the terminal, in character cells */
+    double tri_size;        /* how big one triangle is, in sub-cell pixels */
+    int    cell_w, cell_h;  /* pixels packed into one character cell (chars are tall) */
+    int    ox, oy;          /* screen cell the grid is centered on (the origin) */
+    double border_w;        /* how close to an edge counts as "on the edge" (0..1) */
+    int    theme;           /* which color set is active (0..N_THEMES-1) */
+    int    paused;          /* nonzero while the sim is frozen */
+    int    density;         /* how many triangles a fresh scatter aims for */
+    int    scatter_radius;  /* how far from the cursor triangles may land, in cells */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols)
@@ -259,6 +133,10 @@ static void ctx_resize(GridCtx *g, int rows, int cols)
     g->ox = cols / 2; g->oy = (rows - 1) / 2;
 }
 
+/* Given a point, find which triangle it falls in. We scale into grid units,
+ * the whole part names the square, the leftover fraction (fa, fb) says where
+ * inside it — and whichever side of the diagonal that lands on tells us upper
+ * or lower triangle. */
 static void pixel_to_tri(double px, double py, double size,
                          int *col, int *row, int *up,
                          double *fa, double *fb)
@@ -288,6 +166,10 @@ static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
     *srow = g->oy + (int)(cy / g->cell_h);
 }
 
+/* Picks the line character to draw a point as, by seeing which of the
+ * triangle's three edges it sits closest to ('|', '_' or '\\'), and reports
+ * that nearest-edge distance so the caller can skip points sitting in open
+ * space. */
 static char tri_edge_char(int up, double fa, double fb, double *out_min)
 {
     double l1, l2, l3; char ch1, ch2, ch3;
@@ -317,14 +199,23 @@ static void ctx_draw_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_BORDER));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool ── */
 
+/* One scattered triangle. col/row picks the square it lives in; up says which
+ * of that square's two triangles it is (1 = upper-right, 0 = lower-left). glyph
+ * is the character drawn for it, and alive lets us skip dead entries. */
 typedef struct { int col, row, up; char glyph; bool alive; } Obj;
+
+/* The whole scatter cloud: a fixed-size bag of triangles plus how many of the
+ * MAX_OBJ slots are currently in use. No allocation — it's all here up front. */
 typedef struct { Obj items[MAX_OBJ]; int count; } Pool;
 
+/* The running state of the random-number maker. Changing this changes the
+ * cloud; we mix in the clock each reseed so two clouds never look the same. */
 static unsigned int g_seed = 1;
+/* A tiny home-grown random-number maker (a classic LCG, Numerical Recipes
+ * ch. 7). Returns a fresh value in 0..1 each call. We use our own instead of
+ * rand() so a given seed always replays the exact same cloud. */
 static double frand(void)
 {
     g_seed = g_seed * 1103515245u + 12345u;
@@ -348,12 +239,16 @@ static int distance_bucket(int dist, int max_d)
     return b;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 cursor ── */
 
+/* Where the '@' marker sits. Same address scheme as Obj: col/row pick the
+ * square, up picks which half-triangle inside it. */
 typedef struct { int col, row, up; } Cursor;
 
+/* How an arrow key nudges the cursor. On a triangle grid one step depends on
+ * which way the current triangle points, so the move is looked up by direction
+ * (left/right/up/down) and by the current up-flag, giving {dcol, drow, new-up}.
+ * Index it as TRI_DIR[direction][cursor.up]. */
 static const int TRI_DIR[4][2][3] = {
     { { -1,  0,  1 }, {  0,  0,  0 } },
     { {  0,  0,  1 }, { +1,  0,  0 } },
@@ -384,9 +279,7 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  scatter                                                             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 scatter ── */
 
 static void scatter_seed(Pool *sp, const GridCtx *g, const Cursor *cur)
 {
@@ -421,9 +314,7 @@ static void scatter_draw(const Pool *sp, const GridCtx *g, const Cursor *cur)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 scene ── */
 
 static void hud_draw(const GridCtx *g, const Pool *sp, const Cursor *cur,
                      double fps)
@@ -455,9 +346,7 @@ static void scene_draw(const GridCtx *g, const Pool *sp, const Cursor *cur,
     wnoutrefresh(stdscr); doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(int theme)
@@ -468,9 +357,7 @@ static void screen_init(int theme)
     color_init(theme); atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §10 app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §10 app ── */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 static void on_signal(int s)

@@ -1,166 +1,19 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 04_hex_scatter.c — four scatter strategies on a flat-top hex grid
+ * 04_hex_scatter.c — four ways to scatter objects across a hex grid
  *
- * DEMO: A flat-top hex grid fills the screen.  Move '@' and press SPACE to
- *       fire one of four scatter strategies centered on the cursor.  Four
- *       modes: UNIFORM (random sparse), MINDIST (Poisson-disk-like, evenly
- *       spaced), FLOOD (solid disc fill), GRADIENT (dense center, sparse edge).
- *       Adjust the scatter radius and density/mindist parameters live.
+ * Move the '@' cursor over a flat-top hex grid and press SPACE to "spray"
+ * objects around it. Four sprays: uniform (random and sparse), mindist
+ * (evenly spaced, no two too close), flood (fills the whole circle solid),
+ * and gradient (thick near the cursor, thinning toward the edge). The spray
+ * radius and the density/spacing knobs are all adjustable live.
  *
- * Study alongside: grids/hex_grids_placement/03_hex_path.c (path placement),
- *                  grids/rect_grids_placement/04_scatter.c (same on rect)
- *
- * Section map:
- *   §1  config   — all tunable constants
- *   §2  clock    — monotonic timer + sleep
- *   §3  color    — color pairs: grid, cursor, objects per mode, HUD, hint
- *   §4  gridctx  — GridCtx + cube_round, ctx_to_screen, hex_dist, ctx_draw_bg
- *   §5  pool     — Pool: place, clear, draw
- *   §6  cursor   — Cursor + axial movement, cursor_draw
- *   §7  scatter  — scatter_uniform, scatter_mindist, scatter_flood, scatter_gradient
- *   §8  scene    — hud_draw + scene_draw
- *   §9  screen   — ncurses init / cleanup
- *   §10 app      — signals, main loop
- *
- * Keys:  arrows:move  spc:scatter  1-4:mode  +/-:radius  d/D:density  m/M:mindist
- *        C:clear  r:reset  q/ESC:quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/hex_grids_placement/04_hex_scatter.c \
- *       -o 04_hex_scatter -lncurses -lm
+ * Sister files: 03_hex_path.c (placing along a path on this same grid),
+ *               ../rect_grids_placement/04_scatter.c (the same idea on squares).
+ * The even-spacing spray follows Poisson-disk sampling
+ * (Bridson 2007: https://www.cs.ubc.ca/~rbridson/docs/bridson-siggraph07-poissondisk.pdf).
+ * Hex math (distance, circles): https://www.redblobgames.com/grids/hexagons/
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Four scatter placement strategies, all centered on the
- *                  cursor hex (cur.q, cur.r) with radius R.  Each iterates
- *                  the disc (hexes with hex_dist ≤ R from cursor) and applies
- *                  a different acceptance rule.
- *                  UNIFORM:   accept with probability DENSITY (uniform random)
- *                  MINDIST:   accept only if hex_dist to every existing pool
- *                             member ≥ MIN_DIST (Poisson-disk sampling)
- *                  FLOOD:     accept all hexes in disc (density = 1.0)
- *                  GRADIENT:  accept with P = FALLOFF/(dist+FALLOFF), making
- *                             the center denser than the edge
- *
- * Data-structure : Pool — flat array of Obj{q,r,glyph}.  MINDIST checks
- *                  pool linearly for each candidate (O(n) per candidate).
- *                  With n ≤ 256 and disc ≤ 169 cells (R=7), this is fast.
- *
- * GridContext    : GridCtx carries the hex-specific geometry (hex_size,
- *                  border_w, screen origin ox/oy, terminal extent rows/cols).
- *
- * Rendering      : Three-pass: grid background → pool objects → cursor '@'.
- *
- * Performance    : FLOOD is O(disc_size).  UNIFORM/GRADIENT are O(disc_size).
- *                  MINDIST is O(disc_size × pool_count) per scatter — still
- *                  < 50k ops for typical parameters.
- *
- * References     :
- *   Poisson-disk sampling    — https://www.cs.ubc.ca/~rbridson/docs/bridson-siggraph07-poissondisk.pdf
- *   Hex disc / ring          — https://www.redblobgames.com/grids/hexagons/#range
- *   Gradient / falloff        — inverse-distance density weighting
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * All four scatter modes share one loop structure:
- *
- *   for dr in [-R, R]:
- *     for dq in [-R, R]:
- *       d = hex_dist(cursor, cursor+(dq,dr))
- *       if d > R: skip  (outside the scatter disc)
- *       if acceptance_rule(mode, d, ...): pool_place(cursor+(dq,dr))
- *
- * The difference is ENTIRELY in the acceptance rule.  The bounding-box loop
- * + hex_dist filter produces the hex disc.  Each mode then decides whether
- * to accept or reject each candidate cell.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Picture the four modes as four kinds of paint sprayer aimed at the cursor:
- *
- *   UNIFORM:   a spray can that randomly skips ~50% of the area (sparse).
- *   MINDIST:   a stamp that places dots only if each dot is far from all others
- *              — result looks evenly distributed, like a Poisson disk.
- *   FLOOD:     a paint bucket that fills every cell within the radius solidly.
- *   GRADIENT:  a soft-spray that concentrates near the cursor and fades out —
- *              dense centre, sparse edge (like a Gaussian blob).
- *
- * DRAWING METHOD  (GRADIENT — the most mathematically interesting)
- * ──────────────────────────────────────────────────────────────
- *  For each candidate hex at axial distance d from cursor:
- *  1. Compute acceptance probability: P = FALLOFF / (d + FALLOFF)
- *     d=0: P=FALLOFF/FALLOFF=1.0 (cursor hex always placed)
- *     d=1: P=FALLOFF/(1+FALLOFF)
- *     d=R: P=FALLOFF/(R+FALLOFF)
- *  2. Draw a uniform random number u ∈ [0, 1).
- *  3. If u < P: pool_place (accept); else: skip (reject).
- *  Increasing FALLOFF makes the gradient softer (slower dropoff).
- *
- * KEY FORMULAS
- * ────────────
- *  hex_dist (used by every mode to determine disc membership):
- *    d = (|dq| + |dr| + |dq+dr|) / 2
- *
- *  Disc cell count for radius R:
- *    count = 3R² + 3R + 1   (e.g. R=3 → 37 cells, R=5 → 91 cells)
- *
- *  UNIFORM acceptance:  rand()/RAND_MAX < DENSITY
- *
- *  MINDIST acceptance:  all pool objects have hex_dist ≥ MIN_DIST to candidate
- *
- *  FLOOD acceptance:    d ≤ R  (always accept)
- *
- *  GRADIENT acceptance:
- *    P = FALLOFF / (d + FALLOFF)
- *    rand()/RAND_MAX < P
- *
- *  Expected placed cells for GRADIENT over disc of radius R:
- *    E[n] = Σ_{d=0}^{R} ring_count(d) × FALLOFF / (d + FALLOFF)
- *    where ring_count(0)=1, ring_count(d)=6d for d≥1
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • MINDIST with MIN_DIST=1: adjacent hexes are allowed; any hex in the disc
- *    that doesn't coincide with an existing object is accepted.
- *
- *  • MINDIST with very large MIN_DIST: only the cursor hex (d=0) may be placed
- *    if it's ≥ MIN_DIST from all pool objects.  Can result in 0 new objects.
- *
- *  • FLOOD may overflow MAX_OBJ for large radii: R=8 disc = 217 cells, R=9 = 271.
- *    pool_place silently caps at MAX_OBJ=256.  Use R ≤ 8 for full floods.
- *
- *  • GRADIENT FALLOFF=0 would cause division by zero in d=0 case.
- *    Keep FALLOFF ≥ 1. At FALLOFF=1: P(d=0)=1, P(d=1)=0.5, P(d=2)=0.33.
- *
- *  • rand() is seeded once in main() with srand(time(NULL)).  Each scatter
- *    call advances the PRNG state — scatter at the same position gives
- *    different results each time.  This is a feature, not a bug.
- *
- * HOW TO VERIFY  (radius=3, cursor=(0,0), 80×24 terminal, size=14)
- * ─────────────
- *  Disc R=3: 3×9+9+1 = 37 cells.
- *
- *  UNIFORM DENSITY=0.5: expect ~18-19 objects placed.
- *    Each of 37 hexes accepted with p=0.5, independently. ✓
- *
- *  FLOOD R=3: exactly 37 cells placed (all disc hexes). ✓
- *    Verify: (dq=3,dr=0): d=(3+0+3)/2=3 ≤ 3 → placed. ✓
- *            (dq=2,dr=2): d=(2+2+4)/2=4 > 3 → rejected. ✓
- *
- *  GRADIENT FALLOFF=3, R=3:
- *    d=0: P=3/3=1.0   → 1×1=1 expected cell
- *    d=1: P=3/4=0.75  → 6×0.75=4.5 expected cells
- *    d=2: P=3/5=0.60  → 12×0.60=7.2 expected cells
- *    d=3: P=3/6=0.50  → 18×0.50=9.0 expected cells
- *    Total expected: ~21.7 cells (vs 37 for FLOOD). ✓
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -175,9 +28,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define CELL_W              2
 #define CELL_H              4
@@ -191,34 +42,36 @@
 #define BORDER_W_MIN        0.03
 #define BORDER_W_MAX        0.35
 
-/* Scatter radius bounds. R=8 disc = 217 cells — just fits in MAX_OBJ=256. */
+/* How big the spray circle is, in hex steps. The cap is 8 because an 8-step
+ * circle is 217 cells, which still fits under the 256-object limit below. */
 #define RADIUS_DEFAULT      4
 #define RADIUS_MIN          1
 #define RADIUS_MAX          8
 
-/* Density for UNIFORM mode: fraction of disc hexes to place (0.0–1.0). */
+/* Uniform spray: chance each cell in the circle gets an object (0=none, 1=all). */
 #define DENSITY_DEFAULT     0.40
 #define DENSITY_STEP        0.05
 #define DENSITY_MIN         0.05
 #define DENSITY_MAX         1.00
 
-/* Minimum hex-step separation for MINDIST mode. */
+/* Even-spacing spray: how many hex steps apart objects must stay. */
 #define MINDIST_DEFAULT     2
 #define MINDIST_MIN         1
 #define MINDIST_MAX         6
 
-/* Falloff constant for GRADIENT: P = FALLOFF/(d+FALLOFF).  Must be ≥ 1. */
+/* Gradient spray: controls how fast the spray thins out from the center.
+ * Bigger = thins slower (more even). Must stay at least 1 so we never divide
+ * by zero at the center cell. */
 #define GRAD_FALLOFF        3
 
+/* Most objects we'll ever hold; extra placements past this are dropped. */
 #define MAX_OBJ            256
-#define FRAME_NS    16666667LL
+#define FRAME_NS    16666667LL   /* one frame, ~60 per second, in nanoseconds */
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How heavily to smooth the on-screen fps number so it doesn't jump around. */
 #define FPS_EWMA_ALPHA      0.05
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -234,9 +87,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&ts, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 #define PAIR_GRID      1
 #define PAIR_CURSOR    2
@@ -255,15 +106,15 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,    -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx — GridCtx + cube_round, ctx_to_screen, hex_dist, ctx_draw_bg */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx ── */
 
+/* Everything needed to turn a hex coordinate into a spot on the screen, and
+ * back. Bundled together so the drawing code can pass one thing around. */
 typedef struct {
-    int    rows, cols;
-    double hex_size;
-    double border_w;
-    int    ox, oy;
+    int    rows, cols;   /* terminal size in characters */
+    double hex_size;     /* how big one hex is drawn, in sub-cell units */
+    double border_w;     /* fraction of each hex left blank as a gap (0..0.5) */
+    int    ox, oy;       /* screen cell that the center hex (0,0) sits on */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols,
@@ -277,9 +128,10 @@ static void ctx_init(GridCtx *g, int rows, int cols,
 }
 
 /*
- * cube_round — nearest integer hex to fractional cube position.
- * Round all three; fix the component with the LARGEST error to restore
- * q+r+s=0.  See 01_hex_direct.c §4 for the full derivation.
+ * Snaps a fuzzy in-between hex position to the nearest real hex cell. Hex
+ * coordinates come in threes that must always sum to zero; rounding each one
+ * separately can break that, so we fix up whichever one we rounded worst.
+ * Full derivation lives in 01_hex_direct.c §4.
  */
 static void cube_round(double fq, double fr, double fs, int *q, int *r)
 {
@@ -292,13 +144,7 @@ static void cube_round(double fq, double fr, double fs, int *q, int *r)
     else                          { *q = rq; *r = rr; }
 }
 
-/*
- * ctx_to_screen — flat-top forward matrix + aspect correction.
- *
- * THE FORMULA:
- *   cx = size × 3/2 × q,   cy = size × (√3/2 × q  +  √3 × r)
- *   col = ox + round(cx / CELL_W),   row = oy + round(cy / CELL_H)
- */
+/* Hex coordinate (q, r) -> which screen cell to draw it on. */
 static void ctx_to_screen(const GridCtx *g, int q, int r, int *col, int *row)
 {
     double sq3 = sqrt(3.0);
@@ -309,12 +155,9 @@ static void ctx_to_screen(const GridCtx *g, int q, int r, int *col, int *row)
 }
 
 /*
- * hex_dist — axial distance between two hexes.
- *
- * THE FORMULA:
- *   d = (|dq| + |dr| + |dq + dr|) / 2
- * Used by all scatter modes to filter the bounding box to the disc.
- * Used by MINDIST to check separation from pool objects.
+ * How many hex steps apart two cells are. This is the workhorse of the whole
+ * file: every spray uses it to keep only the cells inside the circle, and the
+ * even-spacing spray uses it to check nothing is too close to nothing else.
  */
 static int hex_dist(int q1, int r1, int q2, int r2)
 {
@@ -322,6 +165,8 @@ static int hex_dist(int q1, int r1, int q2, int r2)
     return (abs(dq) + abs(dr) + abs(dq + dr)) / 2;
 }
 
+/* Picks the ASCII line character ( - \ | / ) that best matches a given angle,
+ * so a hex edge looks like it's leaning the right way. */
 static char angle_char(double theta)
 {
     double t = fmod(theta, M_PI);
@@ -333,6 +178,10 @@ static char angle_char(double theta)
     else                              return '-';
 }
 
+/* Draws the empty hex grid that fills the screen. For each screen cell it
+ * works out which hex it belongs to; cells near a hex's edge get an outline
+ * character, cells deep inside a hex are left blank. The hex under the cursor
+ * is tinted to stand out. */
 static void ctx_draw_bg(const GridCtx *g, int curq, int curr)
 {
     double size  = g->hex_size;
@@ -370,13 +219,19 @@ static void ctx_draw_bg(const GridCtx *g, int curq, int curr)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool ── */
 
+/* One placed object: which hex it sits on (q, r) and the character to draw. */
 typedef struct { int q, r; char glyph; } Obj;
+
+/* The bag of everything that's been scattered so far. Fixed-size array, no
+ * heap; once it's full (count == MAX_OBJ) further placements are ignored.
+ * 'count' is how many of the 'items' slots are actually in use. */
 typedef struct { Obj items[MAX_OBJ]; int count; } Pool;
 
+/* Adds an object at a hex, or just updates the glyph if one's already there,
+ * so the same cell never gets two objects. Silently does nothing if the bag
+ * is full. */
 static void pool_place(Pool *p, int q, int r, char glyph)
 {
     for (int i = 0; i < p->count; i++) {
@@ -402,16 +257,14 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_OBJ) | A_BOLD);
 }
 
-/* ── end §5 — pool objects are scattered by §7 functions ──────────────── */
+/* ── §6 cursor ── */
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  cursor — axial cursor and movement                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
+/* Where the '@' marker is on the grid, in hex coordinates. */
 typedef struct { int q, r; } Cursor;
 
 static void cursor_reset(Cursor *cur) { cur->q = 0; cur->r = 0; }
 
+/* The (q, r) step for each arrow key: up, down, left, right in that order. */
 static const int HEX_DIR[4][2] = {
     { 0, -1 }, { 0, +1 }, {-1, 0}, {+1, 0}
 };
@@ -436,20 +289,16 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  scatter — four acceptance strategies over the hex disc             */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
+/* ── §7 scatter ── */
 /*
- * scatter_uniform — place each disc hex with probability DENSITY.
- *
- * THE FORMULA:
- *   For each (dq, dr) in [-R,R]² with hex_dist(0,0,dq,dr) ≤ R:
- *     if rand()/RAND_MAX < density: pool_place(cur.q+dq, cur.r+dr, '.')
- *
- * Expected output: density × disc_count cells.  Variance is binomial:
- * each hex is an independent Bernoulli trial with p = density.
+ * The four sprays all walk the same circle of hexes around the cursor (every
+ * cell within 'radius' steps). What differs is the rule each one uses to
+ * decide whether a given cell gets an object. That single rule is the whole
+ * personality of each spray.
  */
+
+/* Uniform spray: flip a weighted coin for every cell, place a '.' if it wins.
+ * Higher density = more cells win, but they're scattered with no pattern. */
 static void scatter_uniform(Pool *pool, int cQ, int cR,
                              int radius, double density)
 {
@@ -463,20 +312,11 @@ static void scatter_uniform(Pool *pool, int cQ, int cR,
 }
 
 /*
- * scatter_mindist — Poisson-disk sampling on the hex grid.
- *
- * THE FORMULA:
- *   For each candidate (q, r) in the disc:
- *     For each existing pool object (pq, pr):
- *       if hex_dist(q, r, pq, pr) < mindist: reject candidate
- *     If no object is too close: pool_place(q, r, '+')
- *
- * WHY this produces even distribution: any two placed objects are guaranteed
- * ≥ mindist hex steps apart.  At mindist=2 each object "owns" a 7-cell disc
- * around itself (1 + 6 neighbours), leaving no adjacent hexes empty.
- *
- * Cost: O(disc_count × pool_count) per scatter.  With disc ≤ 217 and
- * pool ≤ 256, this is at most 55,552 comparisons — under 1 ms.
+ * Even-spacing spray (Poisson-disk sampling): place a '+' only where it stays
+ * at least 'mindist' steps from every object already down. That guarantee is
+ * what makes the result look tidy and evenly spread instead of clumpy. We
+ * check each candidate against the whole bag, which is cheap here (a few tens
+ * of thousands of comparisons at most, well under a millisecond).
  */
 static void scatter_mindist(Pool *pool, int cQ, int cR,
                              int radius, int mindist)
@@ -495,16 +335,8 @@ static void scatter_mindist(Pool *pool, int cQ, int cR,
     }
 }
 
-/*
- * scatter_flood — fill the entire disc solidly.
- *
- * THE FORMULA:
- *   Accept ALL hexes with hex_dist(cursor, hex) ≤ radius.
- *   disc_count = 3R² + 3R + 1 cells placed.
- *
- * Equivalent to a flood-fill starting at cursor outward to depth R — but
- * since the hex plane has no obstacles here, iteration is simpler than BFS.
- */
+/* Flood spray: no coin flip, no spacing check — fill every cell in the circle
+ * solid with '#'. The simplest rule of the four. */
 static void scatter_flood(Pool *pool, int cQ, int cR, int radius)
 {
     for (int dr = -radius; dr <= radius; dr++) {
@@ -515,19 +347,10 @@ static void scatter_flood(Pool *pool, int cQ, int cR, int radius)
     }
 }
 
-/*
- * scatter_gradient — acceptance probability falls off with hex distance.
- *
- * THE FORMULA:
- *   For each hex at dist d from cursor:
- *     P = GRAD_FALLOFF / (d + GRAD_FALLOFF)
- *     if rand()/RAND_MAX < P: place '*'
- *
- * WHY inverse-distance falloff: it produces a "heat map" that is denser at
- * the cursor and sparser at the edge.  Increasing GRAD_FALLOFF makes the
- * gradient shallower (more uniform).  At GRAD_FALLOFF=∞, P=1 for all d
- * (degenerates to FLOOD).  At GRAD_FALLOFF=1 the dropoff is steep.
- */
+/* Gradient spray: like the uniform spray, but the win chance shrinks the
+ * farther a cell is from the cursor. The center cell always wins; outer cells
+ * win less and less, giving a '*' blob that's dense in the middle and fades at
+ * the rim. GRAD_FALLOFF sets how gentle the fade is. */
 static void scatter_gradient(Pool *pool, int cQ, int cR, int radius)
 {
     for (int dr = -radius; dr <= radius; dr++) {
@@ -541,23 +364,24 @@ static void scatter_gradient(Pool *pool, int cQ, int cR, int radius)
     }
 }
 
-/* ── end §7 — all scatter strategies proven correct in HOW TO VERIFY ─── */
+/* ── §8 scene ── */
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
+/* Which of the four sprays is currently selected. N_SC is the count, handy
+ * for sizing the name table below. */
 typedef enum {
     SC_UNIFORM=0, SC_MINDIST=1, SC_FLOOD=2, SC_GRADIENT=3, N_SC=4
 } ScatterMode;
 
 static const char *SC_NAME[N_SC] = { "uniform", "mindist", "flood", "gradient" };
 
+/* The live settings the user tweaks with the keys. Some knobs only matter for
+ * one spray (density for uniform, mindist for even-spacing); they're kept here
+ * regardless so switching sprays remembers each one's last value. */
 typedef struct {
     ScatterMode mode;
-    int         radius;
-    double      density;   /* UNIFORM mode only */
-    int         mindist;   /* MINDIST mode only */
+    int         radius;    /* spray circle size, in hex steps */
+    double      density;   /* uniform spray only: win chance per cell */
+    int         mindist;   /* even-spacing spray only: minimum gap in steps */
 } SceneCfg;
 
 static void cfg_init(SceneCfg *cfg)
@@ -579,7 +403,8 @@ static void scene_scatter(Pool *pool, const Cursor *cur, const SceneCfg *cfg)
     }
 }
 
-/* Bright bold yellow fps readout (top-right) + bold cyan key hints (bottom). */
+/* Draws the two overlays: current spray + settings + fps in the top-right,
+ * and the key reminders along the bottom. */
 static void hud_draw(const GridCtx *g, const Pool *p, const SceneCfg *cfg,
                       double fps)
 {
@@ -619,9 +444,7 @@ static void scene_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -634,9 +457,7 @@ static void screen_init(void)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §10 app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §10 app ── */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 
@@ -664,6 +485,8 @@ int main(void)
 
     while (g_running) {
         if (g_need_resize) {
+            /* Terminal was resized: the endwin/refresh pair is the ncurses
+             * way to pick up the new window size before we re-measure it. */
             g_need_resize = 0; endwin(); refresh();
             getmaxyx(stdscr, rows, cols);
             ctx_init(&g, rows, cols, g.hex_size, g.border_w);

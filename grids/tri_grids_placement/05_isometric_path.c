@@ -1,119 +1,15 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 05_isometric_path.c — line-of-sight path on the iso (solid-fill) grid
+ * 05_isometric_path.c — shortest line of triangles between two points,
+ * drawn on the solid-colour "stacked cubes" iso grid.
  *
- * DEMO: Iso solid-colour triangular grid (6-cycle palette). Move '@' with
- *       arrows; 's' sets START at cursor, 'e' sets END. The path between
- *       markers is computed by pixel-walking the centroid-to-centroid
- *       line and recording each triangle the line passes through. Path
- *       cells overlay bright '*' glyphs on the colour fill.
+ * Move the '@' cursor with the arrows. Press 's' to drop a start, 'e' to
+ * drop an end; the program lights up every triangle a straight line from
+ * start to end passes over with a bright '*'.
  *
- * Study alongside: grids/tri_grids/05_isometric.c (rasterizer + palette),
- *                  05_isometric_direct.c (manual placement on iso),
- *                  01_equilateral_path.c (same path, edges instead of fills).
- *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, TRI_SIZE, MAX_OBJ
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — fill palette + path / start / end / cursor / HUD / hint
- *   §4 gridctx  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg
- *   §5 pool     — Pool: place / find / draw   (path entries, glyph='*')
- *   §6 cursor   — Cursor + cursor_reset / cursor_move / cursor_draw
- *   §7 mode     — path: state machine (set start, set end, recompute)
- *   §8 scene    — hud_draw + scene_draw
- *   §9 screen   — ncurses init / cleanup
- *  §10 app      — signals, main loop
- *
- * Keys:  arrows:move  s:set-start  e:set-end  spc:clear-path
- *        +/-:size  t:theme  r:reset  q/ESC:quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/05_isometric_path.c \
- *       -o 05_isometric_path -lncurses -lm
+ * Sister files: grids/tri_grids/05_isometric.c (the coloured grid itself),
+ * 01_equilateral_path.c (same idea, but it outlines edges instead).
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Line-rasterize between two centroids in PIXEL space;
- *                  for each sampled pixel, ask pixel_to_tri "which
- *                  triangle (col, row, up) am I in?" and record uniques.
- *                  The result is the ordered set of triangles traversed
- *                  by the straight line.
- *
- * Data-structure : Pool — flat array of Obj{col, row, up, glyph='*',
- *                  alive}. Dedup via pool_find. The fill colour of each
- *                  path triangle is the same palette index as the
- *                  background; the '*' overlay is what the user sees.
- *
- * Sampling step  : ~size/4 — fine enough never to skip a triangle.
- *
- * State machine  : IDLE → has_start → has_start && has_end → recompute.
- *                  's' / 'e' transition; SPACE resets to IDLE.
- *
- * References     :
- *   Triangular tiling — https://en.wikipedia.org/wiki/Triangular_tiling
- *   Bresenham line — https://en.wikipedia.org/wiki/Bresenham%27s_line_algorithm
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Same line-walk as 01_equilateral_path; the only difference is paint.
- * The background is solid-filled by palette index; the path overlays '*'
- * on top of those fills. Path computation is unaware of colour.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Picture a wall of stacked cubes (the iso fill) and a string stretched
- * from S to E. The path is the ordered list of cube faces the string
- * crosses. We sample the string finely in pixel space and classify each
- * sample's triangle with the same skew-lattice formula the background
- * uses. Adjacent samples in the same triangle are deduped.
- *
- * DRAWING METHOD  (per frame)
- * ──────────────
- *  1. erase()
- *  2. ctx_draw_bg paints every cell with its palette colour.
- *  3. pool_draw — '*' at each path entry's centroid screen cell.
- *  4. marker_draw — 'S' at start, 'E' at end.
- *  5. cursor_draw — '@' at the cursor address.
- *
- *  path_compute runs only on START/END change or size change.
- *
- * KEY FORMULAS
- * ────────────
- *  Pixel → lattice  (h = size · √3 / 2):
- *    b = py / h,  a = px / size - 0.5 · b
- *    col = ⌊a⌋,   row = ⌊b⌋
- *    up  = (fa + fb ≥ 1) ? △ : ▽
- *
- *  Centroid lattice → pixel:
- *    ▽: a = col + 1/3,  b = row + 1/3
- *    △: a = col + 2/3,  b = row + 2/3
- *    px = (a + 0.5·b) · size,  py = b · h
- *
- *  Walk:
- *    dist = sqrt((ex-sx)² + (ey-sy)²)
- *    step = size · 0.25
- *    n    = floor(dist/step) + 1
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • '*' contrast: drawn with PAIR_PATH (bright fg over default bg) so
- *    it stays readable on every palette tile.
- *  • Zero-length, sampling step, MAX_OBJ cap: identical to other _path
- *    siblings.
- *  • Recompute on size change: '+'/'-' must call path_compute.
- *
- * HOW TO VERIFY
- * ─────────────
- *  Set START and END at the same triangle: path size = 1.
- *  END one edge away: path size = 2. Cycle 't': path stars stay over the
- *  same triangles even though the colours under them shift.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -126,9 +22,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 
@@ -146,7 +40,7 @@
 
 #define FPS_EWMA_ALPHA  0.05
 
-#define PAIR_FILL_BASE 1                        /* 1..6 */
+#define PAIR_FILL_BASE 1                        /* six fill colours live in slots 1..6 */
 #define PAIR_PATH     (PAIR_FILL_BASE + N_PALETTE)
 #define PAIR_START    (PAIR_PATH + 1)
 #define PAIR_END      (PAIR_START + 1)
@@ -154,9 +48,7 @@
 #define PAIR_HUD      (PAIR_CURSOR + 1)
 #define PAIR_HINT     (PAIR_HUD + 1)
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -171,9 +63,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static const short PAL256[N_THEMES][N_PALETTE] = {
     { 196, 214, 226, 118,  39, 129 },
@@ -200,16 +90,18 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx                                                             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx ── */
 
+/* Everything the grid needs to know to turn a triangle's address into a
+ * spot on screen: how big the terminal is, how big each triangle is, and
+ * where the grid's centre sits. Kept in one struct so a resize or a size
+ * change just updates these numbers in place. */
 typedef struct {
-    int    rows, cols;
-    int    cw, ch;
-    double tri_size;
-    int    ox, oy;
-    int    max_col, max_row;
+    int    rows, cols;        /* terminal size, in character cells */
+    int    cw, ch;            /* width/height of one cell, in sub-pixels */
+    double tri_size;          /* edge length of a triangle, in pixels */
+    int    ox, oy;            /* screen cell the grid is centred on */
+    int    max_col, max_row;  /* how far the cursor may roam from centre */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols, double tri_size)
@@ -223,6 +115,9 @@ static void ctx_init(GridCtx *g, int rows, int cols, double tri_size)
     g->max_row = rows / 2;
 }
 
+/* Given a point on screen, work out which triangle it falls inside and
+ * whether that triangle points up or down. This is the one place that
+ * decodes the skewed grid; everything else just trusts the answer. */
 static void pixel_to_tri(double px, double py, double size,
                          int *col, int *row, int *up,
                          double *fa, double *fb)
@@ -237,6 +132,8 @@ static void pixel_to_tri(double px, double py, double size,
     *fb = b - (double)r;
     *up = (*fa + *fb >= 1.0) ? 1 : 0;
 }
+/* The other direction: hand back the pixel at a triangle's middle, so we
+ * know where to draw its marker and where its path-line starts and ends. */
 static void tri_centroid_pixel(int col, int row, int up, double size,
                                double *cx, double *cy)
 {
@@ -255,6 +152,9 @@ static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
     *srow = g->oy + (int)(cy / g->ch);
 }
 
+/* Pick which of the six fill colours a triangle gets. The mix of its
+ * address and orientation makes neighbours differ, so the grid reads as
+ * a wall of stacked cubes rather than a flat sheet. */
 static int palette_index(int col, int row, int up)
 {
     int k = col + 2 * row + up;
@@ -279,16 +179,17 @@ static void ctx_draw_bg(const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool ── */
 
+/* One triangle that the path passes through, ready to be drawn. */
 typedef struct {
-    int  col, row, up;
-    char glyph;
-    bool alive;
+    int  col, row, up;   /* which triangle (its grid address + orientation) */
+    char glyph;          /* the character to stamp on it ('*') */
+    bool alive;          /* false means this slot is free for reuse */
 } Obj;
 
+/* The full list of triangles on the current path. A plain fixed array we
+ * refill from scratch each time the path changes — no growing, no freeing. */
 typedef struct {
     Obj items[MAX_OBJ];
     int count;
@@ -296,6 +197,8 @@ typedef struct {
 
 static void pool_clear(Pool *p) { p->count = 0; }
 
+/* Is this triangle already in the list? Used to skip duplicates when the
+ * line lingers in one triangle across several samples. */
 static int pool_find(const Pool *p, int col, int row, int up)
 {
     for (int i = 0; i < p->count; i++) {
@@ -327,18 +230,23 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_PATH) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 cursor ── */
 
+/* The whole interactive state: where the '@' is, the start and end the
+ * user has dropped, and the few UI toggles. Grouped here so one struct
+ * captures "what the user is doing right now". */
 typedef struct {
-    int col, row, up;
-    int sCol, sRow, sUp;
-    int eCol, eRow, eUp;
-    int has_start, has_end;
-    int theme, paused;
+    int col, row, up;                /* the '@' cursor's triangle */
+    int sCol, sRow, sUp;             /* the start triangle (set by 's') */
+    int eCol, eRow, eUp;             /* the end triangle (set by 'e') */
+    int has_start, has_end;          /* have those been dropped yet? */
+    int theme, paused;               /* current colour set; pause flag */
 } Cursor;
 
+/* Moving the cursor one step in a triangle grid is fiddly: an up triangle
+ * and a down triangle have different neighbours. This table gives, for each
+ * arrow and each orientation, how to nudge col/row and which way the new
+ * triangle points. */
 static const int TRI_DIR[4][2][3] = {
     { { -1,  0,  1 }, {  0,  0,  0 } },
     { {  0,  0,  1 }, { +1,  0,  0 } },
@@ -375,15 +283,12 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  mode — path state machine + line rasterise                          */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 mode ── */
 
-/*
- * path_compute — pixel-walk between two centroids in PIXEL space, then
- * classify each sample's owning triangle. Dedup via pool_find inside
- * pool_place.
- */
+/* Fill the path list with every triangle a straight line from start to end
+ * crosses. We walk the line in small steps and, at each step, note which
+ * triangle we're standing on; repeats are dropped so each triangle appears
+ * once. */
 static void path_compute(Pool *pool, const Cursor *cur, const GridCtx *g)
 {
     pool_clear(pool);
@@ -419,9 +324,7 @@ static void marker_draw(const GridCtx *g, int col, int row, int up,
     attroff(COLOR_PAIR(pair) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, const Pool *p,
                      double fps)
@@ -457,9 +360,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, const Pool *p,
     wnoutrefresh(stdscr); doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(int theme)
@@ -470,9 +371,7 @@ static void screen_init(int theme)
     color_init(theme); atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §10 app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §10 app ── */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 static void on_signal(int s)
@@ -502,6 +401,8 @@ int main(void)
 
     while (g_running) {
         if (g_need_resize) {
+            /* ncurses needs an endwin()/refresh() bounce to pick up the
+             * terminal's new size after the window changes. */
             g_need_resize = 0; endwin(); refresh();
             ctx_init(&g, LINES, COLS, g.tri_size);
         }

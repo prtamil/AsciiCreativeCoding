@@ -1,179 +1,23 @@
 /*
- * 06_rhombille.c — rhombille tiling: hexagons divided into 3 rhombuses each
+ * 06_rhombille.c — rhombille tiling: each hexagon split into 3 diamonds
  *
- * DEMO: Each hexagon is split into three rhombuses by drawing "spoke" lines
- *       from the hex center to every other vertex (at 0°, 120°, 240°).
- *       The result looks like an isometric view of 3D cubes stacked in a
- *       corner — the classic "cube illusion" from the rhombille tiling.
- *       An '@' cursor moves between hex cells with arrow keys.
+ * We draw a flat-top hex grid, then inside every hex draw three short lines
+ * from the center out to every other corner. That splits each hex into three
+ * diamonds, and the diamonds from neighboring hexes line up to look like a
+ * stack of 3D cubes seen from the corner — the classic "cube illusion".
+ * An '@' marker moves between hexes with the arrow keys.
  *
- * Study alongside: ../README.md (the GridCtx + Cursor abstraction),
- *                  hex_grids/01_flat_top.c (hex border algorithm)
- *                  hex_grids/05_triangular.c (triangular dual of rhombille)
- *
- * Section map:
- *   §1 config   — CELL_W/CELL_H, hex_size + border_w + spoke_w bounds,
- *                 themes, FPS_EWMA_ALPHA, color pair IDs
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — border / spoke / cursor / HUD / HINT pairs (4 themes)
- *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg
- *                 (two-level: hex border → spoke check on interior)
- *   §5 cursor   — Cursor (q, r) + cursor_reset / cursor_move / cursor_draw
- *                 + HEX_DIR axial direction table
- *   §6 scene    — hud_draw + scene_draw
- *   §7 screen   — ncurses init / cleanup
- *   §8 app      — signals, resize, main loop
+ * Study alongside: ../README.md (the GridCtx + Cursor split used everywhere),
+ *                  hex_grids/01_flat_top.c (the hex-border drawing this builds on),
+ *                  hex_grids/05_triangular.c (the triangular cousin of this tiling)
  *
  * Keys:  q/ESC quit  p pause  t theme  r reset  arrows move  +/-:size  [/]:spoke
  *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/hex_grids/06_rhombille.c \
- *       -o 06_rhombille -lncurses -lm
+ * References:
+ *   Rhombille tiling     https://en.wikipedia.org/wiki/Rhombille_tiling
+ *   Isometric projection https://en.wikipedia.org/wiki/Isometric_projection
+ *   Red Blob hex guide   https://www.redblobgames.com/grids/hexagons/
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Rhombille tiling = flat-top hex grid + 3 "spoke" line
- *                  segments per hex. Each spoke goes from the hex center to
- *                  one of 3 alternating vertices (at math angles 0°, 120°,
- *                  240°). This divides each hex into 3 congruent rhombuses.
- *                  Together, adjacent rhombuses from neighboring hexes create
- *                  the illusion of 3D isometric cubes.
- *
- * Data-structure : Two structs — GridCtx (hex_size, border_w, spoke_w,
- *                  cursor bounds in axial space) and Cursor (just (q, r)).
- *                  No grid array; ctx_draw_bg() runs a two-level per-pixel
- *                  classifier:
- *                  Level 1: cube dist > 0.5 − border_w → hex border.
- *                  Level 2: if interior, project (px−cx, py−cy) onto each
- *                    spoke direction; if 0 ≤ t ≤ size and perp ≤ spoke_w,
- *                    draw the spoke character.
- *                  See ../README.md "The two primitives" for why this same
- *                  GridCtx + Cursor split is reused across every grid family.
- *
- * Rendering      : Spoke character = direction of the spoke line itself
- *                  (NOT +π/2 as for hex borders, because we want the line
- *                  character aligned with the spoke direction).
- *                  Spoke at screen 0° → '-'; 120° → '/'; 240° → '\'.
- *                  Hex border: angle_char(theta + π/2) as in 01_flat_top.
- *
- *                  Why alternating vertices (not all 6): connecting center to
- *                  all 6 vertices gives 6 triangles (hexagonal star). Using
- *                  every other vertex gives 3 rhombuses (the rhombille pattern).
- *                  The 3 spoke directions are exactly 120° apart, matching the
- *                  3 cube face orientations in isometric projection.
- *
- * Performance    : O(rows × cols × 3) per frame. The spoke check adds 3 dot
- *                  products per interior cell — still O(rows×cols) overall.
- *
- * References     :
- *   Rhombille tiling (Wikipedia)
- *     https://en.wikipedia.org/wiki/Rhombille_tiling
- *   Isometric projection geometry
- *     https://en.wikipedia.org/wiki/Isometric_projection
- *   Red Blob Games hex grid guide
- *     https://www.redblobgames.com/grids/hexagons/
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Rhombille = flat-top hexagonal grid + 3 "spoke" segments inside each hex.
- * The hex grid provides the outer structure (same as 01_flat_top). Inside
- * each hex, three lines emanate from the center to alternating vertices
- * (0°, 120°, 240°). This creates the distinctive diamond/rhombus pattern
- * that gives the tiling its name.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Every pixel is classified in two levels:
- *
- *   LEVEL 1 — Hex border check (same as 01_flat_top):
- *     cube dist ≥ 0.5 − border_w?  → hex border character
- *
- *   LEVEL 2 — Spoke check (interior pixels only):
- *     For each of 3 spokes, compute:
- *       t    = projection of (pixel−center) onto spoke direction
- *       perp = perpendicular distance from (pixel−center) to spoke line
- *     If 0 ≤ t ≤ hex_size AND perp ≤ spoke_w → draw spoke character
- *
- * The two levels give four possible outcomes for any pixel:
- *   hex border + no spoke → border character (angle_char)
- *   interior + on spoke   → spoke character ('-', '/', '\')
- *   interior + no spoke   → empty (skip)
- *   (hex border + on spoke: border wins by being checked first)
- *
- * WHY ALTERNATING VERTICES:
- *   Flat-top hex has vertices at math angles 0°, 60°, 120°, 180°, 240°, 300°.
- *   Connecting center to all 6 → 6 triangles (star of David / hexagonal star).
- *   Connecting center to 3 alternating (0°, 120°, 240°) → 3 rhombuses.
- *   The 3-spoke version is the rhombille tiling and creates the cube illusion.
- *   The 6-spoke version would be the hexagonal star tiling.
- *
- * DRAWING METHOD  (hex border + spoke projection)
- * ─────────────────────────────────────────────────
- *  1. Flat-top hex pipeline: pixel → cube → nearest hex (Q,R) + cube dist.
- *
- *  2. If dist ≥ limit: draw hex border character (same as 01_flat_top).
- *
- *  3. Else (interior pixel):
- *     Compute vector v = (px − cx, py − cy) from hex center.
- *     For k = 0, 1, 2:
- *       t    = vx × SPOKE_D[k][0] + vy × SPOKE_D[k][1]   (dot product)
- *       perp = |vx × SPOKE_D[k][1] − vy × SPOKE_D[k][0]|  (cross magnitude)
- *       If 0 ≤ t ≤ size AND perp ≤ spoke_w: draw SPOKE_C[k]; break.
- *
- * KEY FORMULAS
- * ────────────
- *  Spoke direction k in screen space (y-down):
- *    Math angles 0°, 120°, 240° → screen directions:
- *    d[k] = (cos(math_angle_k), −sin(math_angle_k))
- *    k=0: (1.0,  0.0)         → screen right → '-'
- *    k=1: (−0.5, −√3/2)      → screen upper-left → '\'
- *    k=2: (−0.5, +√3/2)      → screen lower-left → '/'
- *
- *  Sign flip on sin: screen y increases downward (opposite to math convention).
- *    cos(120°) = −0.5,  −sin(120°) = −√3/2 ≈ −0.866
- *    cos(240°) = −0.5,  −sin(240°) = +√3/2 ≈ +0.866
- *
- *  Along-spoke projection (dot product):
- *    t = vx × dx + vy × dy
- *    t ∈ [0, size] → pixel is "along" the spoke (not behind center, not past vertex)
- *
- *  Perpendicular distance (2D cross product magnitude):
- *    perp = |vx × dy − vy × dx|
- *    perp ≤ spoke_w → pixel is within spoke_w pixels of the spoke line
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Spoke check must use t >= 0 (spoke starts at center) AND t <= size
- *    (spoke ends at vertex). Without t <= size, spokes would extend to
- *    the next hex and produce incorrect patterns.
- *
- *  • The 3 spoke characters are pre-assigned by direction (SPOKE_C[3]):
- *    k=0 ('-'), k=1 ('\'), k=2 ('/'). This is the SPOKE direction angle,
- *    NOT the tangent angle. Spokes are straight lines, not hex-tangent curves.
- *
- *  • cursor hex: both its border AND its spokes are drawn in PAIR_CURSOR.
- *    This gives the cursor hex a fully blue-highlighted appearance.
- *
- * HOW TO VERIFY  (HEX_SIZE=14, spoke_w=2.5, cursor at q=0, r=0)
- * ─────────────
- *  Spoke 0 goes from center (0,0) rightward to vertex (14, 0).
- *  Pixel at (col=ox+4, row=oy): px=8, py=0, vx=8, vy=0.
- *    t    = 8×1.0 + 0×0.0 = 8. 0 ≤ 8 ≤ 14 ✓
- *    perp = |8×0.0 − 0×1.0| = 0 ≤ 2.5 ✓ → draws '-'. ✓
- *
- *  Pixel at (col=ox+4, row=oy+1): px=8, py=4, vx=8, vy=4.
- *    t    = 8×1.0 + 4×0.0 = 8.
- *    perp = |8×0.0 − 4×1.0| = 4 > 2.5 → NOT on spoke 0.
- *    Check spoke 1: d=(−0.5, −0.866).
- *    t    = 8×(−0.5) + 4×(−0.866) = −4−3.46 = −7.46 < 0 → not on spoke 1.
- *    → Interior, no spoke → nothing drawn. ✓
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -190,48 +34,46 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
-/* Sub-pixel resolution per terminal cell — hex math runs in pixel units. */
+/* One terminal cell is this many "pixels" wide and tall. All the hex math
+ * works in these finer pixels so the shapes don't look chunky. */
 #define CELL_W              2
 #define CELL_H              4
 
-/* Hex side length in pixels — the lone tunable that sets cell scale. */
+/* How big each hex is, in pixels (its side length). This is the main dial
+ * for how zoomed-in the grid looks. */
 #define HEX_SIZE_DEFAULT   14.0
 #define HEX_SIZE_MIN        6.0
 #define HEX_SIZE_MAX       40.0
 #define HEX_SIZE_STEP       2.0
 
-/* Cube-distance threshold for "on a hex border" (normalized [0,0.5]). */
+/* How thick the hex outlines are. Bigger = fatter borders, smaller interiors. */
 #define BORDER_W_DEFAULT    0.10
 #define BORDER_W_MIN        0.03
 #define BORDER_W_MAX        0.30
 #define BORDER_W_STEP       0.02
 
-/* Spoke half-width in pixels. 1 terminal column = CELL_W=2 pixels. */
+/* Half the thickness of the inner spoke lines, in pixels. */
 #define SPOKE_W_DEFAULT     2.5
 #define SPOKE_W_MIN         0.5
 #define SPOKE_W_MAX         6.0
 #define SPOKE_W_STEP        0.5
 
 #define N_THEMES            4
-#define TICK_NS            16666667LL    /* ~60 Hz frame budget */
+#define TICK_NS            16666667LL    /* one frame at ~60 fps */
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How fast the on-screen fps number reacts. Small = smooth and slow. */
 #define FPS_EWMA_ALPHA      0.05
 
 /* Color pair IDs */
 #define PAIR_BORDER  1
-#define PAIR_SPOKE   2   /* interior spokes — slightly dimmer for depth */
-#define PAIR_CURSOR  3   /* cursor hex border + '@' character */
+#define PAIR_SPOKE   2   /* the diamond lines inside each hex */
+#define PAIR_CURSOR  3   /* the highlighted hex and its '@' */
 #define PAIR_HUD     4
 #define PAIR_HINT    5
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -248,9 +90,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&ts, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static const short THEMES[N_THEMES][2] = {
     { COLOR_CYAN,   COLOR_BLACK },
@@ -270,47 +110,41 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx and the hex-border + spoke classifier             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula ── */
 
 /*
- * GridCtx — geometry of the rhombille tiling plus cursor bounds.
+ * GridCtx — everything we need to know to draw the grid and find where a hex
+ * lands on screen. One of these is filled in once at startup (and again on
+ * resize) and then passed, read-only, to every drawing routine.
  *
- * Cursor is axial (q, r) — the same coordinate system as 01_flat_top, so
- * max_q / max_r play the same role as max_r / max_c do in rect's GridCtx.
+ * Hex addresses use (q, r) "axial" coordinates — think of them as a slanted
+ * row/column system for hexagons, the same one 01_flat_top uses.
  *
- * The two render knobs (border_w, spoke_w_px) are part of GridCtx because
- * ctx_draw_bg() reads them directly — keeping them off any global lets
- * ctx_draw_bg() be called from any caller with any settings.
+ * The two look-tuning knobs (border_w, spoke_w_px) live here, not in a global,
+ * so a drawing call always uses the settings handed to it.
  */
 typedef struct {
-    /* terminal extent (in cells) */
+    /* size of the terminal, in cells */
     int rows, cols;
 
-    /* hex side length in pixels + sub-pixel cell size */
+    /* hex side length in pixels, plus how many pixels make one cell */
     double hex_size;
     int    cell_w, cell_h;
 
-    /* centring origin in cell coordinates */
+    /* where (0,0) sits on screen, so the grid is centered */
     int ox, oy;
 
-    /* cursor bounds in axial space (loose — cursor can roam freely) */
+    /* how far the cursor may roam in each axis (generous on purpose) */
     int max_q, max_r;
 
-    /* spoke-related render knobs */
-    double border_w;       /* cube-dist threshold for hex borders */
-    double spoke_w_px;     /* spoke half-width in pixels         */
+    /* look-tuning knobs read while drawing */
+    double border_w;       /* how thick the hex outlines are */
+    double spoke_w_px;     /* half-thickness of the inner spoke lines, in pixels */
 } GridCtx;
 
-/*
- * ctx_init — derive geometry from terminal size + hex_size.
- *
- * The grid is centered on screen: ox = cols/2, oy = (rows-1)/2.
- * Axial bounds are loose — the cursor can move anywhere reachable on
- * screen. Out-of-bounds values just sit off-screen, cursor_draw checks
- * before mvaddch.
- */
+/* Fills in a GridCtx from the current terminal size and chosen settings.
+ * The roam limits are deliberately generous — they just stop the cursor from
+ * wandering miles off screen; anything off the edge is hidden by cursor_draw. */
 static void ctx_init(GridCtx *g, int rows, int cols,
                      double hex_size, double border_w, double spoke_w_px)
 {
@@ -322,29 +156,14 @@ static void ctx_init(GridCtx *g, int rows, int cols,
     g->border_w   = border_w;
     g->spoke_w_px = spoke_w_px;
 
-    /* Loose axial bounds — cover screen extent in both axes (flat-top
-     * forward matrix has Δcx ≈ 1.5·s per Q step, Δcy ≈ √3·s per R step). */
+    /* roughly how many hexes fit across and down, with a little slack */
     g->max_q = (int)((cols * CELL_W) / (1.5 * hex_size)) + 2;
     g->max_r = (int)((rows * CELL_H) / (sqrt(3.0) * hex_size)) + 2;
 }
 
-/*
- * ctx_to_screen — center cell of flat-top hex (q, r) in screen coordinates.
- *
- * THE FORMULA (flat-top forward matrix, same as 01_flat_top):
- *   cx_pix = size × 3/2 × q
- *   cy_pix = size × (√3/2 × q  +  √3 × r)
- *   sc = ox + (int)(cx_pix / CELL_W)
- *   sr = oy + (int)(cy_pix / CELL_H)
- *
- * Reading it: q increases east (1.5·s per step), r increases south-east
- * (√3·s per step plus a √3/2·s contribution from q). The integer
- * truncation keeps '@' slightly inside the hex interior rather than
- * landing on a border character.
- *
- * The §4 formula for THIS grid family — every hex file in the series
- * shares this shape, only the inverse classifier in ctx_draw_bg() changes.
- */
+/* Given a hex address (q, r), works out which screen cell its center lands on.
+ * Stepping q moves you right; stepping r moves you down-and-right. Same math
+ * every hex file in this series uses; only the reverse lookup differs. */
 static void ctx_to_screen(const GridCtx *g, int q, int r, int *sr, int *sc)
 {
     double sq3   = sqrt(3.0);
@@ -355,9 +174,8 @@ static void ctx_to_screen(const GridCtx *g, int q, int r, int *sr, int *sc)
     *sr = g->oy + (int)(cy_pix / g->cell_h);
 }
 
-/*
- * angle_char — same as 01_flat_top. See that file for documentation.
- */
+/* Picks the ASCII character that best matches a line at the given angle, so a
+ * curve drawn cell-by-cell reads as a smooth edge. (Same as 01_flat_top.) */
 static char angle_char(double theta)
 {
     double t = fmod(theta, M_PI);
@@ -370,43 +188,25 @@ static char angle_char(double theta)
 }
 
 /*
- * SPOKE_D — three spoke directions in screen space (y-down):
- *   d[k] = (cos(math_angle_k), −sin(math_angle_k))
- *   k=0: math 0°   → (1, 0)         → '-'
- *   k=1: math 120° → (−0.5, −√3/2)  → '\'
- *   k=2: math 240° → (−0.5, +√3/2)  → '/'
- *
- * The −sin is needed because screen y increases downward (opposite math).
+ * The three "spokes" we draw inside every hex: lines from the center out to
+ * every other corner, 120° apart. SPOKE_D holds which way each one points on
+ * screen (right, up-left, down-left); SPOKE_C is the character that looks like
+ * a line going that way. Splitting the hex this way is what makes the diamonds.
+ * (Y points down on screen, which is why these aren't the textbook angles.)
  */
 static const double SPOKE_D[3][2] = {
-    {  1.0,        0.0       },  /* math 0°   → screen right     → '-' */
-    { -0.5,       -0.8660254 },  /* math 120° → screen upper-left → '\' */
-    { -0.5,        0.8660254 },  /* math 240° → screen lower-left → '/' */
+    {  1.0,        0.0       },  /* points right      → '-'  */
+    { -0.5,       -0.8660254 },  /* points up-left    → '\\' */
+    { -0.5,        0.8660254 },  /* points down-left  → '/'  */
 };
 static const char SPOKE_C[3] = { '-', '\\', '/' };
 
 /*
- * ctx_draw_bg — paint the rhombille tiling: hex borders + interior spokes.
- *
- * THE PIPELINE (per screen cell):
- *
- *   pixel → cube → nearest hex (Q,R) + cube dist  [same as 01_flat_top]
- *      │
- *      ├── dist ≥ limit (hex border):
- *      │     angle_char(theta+π/2) in PAIR_CURSOR or PAIR_BORDER
- *      │
- *      └── dist < limit (interior):
- *            v = (px−cx, py−cy)   ← vector from hex center to pixel
- *            For k = 0..2:
- *              t    = v · SPOKE_D[k]           ← along-spoke distance
- *              perp = |v × SPOKE_D[k]|         ← perpendicular distance
- *              if 0 ≤ t ≤ size AND perp ≤ spoke_w:
- *                draw SPOKE_C[k] in PAIR_CURSOR (on_cur) or PAIR_SPOKE
- *                break  ← only one spoke character per pixel
- *
- * The two-level structure (hex first, spoke on interior) is the whole
- * point of rhombille — it composes cleanly with 01_flat_top by adding
- * one more pass on the cells that 01_flat_top would skip.
+ * Draws the whole grid, one terminal cell at a time. For each cell we figure
+ * out which hex it falls in and how far it is from that hex's center. If it's
+ * near the edge, we draw an outline character. If it's inside, we check the
+ * three spokes and draw one if the cell sits on it — that's what carves each
+ * hex into diamonds. The cursor's hex gets the highlight color.
  */
 static void ctx_draw_bg(const GridCtx *g, int cur_q, int cur_r)
 {
@@ -421,12 +221,12 @@ static void ctx_draw_bg(const GridCtx *g, int cur_q, int cur_r)
             double px = (double)(col - g->ox) * g->cell_w;
             double py = (double)(row - g->oy) * g->cell_h;
 
-            /* Flat-top fractional cube coords */
+            /* Which hex is this cell in? Convert to hex coordinates... */
             double fq = (2.0/3.0 * px) / size;
             double fr = (-1.0/3.0 * px + sq3_3 * py) / size;
             double fs = -fq - fr;
 
-            /* cube_round */
+            /* ...then snap to the nearest whole hex. */
             int rq = (int)round(fq), rr = (int)round(fr), rs = (int)round(fs);
             double dq = fabs((double)rq - fq);
             double dr = fabs((double)rr - fr);
@@ -435,6 +235,8 @@ static void ctx_draw_bg(const GridCtx *g, int cur_q, int cur_r)
             else if (dr > ds)             rr = -rq - rs;
             int Q = rq, R = rr;
 
+            /* How far (0..0.5) this cell is from the hex center; near 0.5 means
+             * it's out at the rim, so it's part of the outline. */
             double fQ = (double)Q, fR = (double)R, fS = (double)(-Q - R);
             double dist = fabs(fq - fQ);
             double d2   = fabs(fr - fR);
@@ -442,14 +244,14 @@ static void ctx_draw_bg(const GridCtx *g, int cur_q, int cur_r)
             if (d2 > dist) dist = d2;
             if (d3 > dist) dist = d3;
 
-            /* Hex center in pixel space */
+            /* where this hex's center sits in pixels */
             double cx = size * 1.5 * fQ;
             double cy = size * (sq3_2 * fQ + sq3 * fR);
 
             int on_cur = (Q == cur_q && R == cur_r);
 
             if (dist >= limit) {
-                /* Level 1: hex border — cursor hex uses PAIR_CURSOR */
+                /* Out at the rim: draw an outline character. */
                 double theta = atan2(py - cy, px - cx);
                 char ch = angle_char(theta + M_PI / 2.0);
                 int attr = on_cur ? (COLOR_PAIR(PAIR_CURSOR) | A_BOLD)
@@ -458,7 +260,9 @@ static void ctx_draw_bg(const GridCtx *g, int cur_q, int cur_r)
                 mvaddch(row, col, (chtype)(unsigned char)ch);
                 attroff(attr);
             } else {
-                /* Level 2: interior — check 3 spokes */
+                /* Inside the hex: see if this cell lands on one of the three
+                 * spokes. t is how far along the spoke we are (must be between
+                 * the center and the corner); perp is how far off to the side. */
                 double vx = px - cx, vy = py - cy;
                 for (int k = 0; k < 3; k++) {
                     double dx = SPOKE_D[k][0], dy = SPOKE_D[k][1];
@@ -478,34 +282,24 @@ static void ctx_draw_bg(const GridCtx *g, int cur_q, int cur_r)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 cursor ── */
 
 /*
- * Cursor — just (q, r) in axial flat-top hex coordinates.
- *
- * Bounds live in GridCtx (max_q, max_r), not here. The cursor doesn't know
- * how big the grid is, just where in it the user is pointing. The two
- * structs compose: Cursor + GridCtx → screen position via ctx_to_screen().
+ * Cursor — which hex the user is pointing at, as a (q, r) address. That's all
+ * it holds. It doesn't know the grid's size (that's the GridCtx's job) or
+ * where it lands on screen (ctx_to_screen works that out). Keeping it this
+ * tiny is why the same Cursor type is reused across every grid in the series.
  */
 typedef struct { int q, r; } Cursor;
 
 /*
- * HEX_DIR — 4-direction movement in axial (q, r) space.
- *
- * The rhombille tiling uses the same underlying flat-top hex grid as
- * 01_flat_top, so the same axial direction table applies.
+ * The four arrow-key moves, written as a change in hex address. Up/down nudge
+ * r, left/right nudge q. Moving the cursor just shifts which hex is
+ * highlighted — the diamond pattern itself looks the same in every hex.
  *
  *                 UP: (q=0, r=-1)
- *                       ↑
- *   LEFT: (q=-1, r=0) ← ● → RIGHT: (q=+1, r=0)
- *                       ↓
- *                DOWN: (q=0, r=+1)
- *
- * Moving the cursor shifts the cube illusion's "anchor" hex — the
- * 3-rhombus pattern is identical in every hex, so only the highlight
- * moves, not the underlying tiling geometry.
+ *   LEFT: (q=-1, r=0)  *  RIGHT: (q=+1, r=0)
+ *                 DOWN: (q=0, r=+1)
  */
 static const int HEX_DIR[4][2] = {
     { 0, -1 },   /* UP    */
@@ -521,12 +315,7 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->r = 0;
 }
 
-/*
- * cursor_move — apply (dq, dr) and clamp to GridCtx bounds.
- *
- * Arrow-key dispatch reads HEX_DIR[k] and forwards (dq, dr) here.
- * Bounds are loose (±max_q/max_r around 0).
- */
+/* Nudges the cursor by one step, refusing to step past the roam limits. */
 static void cursor_move(Cursor *cur, const GridCtx *g, int dq, int dr)
 {
     int nq = cur->q + dq;
@@ -535,13 +324,8 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dq, int dr)
     if (nr >= -g->max_r && nr <= g->max_r) cur->r = nr;
 }
 
-/*
- * cursor_draw — place '@' at the centre cell of hex (q, r).
- *
- * Delegates the screen-position math to ctx_to_screen(); only checks
- * bounds and emits the bold '@'. Same shape as cursor_draw across every
- * grid file in the series.
- */
+/* Draws the '@' marker at the cursor's hex, skipping it if that hex is
+ * currently off screen. */
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc;
@@ -553,11 +337,10 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
-/* Bright bold yellow status (top-right) + bold cyan key hints (bottom). */
+/* Draws the on-screen readouts: the status line top-right, the key list along
+ * the bottom. Bright and bold so it stays readable over the busy grid. */
 static void hud_draw(const GridCtx *g, const Cursor *cur,
                      int theme, int paused, double fps)
 {
@@ -587,9 +370,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur,
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -603,9 +384,7 @@ static void screen_init(void)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;

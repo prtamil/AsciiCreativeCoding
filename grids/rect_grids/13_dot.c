@@ -1,155 +1,15 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 13_dot.c — dot grid (intersection points only, no lines)
+ * 13_dot.c — the bare-minimum grid: just a dot at every corner, no lines.
  *
- * DEMO: The minimal grid: only a '.' drawn at each cell corner
- *       (row*CELL_H, col*CELL_W). No connecting lines at all.
- *       The cursor '@' moves between corners; its 4 surrounding dots
- *       are highlighted to show which cell it occupies.
+ * We draw a '.' wherever a row line and a column line would cross, and
+ * nothing in between. Your eye fills in the missing grid on its own. An '@'
+ * cursor walks from cell to cell; the four dots around it light up green so
+ * you can see which cell you're in.
  *
- * Study alongside: 01_uniform_rect.c (same formula, adds lines), 12_ruled.c
- *
- * Section map:
- *   §1 config   — DOT_W, DOT_H (dot spacing), EWMA
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 5 pairs (dot, corner, cursor, HUD, HINT)
- *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_grid_char / ctx_draw_bg
- *   §5 cursor   — Cursor + cursor_reset / cursor_move / cursor_draw
- *   §6 scene    — hud_draw + scene_draw
- *   §7 screen   — ncurses init / cleanup
- *   §8 app      — signals, main loop
- *
- * Keys:  arrows move @   r reset   q/ESC quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/rect_grids/13_dot.c \
- *       -o 13_dot -lncurses
+ * Sister file: 01_uniform_rect.c draws the same corners but ALSO draws the
+ * connecting lines. The only difference here is AND instead of OR (see §4).
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : The rectangular lattice rendered at minimum fidelity.
- *                  Only the intersection points (corners) are drawn.
- *                  All grid structure is implicit — the viewer infers the
- *                  lines from the dot positions alone.
- *
- * Dot formula    : A dot is drawn at screen position (sr, sc) when:
- *                    sr % DOT_H == 0  AND  sc % DOT_W == 0
- *                  This is the AND of both conditions from 01_uniform_rect.
- *                  01 draws a character when either condition holds;
- *                  13 draws only when BOTH hold (the corners only).
- *
- * Cell corners   : Cell (r,c) has 4 corners at:
- *                    top-left     (r*DOT_H,       c*DOT_W)
- *                    top-right    (r*DOT_H,   (c+1)*DOT_W)
- *                    bottom-left  ((r+1)*DOT_H,   c*DOT_W)
- *                    bottom-right ((r+1)*DOT_H, (c+1)*DOT_W)
- *                  These 4 dots define a cell without any connecting lines.
- *
- * Cursor cell    : When the cursor is at (cur->r, cur->c), its 4 corner dots
- *                  are highlighted. The cursor '@' sits at the cell centre:
- *                    centre_row = cur->r*DOT_H + DOT_H/2
- *                    centre_col = cur->c*DOT_W + DOT_W/2
- *
- * References     :
- *   Dot paper — en.wikipedia.org/wiki/Dot_paper
- *   Lattice points — en.wikipedia.org/wiki/Lattice_point
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * The uniform rectangular grid (01) draws when EITHER the row OR the column
- * is on a grid line.  The dot grid draws when BOTH are on a grid line
- * simultaneously.  This logical AND instead of OR selects only the corner
- * positions — every connecting line segment is silently omitted.
- * Yet the human eye reconstructs the grid from the dots alone.
- *
- * HOW TO THINK ABOUT IT — AND vs OR
- * ────────────────────────────────────
- * Grid type vs. condition:
- *
- *   01_uniform_rect:  on_h OR  on_v  -> '-', '|', '+'     (lines + corners)
- *   13_dot:           on_h AND on_v  -> '.' only           (corners only)
- *
- * The "grid lines" in 01 are all positions where at least one coordinate
- * is a multiple of the step.  The "dots" are where BOTH coordinates are
- * multiples — the lattice points (the intersections of those lines).
- *
- * This is the distinction between:
- *   - A LATTICE: the set of discrete points at (k*DH, j*DW) for integers k,j.
- *   - A GRID:    the lattice PLUS all line segments connecting lattice points.
- *
- * The dot grid renders only the lattice.  The grid structure is implicit —
- * inferred by the viewer.  This is both minimal and elegant.
- *
- * DRAWING METHOD
- * ──────────────
- *  Per screen position (sr, sc):
- *
- *  1. on_dot = (sr % DOT_H == 0) AND (sc % DOT_W == 0)
- *  2. If on_dot AND is a cursor corner -> draw '+' with highlight color.
- *  3. If on_dot AND NOT cursor corner  -> draw '.' with dim color.
- *  4. Otherwise                        -> skip.
- *
- *  The cursor cell highlight uses the 4 CORNER DOTS — not fill, not lines.
- *  This keeps the minimal aesthetic while still showing the active cell.
- *
- *  Corner test for cell (cur->r, cur->c):
- *    is_corner_row = (sr == cur->r*DOT_H)  OR (sr == (cur->r+1)*DOT_H)
- *    is_corner_col = (sc == cur->c*DOT_W)  OR (sc == (cur->c+1)*DOT_W)
- *    is_corner = is_corner_row AND is_corner_col
- *
- * KEY FORMULAS
- * ────────────
- *  Dot condition (the only formula):
- *    is_dot(sr, sc) = (sr % DOT_H == 0) && (sc % DOT_W == 0)
- *
- *  Comparison with 01_uniform_rect:
- *    01:  on_h = (sr%CH==0),  on_v = (sc%CW==0)
- *         draw when on_h OR on_v
- *    13:  draw when on_h AND on_v   (AND is the only change!)
- *
- *  Number of dots:
- *    dot_rows = floor((LINES-1) / DOT_H) + 1
- *    dot_cols = floor(COLS / DOT_W) + 1
- *    total    = dot_rows * dot_cols
- *
- *  Cell top-left from cell index:
- *    sr = r * DOT_H,   sc = c * DOT_W
- *  Cell centre:
- *    sr = r * DOT_H + DOT_H/2,   sc = c * DOT_W + DOT_W/2
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • DOT_H=1 and DOT_W=1: every position is a dot.  The screen fills
- *    completely with '.' characters.  No visible grid structure.
- *    For a visible grid: DOT_H >= 2, DOT_W >= 3.
- *
- *  • The cell is defined by its 4 corner dots but has no drawn border.
- *    "Which cell" contains a screen position (sr, sc)?
- *      cell_row = sr / DOT_H    (integer division)
- *      cell_col = sc / DOT_W
- *    Screen positions BETWEEN dots belong to a cell but have no character.
- *
- *  • Cursor '@' placement: the cell centre is NOT at a dot position (unless
- *    DOT_H is even and DOT_W is even and the centre falls on a multiple).
- *    In general, the '@' sits in empty space — this is correct, since the
- *    cell interior has no drawn characters.
- *
- *  • Dot character choice: '.' uses only 1 cell.  On many terminals, a
- *    middle-dot U+00B7 is more visually pleasing but requires correct
- *    locale settings.  Use '.' for maximum portability.
- *
- * HOW TO VERIFY
- * ─────────────
- *  The number of dots in the top row (sr=0) = floor(COLS/DOT_W) + 1.
- *  With DOT_W=6, COLS=80: floor(80/6)+1 = 13+1 = 14 dots in row 0.
- *  No characters should appear between the dots on row 0.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
@@ -161,31 +21,26 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS  30
 
-/*
- * DOT_W, DOT_H — spacing between dots (= cell size).
- * The dot formula is: (sr % DOT_H == 0) && (sc % DOT_W == 0).
- */
+/* How far apart the dots sit. This is also the cell size: a cell is one
+ * DOT_H tall and one DOT_W wide, with a dot at each of its four corners. */
 #define DOT_W   6    /* columns between dots */
 #define DOT_H   3    /* rows between dots    */
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* The fps number on screen jumps around frame to frame, so we smooth it:
+ * each frame nudges the old value a little toward the new one. */
 #define FPS_EWMA_ALPHA  0.05
 
-#define PAIR_DOT     1   /* regular grid dots          */
-#define PAIR_CORNER  2   /* highlighted cell corners   */
+#define PAIR_DOT     1   /* ordinary dots              */
+#define PAIR_CORNER  2   /* the four dots around cursor */
 #define PAIR_CURSOR  3
 #define PAIR_HUD     4
 #define PAIR_HINT    5
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -200,9 +55,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static void color_init(void)
 {
@@ -214,10 +67,16 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx and the cell ↔ screen mapping                    */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula — where dots go and which cell holds a screen position ── */
 
+/* Everything we need to turn cell coordinates into screen positions and back.
+ * Filled once at startup (and again on resize) from the terminal size, so the
+ * drawing code never has to re-derive any of it.
+ *   rows, cols     terminal size right now, in characters
+ *   cw, ch         dot spacing — columns and rows between dots (a copy of
+ *                  DOT_W / DOT_H, so the math reads off the struct)
+ *   max_r, max_c   highest cell index the cursor may sit on; keeps it from
+ *                  walking off the bottom or right edge */
 typedef struct {
     int rows, cols;
     int cw, ch;
@@ -238,27 +97,17 @@ static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
     *sc = c * g->cw;
 }
 
-/*
- * ctx_grid_char — DOT GRID FORMULA:
- *
- *   on_dot = (sr % DOT_H == 0) && (sc % DOT_W == 0)
- *
- * Compare to 01_uniform_rect:
- *   01: draws when (sr%CELL_H==0) OR (sc%CELL_W==0)   — lines
- *   13: draws when (sr%DOT_H==0) AND (sc%DOT_W==0)    — corners only
- */
+/* A spot gets a dot only where a row line AND a column line cross — that's
+ * the whole trick. Sister file 01 draws when EITHER lines up (so you get the
+ * full lattice of lines); using AND keeps just the crossings. */
 static char ctx_grid_char(const GridCtx *g, int sr, int sc)
 {
     bool on_dot = (sr % g->ch == 0) && (sc % g->cw == 0);
     return on_dot ? '.' : ' ';
 }
 
-/*
- * is_cursor_corner — test if (sr,sc) is one of the 4 corners of cell (cr,cc).
- *
- * The 4 corner rows are:  cr*DOT_H  and  (cr+1)*DOT_H
- * The 4 corner cols are:  cc*DOT_W  and  (cc+1)*DOT_W
- */
+/* Is this screen spot one of the four corner dots of the cursor's cell?
+ * Those corners sit on the cell's own row/column lines and the next ones over. */
 static bool is_cursor_corner(const GridCtx *g, int sr, int sc, int cr, int cc)
 {
     bool r_ok = (sr == cr * g->ch || sr == (cr + 1) * g->ch);
@@ -266,7 +115,7 @@ static bool is_cursor_corner(const GridCtx *g, int sr, int sc, int cr, int cc)
     return r_ok && c_ok;
 }
 
-/* Cell centre (used for '@' placement) */
+/* Middle of a cell — where the '@' sits, in the empty space between dots. */
 static void cell_centre(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
     ctx_to_screen(g, r, c, sr, sc);
@@ -274,10 +123,8 @@ static void cell_centre(const GridCtx *g, int r, int c, int *sr, int *sc)
     *sc += g->cw / 2;
 }
 
-/*
- * ctx_draw_bg — draw all dots; corners of the cursor's cell get highlight.
- * Takes the cursor coords so it can paint the corner highlight in PAIR_CORNER.
- */
+/* Paint every dot. The four around the cursor's cell turn into a green '+'
+ * instead of a plain '.', which is why we pass the cursor's cell in. */
 static void ctx_draw_bg(const GridCtx *g, int cr, int cc)
 {
     for (int sr = 0; sr < g->rows - 1; sr++) {
@@ -296,10 +143,10 @@ static void ctx_draw_bg(const GridCtx *g, int cr, int cc)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 cursor ── */
 
+/* Which cell the '@' is on, as a (row, column) cell index — not a screen
+ * position. §4 turns these into pixels when it's time to draw. */
 typedef struct { int r, c; } Cursor;
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
@@ -323,9 +170,7 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
 {
@@ -350,9 +195,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
     wnoutrefresh(stdscr); doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(void)
@@ -363,9 +206,7 @@ static void screen_init(void)
     color_init(); atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 static void on_signal(int s)

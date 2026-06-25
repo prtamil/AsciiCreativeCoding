@@ -1,127 +1,20 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 06_hex_subdivision_patterns.c — preset stamps on hex-subdivision grid
+ * 06_hex_subdivision_patterns.c — stamp preset shapes onto a hex grid.
  *
- * DEMO: Cursor moves with arrows (whole hexes) on a flat-top hex grid
- *       where each hex is split into 6 wedges by 3 long diagonals.
- *       ',' / '.' rotate the cursor sector. Press 1..5 to STAMP a preset
- *       pattern at the cursor wedge:
- *         1 = RING    (6 wedges of the cursor's hex — full pinwheel)
- *         2 = LINE    (wedges along a horizontal hex strip)
- *         3 = STAR    (RING + outer ring of neighbouring hexes)
- *         4 = TRI     (cursor + 3 alternating sectors)
- *         5 = SCATTER (random within a small radius)
- *       SPACE clears all objects. 'g' cycles the placed glyph.
+ * Move a cursor over a flat-top hex grid (each hex split into 6 pie wedges).
+ * Press 1..5 to drop a ready-made shape of glyphs around the cursor: a ring,
+ * a line, a star, a triangle, or a random scatter. Shapes add up; they don't
+ * replace. SPACE clears everything.
  *
- * Study alongside: grids/tri_grids/06_hex_subdivision.c (rasterizer),
- *                  06_hex_subdivision_direct.c (manual placement),
- *                  01_equilateral_patterns.c (same patterns on tri).
+ * Sister files: grids/tri_grids/06_hex_subdivision.c (draws the grid),
+ *               06_hex_subdivision_direct.c (place wedges one at a time).
  *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, HEX_SIZE, MAX_OBJ
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 6 pairs: edge / radius / cursor / object / HUD / hint
- *   §4 gridctx  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg
- *   §5 pool     — Pool: place / find / draw
- *   §6 cursor   — Cursor + cursor_reset / cursor_move / cursor_rotate
- *   §7 mode     — pattern offset tables + pattern_stamp + pattern_scatter
- *   §8 scene    — hud_draw + scene_draw
- *   §9 screen   — ncurses init / cleanup
- *  §10 app      — signals, main loop
- *
- * Keys:  arrows:move-hex  ,/.:rotate  1..5:stamp  spc:clear  g:glyph
- *        +/-:size  t:theme  r:reset  q/ESC:quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/06_hex_subdivision_patterns.c \
- *       -o 06_hex_subdivision_patterns -lncurses -lm
+ * Each shape is a fixed list of "go this many hexes over, into this wedge,"
+ * stamped at the cursor's spot. The wedge number is an absolute direction
+ * (like a compass heading), not relative — so a shape keeps its look no
+ * matter where you stamp it. Hex coordinate math follows redblobgames.com.
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Stamp-based placement. Each pattern is a STATIC array
- *                  of (ΔQ, ΔR, target_sector) triples relative to the
- *                  cursor. Pressing a digit translates the array by the
- *                  cursor and inserts each entry into the pool.
- *
- * Data-structure : Pool — flat array of Obj{q, r, sector, glyph, alive}.
- *                  Pattern tables are read-only in §7. SCATTER picks
- *                  random offsets and a random sector via LCG.
- *
- * The trick      : target_sector is ABSOLUTE (0..5), not a delta. Sectors
- *                  are oriented by the same +x reference in every hex; a
- *                  translated stamp must keep its silhouette regardless
- *                  of where it lands.
- *
- * References     :
- *   Hexagonal coordinates — https://www.redblobgames.com/grids/hexagons/
- *   Hex axial system — https://en.wikipedia.org/wiki/Hexagonal_coordinate_systems
- *   Linear congruential generator — Numerical Recipes ch. 7
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * A pattern is a static list of (ΔQ, ΔR, sector) entries. Pressing '1'
- * translates the RING list by the cursor and inserts each entry into the
- * pool. The cursor never moves; only objects appear. The RING covers all
- * 6 sectors of one hex (a full pinwheel); the STAR adds neighbouring hex
- * wedges around it.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Rubber stamps on a hex grid with diameter cuts. Each pattern is a
- * fixed-shape ink dot pattern keyed to the cursor's hex address; the
- * sector field selects which wedge inside the target hex receives ink.
- * SCATTER generates a random stamp on every press.
- *
- * DRAWING METHOD  (per frame)
- * ──────────────
- *  1. erase()
- *  2. ctx_draw_bg — hex border + 3 radii via angle_char and radius
- *     proximity test.
- *  3. pool_draw — every placed object's glyph at its wedge centroid.
- *  4. cursor_draw — '@' on top.
- *
- *  Stamping (only on key press):
- *    pattern_stamp(pool, PAT_xxx, cur.q, cur.r, glyph)
- *      for each entry (ΔQ, ΔR, sector_abs):
- *        pool_place(pool, cur.q+ΔQ, cur.r+ΔR, sector_abs, glyph)
- *
- * KEY FORMULAS
- * ────────────
- *  Pattern entry shape:  (ΔQ, ΔR, target_sector)        [3-tuple]
- *  Sentinel:             { 0xDEAD, 0, 0 }
- *
- *  Wedge centroid (1/3 of the way from hex centre to a vertex):
- *    angle = sector · π/3
- *    radius = size · √3 / 3
- *    cx_w   = cx + radius · cos(angle)
- *    cy_w   = cy + radius · sin(angle)
- *
- *  Why ABSOLUTE target_sector: sectors are global angles measured from
- *  +x at every hex centre. The same sector ID in two different hexes
- *  points the same compass direction; a delta would have no consistent
- *  meaning across hex translations.
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • RING covers the cursor's full hex (6 sectors) — repeating the stamp
- *    at the same hex has no effect (pool_place deduplicates).
- *  • MAX_OBJ cap: STAR (12+ entries) plus SCATTER saturates quickly.
- *    SPACE clears the pool to recover.
- *  • Glyph cycle: glyph used by the next stamp comes from
- *    GLYPHS[cur.glyph_idx] AT stamp time.
- *
- * HOW TO VERIFY
- * ─────────────
- *  Press '1' (RING): all 6 wedges of the cursor's hex hold a glyph.
- *  Press LEFT to move one hex left; press '1' again — a new ring on the
- *  new hex; the old ring remains. Patterns ADD, not REPLACE.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -138,9 +31,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 
@@ -170,9 +61,7 @@
 
 static const char GLYPHS[N_GLYPHS] = { '*', 'o', '+', '#', 'X', '%' };
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -187,9 +76,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static const short THEME_FG[N_THEMES][3] = {
     {  75,  39, 226 },
@@ -225,17 +112,17 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx                                                             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx ── */
 
+/* Everything needed to map a hex address to a spot on screen and back.
+ * Built once at startup and rebuilt on resize. */
 typedef struct {
-    int    rows, cols;
-    int    cw, ch;
-    double hex_size;
-    int    ox, oy;
-    int    max_q, max_r;
-    double border_w, radius_t_frac;
+    int    rows, cols;            /* terminal size in characters */
+    int    cw, ch;               /* how many sub-pixels one character cell is wide/tall */
+    double hex_size;             /* hex radius in sub-pixels; bigger = chunkier grid */
+    int    ox, oy;               /* screen cell that hex (0,0) sits on */
+    int    max_q, max_r;         /* how far the cursor may roam from the centre */
+    double border_w, radius_t_frac; /* how thick the hex outline and the 3 inner cuts draw */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols, double hex_size)
@@ -351,16 +238,17 @@ static void ctx_draw_bg(const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool ── */
 
+/* One placed mark: which hex, which of its 6 wedges, and the character drawn. */
 typedef struct {
-    int  q, r, sector;
-    char glyph;
-    bool alive;
+    int  q, r, sector;   /* hex address (q,r) and wedge 0..5 within it */
+    char glyph;          /* the character shown there */
+    bool alive;          /* false = ignore this slot */
 } Obj;
 
+/* All placed marks live here — a plain array we append to; no allocation,
+ * full once it hits MAX_OBJ. SPACE wipes it by zeroing count. */
 typedef struct {
     Obj items[MAX_OBJ];
     int count;
@@ -399,22 +287,22 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_OBJECT) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 cursor ── */
 
+/* Where the user is pointing and their current settings. */
 typedef struct {
-    int q, r, sector;
-    int glyph_idx;
-    int theme;
-    int paused;
+    int q, r, sector;   /* hex the cursor sits on, plus its highlighted wedge */
+    int glyph_idx;      /* index into GLYPHS — the character the next stamp uses */
+    int theme;          /* current colour theme */
+    int paused;         /* unused for motion here; kept for HUD/key parity */
 } Cursor;
 
+/* Arrow keys map to these hex steps, in the order UP, DOWN, LEFT, RIGHT. */
 static const int HEX_DIR[4][2] = {
-    { 0, -1 },   /* UP    */
-    { 0, +1 },   /* DOWN  */
-    {-1,  0 },   /* LEFT  */
-    {+1,  0 },   /* RIGHT */
+    { 0, -1 },
+    { 0, +1 },
+    {-1,  0 },
+    {+1,  0 },
 };
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
@@ -451,24 +339,25 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  mode — pattern stamps (ΔQ, ΔR, sector) + scatter LCG                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 mode — preset shape tables + random scatter ── */
 
+/* A shape is a list of {hex step in q, hex step in r, which wedge} entries,
+ * ending with this marker. Each entry says "from the cursor, go this far,
+ * fill that wedge." 0xDEAD just flags the end of the list. */
 #define PAT_END   { 0xDEAD, 0, 0 }
 #define IS_END(p) ((p)[0] == 0xDEAD)
 
-/* RING: all 6 sectors of the cursor hex */
+/* Fill all 6 wedges of the cursor's own hex — a pinwheel. */
 static const int PAT_RING[][3] = {
     {  0,  0, 0 }, {  0,  0, 1 }, {  0,  0, 2 },
     {  0,  0, 3 }, {  0,  0, 4 }, {  0,  0, 5 }, PAT_END
 };
-/* LINE: cursor hex + 5 hexes to the right, sector 0 */
+/* A short row: same wedge across the cursor's hex and the 5 to its right. */
 static const int PAT_LINE[][3] = {
     {  0, 0, 0 }, {  1, 0, 0 }, {  2, 0, 0 },
     {  3, 0, 0 }, {  4, 0, 0 }, {  5, 0, 0 }, PAT_END
 };
-/* STAR: cursor's 6 sectors + 6 outer hex sectors */
+/* The full ring plus one wedge poking out toward each of the 6 neighbours. */
 static const int PAT_STAR[][3] = {
     {  0,  0, 0 }, {  0,  0, 1 }, {  0,  0, 2 },
     {  0,  0, 3 }, {  0,  0, 4 }, {  0,  0, 5 },
@@ -477,7 +366,7 @@ static const int PAT_STAR[][3] = {
     { -1,  1, 5 }, {  1, -1, 2 },
     PAT_END
 };
-/* TRI: 3 hex 'corners' around cursor — sectors meeting at a vertex */
+/* Three wedges that meet at a shared corner, making a little triangle. */
 static const int PAT_TRI[][3] = {
     {  0, 0, 0 }, {  1, 0, 3 }, {  1, -1, 2 }, PAT_END
 };
@@ -498,6 +387,7 @@ static double frand(void)
 
 static void pattern_scatter(Pool *pool, int cQ, int cR, char glyph)
 {
+    /* stir in the clock so each press scatters differently */
     g_seed ^= (unsigned int)clock_ns();
     int n = 10, tries = 0;
     while (n > 0 && tries < 100) {
@@ -511,9 +401,7 @@ static void pattern_scatter(Pool *pool, int cQ, int cR, char glyph)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, const Pool *p,
                      double fps)
@@ -545,9 +433,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, const Pool *p,
     wnoutrefresh(stdscr); doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(int theme)
@@ -558,9 +444,7 @@ static void screen_init(int theme)
     color_init(theme); atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §10 app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §10 app ── */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 static void on_signal(int s)

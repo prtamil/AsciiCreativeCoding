@@ -1,168 +1,16 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 03_hex_path.c — hex paths (line, ring walk, L-path) on a flat-top grid
+ * 03_hex_path.c — draw paths between hexes on a flat-top hex grid.
  *
- * DEMO: A flat-top hex grid fills the screen.  Set a fixed endpoint A with
- *       the 'a' key, then move '@' to position B and press SPACE to stamp a
- *       path between them.  Three modes:  LINE (shortest hex path via lerp +
- *       cube_round),  RING (all hexes exactly N steps from cursor),  LPATH
- *       (q-axis leg first, then r-axis leg).
+ * Set a start point A with 'a', move the '@' cursor to a second spot, and
+ * press SPACE to stamp a path. Three flavours: a straight line, a ring of
+ * hexes a fixed number of steps away, and an L-shaped path that turns once.
  *
- * Study alongside: grids/hex_grids_placement/02_hex_pattern.c (pattern stamp),
- *                  grids/rect_grids_placement/03_path.c (Bresenham on rect)
- *
- * Section map:
- *   §1  config   — all tunable constants
- *   §2  clock    — monotonic timer + sleep
- *   §3  color    — color pairs: grid, cursor, endpoint A/B, path, HUD, hint
- *   §4  gridctx  — GridCtx + cube_round, ctx_to_screen, hex_dist, ctx_draw_bg
- *   §5  pool     — Pool: place, clear, draw
- *   §6  cursor   — Cursor + axial movement, cursor_draw
- *   §7  paths    — HEX6 directions, hex_lerp_round, path_line, path_ring, path_lpath
- *   §8  scene    — hud_draw + scene_draw
- *   §9  screen   — ncurses init / cleanup
- *   §10 app      — signals, main loop
- *
- * Keys:  arrows:move  a:set-A  b:set-B  spc:stamp-path  1-3:mode  +/-:ring-N
- *        C:clear  r:reset  q/ESC:quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/hex_grids_placement/03_hex_path.c \
- *       -o 03_hex_path -lncurses -lm
+ * Sister files: 02_hex_pattern.c (stamping a pattern), and
+ *               rect_grids_placement/03_path.c (the same idea on a square grid).
+ * The path math comes from redblobgames.com/grids/hexagons (line drawing,
+ * rings, and coordinate rounding).
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Three hex path algorithms.
- *                  LINE: Lerp both axial axes from A to B in N = hex_dist(A,B)
- *                  steps, calling cube_round at each t=i/N to snap fractional
- *                  cube coordinates to the nearest integer hex.
- *                  RING: Start N steps in one direction from cursor; walk N
- *                  steps in each of the 6 hex directions in sequence.
- *                  LPATH: Travel from A to B by changing q first (keeping r
- *                  fixed at aR), then changing r (keeping q fixed at bQ).
- *
- * Data-structure : Pool — flat array of Obj{q,r,glyph}.  pool_place adds
- *                  or overwrites (no duplicates).  Path stamping is additive.
- *
- * GridContext    : GridCtx carries the hex-specific geometry (hex_size,
- *                  border_w, screen origin ox/oy, terminal extent rows/cols).
- *
- * Rendering      : Five-pass: grid background → stamped path objects →
- *                  live preview → endpoint A/B markers (if set) → cursor '@'.
- *
- * Performance    : path_line is O(N).  path_ring is O(6N).  path_lpath is
- *                  O(|dq|+|dr|).  All are fast for any visible terminal.
- *
- * References     :
- *   Hex line drawing      — https://www.redblobgames.com/grids/hexagons/#line-drawing
- *   Hex ring algorithm    — https://www.redblobgames.com/grids/hexagons/#rings
- *   Lerp + cube_round     — https://www.redblobgames.com/grids/hexagons/#rounding
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * All three algorithms share a common structure: visit a sequence of hex
- * addresses and call pool_place on each one.  The difference is HOW the
- * addresses are generated:
- *
- *   LINE    — sample a continuous straight line at N+1 equally-spaced points
- *             and round each to the nearest integer hex.
- *   RING    — start at a known ring entry point and take N steps in each of
- *             6 directions — the geometry guarantees exactly 6N cells are visited.
- *   LPATH   — split the journey into two axis-aligned legs (change q, then r).
- *             This is the hex analogue of a rook's L-move in chess.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * LINE: Imagine stretching a rubber band from A to B in pixel space and
- * sampling it at N equally-spaced intervals.  Each sample is snapped to the
- * nearest hex centre via cube_round.  The resulting hex sequence is the
- * hexagonal equivalent of Bresenham's line — no gaps, no jumps.
- *
- * RING: Think of the ring as a hexagonal clock.  Start at the 6 o'clock
- * position (N steps south from cursor).  Then walk clockwise: N steps in each
- * of 6 directions.  After 6×N steps, you're back at the start.  Each of the
- * 6×N steps visits exactly one hex on the ring (no revisits).
- *
- * LPATH: Go right/left first (q-axis), then up/down (r-axis).  The corner
- * cell (bQ, aR) is where the two legs meet; it is visited once.
- *
- * DRAWING METHOD  (LINE — the key algorithm)
- * ──────────────────────────────────────────
- *  1. N = hex_dist(A, B).  If N=0, place one cell and return.
- *  2. For i = 0, 1, ..., N:
- *       t = i / N                           ← parameter in [0.0, 1.0]
- *       fq = aQ + (bQ − aQ) × t
- *       fr = aR + (bR − aR) × t
- *       fs = −fq − fr
- *  3. cube_round(fq, fr, fs) → integer hex (q, r).
- *  4. pool_place(q, r, glyph).
- *
- * KEY FORMULAS
- * ────────────
- *  hex_lerp_round (hex line sample at parameter t ∈ [0,1]):
- *    fq = aQ + (bQ−aQ)×t
- *    fr = aR + (bR−aR)×t
- *    fs = −fq − fr
- *    (q, r) = cube_round(fq, fr, fs)
- *
- *  hex_dist (step count for line, ring N):
- *    d = (|dq| + |dr| + |dq+dr|) / 2
- *
- *  hex_line cell count: N + 1 = hex_dist(A,B) + 1
- *
- *  Ring algorithm (radius N, centre = cursor):
- *    start: (cur.q, cur.r) + N × HEX6[4]   [N steps in direction 4]
- *    walk: for i in 0..5: N steps in HEX6[i] direction
- *    ring cell count: 6N  (1 for N=0)
- *
- *  HEX6 — 6 axial neighbor directions (flat-top):
- *    0:(+1, 0)  1:(0, +1)  2:(−1,+1)  3:(−1,0)  4:(0,−1)  5:(+1,−1)
- *
- *  L-path cell count: |bQ − aQ| + |bR − aR| + 1
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • hex_lerp_round uses EXACT lerp — not epsilon-nudged like some
- *    implementations.  Cube_round handles the boundary correctly because
- *    it fixes the largest-error component, which at t=0.5 defaults to S.
- *    No nudge is needed; the algorithm is already correct.
- *
- *  • Ring at N=0: start = cursor + 0×dir = cursor; walk 0 steps in each
- *    direction → places 0 cells.  Handle N=0 as a single-cell special case.
- *
- *  • L-path when A == B: both legs have length 0 → one cell placed.
- *
- *  • L-path corner: cell (bQ, aR) is included in the q-axis leg (its
- *    last cell) and excluded from the r-axis leg (which starts at aR+dR).
- *    This prevents double-placing the corner.
- *
- * HOW TO VERIFY  (cursor at (0,0), B at (3,0))
- * ─────────────
- *  LINE, A=(0,0) B=(3,0): d=3, t=0,1/3,2/3,1.
- *    t=0:   fq=0, fr=0 → (0,0)
- *    t=1/3: fq=1, fr=0 → (1,0)
- *    t=2/3: fq=2, fr=0 → (2,0)
- *    t=1:   fq=3, fr=0 → (3,0)
- *    → 4 cells on the E-axis. ✓
- *
- *  RING, N=1, cursor=(0,0):
- *    start = (0,0) + 1×HEX6[4] = (0,0)+(0,-1) = (0,-1)
- *    dir 0=(+1,0): (0,-1)→(1,-1)     dir 1=(0,+1): (1,-1)→(1,0)
- *    dir 2=(-1,+1): (1,0)→(0,1)      dir 3=(-1,0): (0,1)→(-1,1)
- *    dir 4=(0,-1): (-1,1)→(-1,0)     dir 5=(+1,-1): (-1,0)→(0,-1)  [back to start]
- *    → 6 cells visited, each once. ✓
- *
- *  LPATH, A=(0,0) B=(2,2):
- *    q-leg: q=0→2 at r=0 → (0,0),(1,0),(2,0)
- *    r-leg: r=1→2 at q=2 → (2,1),(2,2)   [skips corner (2,0) already placed]
- *    → 5 cells = |2-0|+|2-0|+1. ✓
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -177,9 +25,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define CELL_W              2
 #define CELL_H              4
@@ -193,20 +39,18 @@
 #define BORDER_W_MIN        0.03
 #define BORDER_W_MAX        0.35
 
-/* Maximum ring radius (ring cells = 6N, must fit in MAX_OBJ). */
+/* A ring of radius N holds 6N hexes, so cap N so the ring still fits the pool. */
 #define RING_N_DEFAULT      3
 #define RING_N_MIN          0
-#define RING_N_MAX         40   /* 6×40=240 < MAX_OBJ=256 */
+#define RING_N_MAX         40   /* 6*40 = 240, under the 256 pool limit */
 
 #define MAX_OBJ            256
 #define FRAME_NS    16666667LL
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How quickly the on-screen FPS number reacts; smaller = steadier reading. */
 #define FPS_EWMA_ALPHA      0.05
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -222,18 +66,16 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&ts, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 #define PAIR_GRID      1
 #define PAIR_CURSOR    2
-#define PAIR_ENDPT_A   3   /* fixed endpoint A marker 'A'        */
-#define PAIR_PATH      4   /* stamped path glyphs                */
-#define PAIR_HUD       5   /* status bar (yellow)                */
-#define PAIR_HINT      6   /* key-hint footer (cyan)             */
-#define PAIR_ENDPT_B   7   /* fixed endpoint B marker 'B'        */
-#define PAIR_PREVIEW   8   /* live path preview before stamping  */
+#define PAIR_ENDPT_A   3   /* the 'A' start marker         */
+#define PAIR_PATH      4   /* stamped path glyphs          */
+#define PAIR_HUD       5   /* status bar (yellow)          */
+#define PAIR_HINT      6   /* key-hint footer (cyan)       */
+#define PAIR_ENDPT_B   7   /* the 'B' end marker           */
+#define PAIR_PREVIEW   8   /* the green dots shown before you stamp */
 
 static void color_init(void)
 {
@@ -249,15 +91,18 @@ static void color_init(void)
     init_pair(PAIR_PREVIEW, COLORS >= 256 ?  82 : COLOR_GREEN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx — GridCtx + cube_round, ctx_to_screen, hex_dist, ctx_draw_bg */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx ── */
 
+/*
+ * Everything we need to turn a hex address into a spot on the screen, and to
+ * draw the empty grid. One of these is built once at startup and rebuilt on
+ * resize.
+ */
 typedef struct {
-    int    rows, cols;
-    double hex_size;
-    double border_w;
-    int    ox, oy;
+    int    rows, cols;   /* terminal size, in characters */
+    double hex_size;     /* radius of one hex, in screen sub-pixels */
+    double border_w;     /* how thick the hex outline looks, 0..0.5 of a hex */
+    int    ox, oy;       /* where hex (0,0) lands on screen, in characters */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols,
@@ -271,9 +116,10 @@ static void ctx_init(GridCtx *g, int rows, int cols,
 }
 
 /*
- * cube_round — nearest integer hex to fractional cube position.
- * Round all three; fix the component with the LARGEST error to restore
- * q+r+s=0.  See 01_hex_direct.c §4 for the full derivation.
+ * Snap a fractional hex position to the nearest real hex. We round each of
+ * the three coordinates, but rounding can break the rule that they must sum
+ * to zero, so we re-derive whichever one we rounded the hardest. See
+ * 01_hex_direct.c §4 for the worked-out reasoning.
  */
 static void cube_round(double fq, double fr, double fs, int *q, int *r)
 {
@@ -287,11 +133,9 @@ static void cube_round(double fq, double fr, double fs, int *q, int *r)
 }
 
 /*
- * ctx_to_screen — flat-top forward matrix + aspect correction.
- *
- * THE FORMULA:
- *   cx = size × 3/2 × q,   cy = size × (√3/2 × q  +  √3 × r)
- *   col = ox + round(cx / CELL_W),   row = oy + round(cy / CELL_H)
+ * Find which character cell a hex's centre lands on. The math is the standard
+ * flat-top hex placement, then we divide by the cell size so the answer comes
+ * out in terminal rows and columns instead of sub-pixels.
  */
 static void ctx_to_screen(const GridCtx *g, int q, int r, int *col, int *row)
 {
@@ -303,11 +147,8 @@ static void ctx_to_screen(const GridCtx *g, int q, int r, int *col, int *row)
 }
 
 /*
- * hex_dist — axial distance between two hexes.
- *
- * THE FORMULA:
- *   d = (|dq| + |dr| + |dq + dr|) / 2
- * Used by path_line to determine step count N = hex_dist(A, B).
+ * How many steps it takes to walk from one hex to another. The straight-line
+ * path uses this to know how many points to drop along the way.
  */
 static int hex_dist(int q1, int r1, int q2, int r2)
 {
@@ -363,11 +204,16 @@ static void ctx_draw_bg(const GridCtx *g, int curq, int curr)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool ── */
 
+/* One stamped cell: its hex address (q, r) and the character drawn there. */
 typedef struct { int q, r; char glyph; } Obj;
+
+/*
+ * The collection of everything stamped so far. It's a plain fixed array, no
+ * dynamic memory, so paths just keep adding to it up to MAX_OBJ. There's only
+ * ever one hex per address — placing on an occupied spot overwrites it.
+ */
 typedef struct { Obj items[MAX_OBJ]; int count; } Pool;
 
 static void pool_place(Pool *p, int q, int r, char glyph)
@@ -395,14 +241,14 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_PATH) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  cursor — axial cursor and movement                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 cursor ── */
 
+/* Where the '@' currently sits, as a hex address. */
 typedef struct { int q, r; } Cursor;
 
 static void cursor_reset(Cursor *cur) { cur->q = 0; cur->r = 0; }
 
+/* The four arrow-key moves, in hex terms: up, down, left, right. */
 static const int HEX_DIR[4][2] = {
     { 0, -1 }, { 0, +1 }, {-1, 0}, {+1, 0}
 };
@@ -427,19 +273,15 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  paths — hex_lerp_round, path_line, path_ring, path_lpath           */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 paths ── */
 
 /*
- * HEX6 — all 6 axial neighbor directions for flat-top hex grid.
- * Used by path_ring for the ring-walk step directions.
+ * The six steps to a hex's neighbours, going around clockwise. The ring walk
+ * leans on the order: start one side away, then take a run of steps in each
+ * direction in turn, and you trace the whole ring without ever doubling back.
  *
- *   index 0:(+1, 0) E    index 1:(0, +1) SE   index 2:(-1,+1) SW
- *   index 3:(-1, 0) W    index 4:(0, -1) NW   index 5:(+1,-1) NE
- *
- * Ring walk starts N steps in direction 4 (NW), then walks E, SE, SW, W,
- * NW, NE in sequence — visiting all 6N ring cells exactly once.
+ *   0:(+1, 0) E    1:(0, +1) SE   2:(-1,+1) SW
+ *   3:(-1, 0) W    4:(0, -1) NW   5:(+1,-1) NE
  */
 static const int HEX6[6][2] = {
     {+1,  0}, { 0, +1}, {-1, +1},
@@ -447,17 +289,10 @@ static const int HEX6[6][2] = {
 };
 
 /*
- * hex_lerp_round — single sample of the hex line at parameter t ∈ [0,1].
- *
- * THE FORMULA:
- *   fq = aQ + (bQ − aQ) × t
- *   fr = aR + (bR − aR) × t
- *   fs = −fq − fr
- *   (q, r) = cube_round(fq, fr, fs)
- *
- * WHY linear lerp works: the hex plane embeds in 3-D cube space as a flat
- * diagonal plane.  A straight line in cube space crosses exactly the same
- * hexes as the shortest path between A and B — no detour, no diagonal bias.
+ * Pick the single hex that lands part-way from A to B, where t=0 is A and t=1
+ * is B. We slide along the straight line between them and snap to the nearest
+ * hex. Because of how hex coordinates work, that straight line passes through
+ * exactly the hexes of the true shortest path, with no diagonal favouritism.
  */
 static void hex_lerp_round(double aQ, double aR, double bQ, double bR,
                             double t, int *q, int *r)
@@ -469,12 +304,8 @@ static void hex_lerp_round(double aQ, double aR, double bQ, double bR,
 }
 
 /*
- * path_line — stamp the shortest hex path from (aQ,aR) to (bQ,bR).
- *
- * THE FORMULA:
- *   N = hex_dist(A, B)
- *   For i = 0..N: t = i/N → hex_lerp_round(A, B, t) → pool_place.
- *   Total cells = N + 1.
+ * Stamp the shortest line of hexes from A to B. We figure out how many steps
+ * apart they are, then drop one hex at each evenly-spaced point along the way.
  */
 static void path_line(Pool *pool, int aQ, int aR, int bQ, int bR,
                        char glyph)
@@ -490,18 +321,10 @@ static void path_line(Pool *pool, int aQ, int aR, int bQ, int bR,
 }
 
 /*
- * path_ring — stamp all hexes exactly N steps from (cur.q, cur.r).
- *
- * THE FORMULA:
- *   Start: (cur.q, cur.r) + N × HEX6[4] = (cur.q + 0×N, cur.r + (−1)×N)
- *        = (cur.q, cur.r−N)
- *   Walk: for i in 0..5, take N steps in direction HEX6[i].
- *   Total cells: 6N.  Special case N=0: place cursor cell only.
- *
- * WHY this visits 6N cells without revisiting:
- *   Each leg of length N steps moves the walker along one edge of the ring.
- *   The 6 edges together complete a closed hexagonal loop.  The walker never
- *   enters the ring interior.
+ * Stamp every hex that sits exactly N steps away from the centre — a hexagon
+ * outline. We jump out to one corner of the ring, then walk its six sides in
+ * order. Each side is a straight run of N steps, so we trace the whole loop
+ * once and land back where we started. N=0 is just the centre hex by itself.
  */
 static void path_ring(Pool *pool, int cQ, int cR, int N, char glyph)
 {
@@ -518,25 +341,18 @@ static void path_ring(Pool *pool, int cQ, int cR, int N, char glyph)
 }
 
 /*
- * path_lpath — q-axis leg then r-axis leg from (aQ,aR) to (bQ,bR).
- *
- * THE FORMULA:
- *   q-leg: step q from aQ to bQ at r=aR  (includes both endpoints)
- *   r-leg: step r from aR+dR to bR at q=bQ  (skips corner (bQ,aR))
- *   Total: |bQ−aQ| + |bR−aR| + 1 cells.
- *
- * WHY skip (bQ,aR) in the r-leg: pool_place already placed it in the q-leg.
- * Double-counting would not duplicate (pool_place deduplicates), but skipping
- * is clearer and avoids the redundant search.
+ * Stamp an L-shaped path: go straight along one axis to line up with B, turn
+ * once at the corner, then go straight along the other axis to reach B. The
+ * second leg starts just past the corner so we don't stamp it twice.
  */
 static void path_lpath(Pool *pool, int aQ, int aR, int bQ, int bR,
                         char glyph)
 {
-    /* q-axis leg: traverse from (aQ,aR) to (bQ,aR) */
+    /* First leg: slide along q until we're under B, keeping r fixed. */
     int dQ = (bQ >= aQ) ? 1 : -1;
     for (int q = aQ; q != bQ + dQ; q += dQ)
         pool_place(pool, q, aR, glyph);
-    /* r-axis leg: traverse from (bQ,aR+dR) to (bQ,bR) — skips corner */
+    /* Second leg: slide along r up to B, starting one past the shared corner. */
     if (aR != bR) {
         int dR = (bR >= aR) ? 1 : -1;
         for (int r = aR + dR; r != bR + dR; r += dR)
@@ -544,21 +360,25 @@ static void path_lpath(Pool *pool, int aQ, int aR, int bQ, int bR,
     }
 }
 
-/* ── end §7 — for scatter placement strategies, read 04_hex_scatter.c §7 */
+/* For scatter-placement strategies, see 04_hex_scatter.c §7. */
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 scene ── */
 
+/* Which of the three path shapes is active. */
 typedef enum { PATH_LINE=0, PATH_RING=1, PATH_LPATH=2, N_PATH=3 } PathMode;
 
 static const char *PATH_NAME[N_PATH] = { "line", "ring", "lpath" };
 
+/*
+ * The current state of the demo: which path mode we're in, the ring size, and
+ * the two endpoints the user has pinned down. has_a / has_b say whether each
+ * endpoint has actually been set yet; until then we fall back to the cursor.
+ */
 typedef struct {
     PathMode path_mode;
-    int      ring_n;       /* radius for RING mode */
-    int      has_a; int aQ, aR;   /* fixed endpoint A ('a' key) */
-    int      has_b; int bQ, bR;   /* fixed endpoint B ('b' key) */
+    int      ring_n;              /* ring radius, only used in ring mode */
+    int      has_a; int aQ, aR;   /* start point A, set with the 'a' key */
+    int      has_b; int bQ, bR;   /* end point B, set with the 'b' key   */
 } SceneCfg;
 
 static void cfg_init(SceneCfg *cfg)
@@ -569,7 +389,7 @@ static void cfg_init(SceneCfg *cfg)
     cfg->has_b = 0; cfg->bQ = 0; cfg->bR = 0;
 }
 
-/* endpoint_marker — render a letter marker at a fixed endpoint hex. */
+/* Draw the 'A' or 'B' letter on the hex the user pinned down. */
 static void endpoint_marker(const GridCtx *g, int q, int r,
                              int pair, char label)
 {
@@ -582,8 +402,8 @@ static void endpoint_marker(const GridCtx *g, int q, int r,
     }
 }
 
-/* preview_dot — draw a single '.' at hex (q, r) if visible.  Caller owns the
- * COLOR_PAIR attron/attroff so all dots in a preview share one attribute set. */
+/* Put one '.' on a hex if it's on screen. The caller sets the colour once and
+ * leaves it on, so a whole preview shares the same attribute. */
 static void preview_dot(const GridCtx *g, int q, int r)
 {
     int col, row;
@@ -592,7 +412,7 @@ static void preview_dot(const GridCtx *g, int q, int r)
         mvaddch(row, col, '.');
 }
 
-/* Mirror path_line's lerp+round walk; only A→B is previewed (no-op without A). */
+/* Same walk as path_line, but drawn as dots. Does nothing until A is set. */
 static void preview_line_draw(const GridCtx *g, const SceneCfg *cfg,
                                int bQ, int bR)
 {
@@ -607,7 +427,7 @@ static void preview_line_draw(const GridCtx *g, const SceneCfg *cfg,
     }
 }
 
-/* Mirror path_ring's HEX6 walk; ring is always centered on the live cursor. */
+/* Same walk as path_ring, drawn as dots, always centred on the live cursor. */
 static void preview_ring_draw(const GridCtx *g, const Cursor *cur,
                                const SceneCfg *cfg)
 {
@@ -626,8 +446,8 @@ static void preview_ring_draw(const GridCtx *g, const Cursor *cur,
     }
 }
 
-/* Mirror path_lpath's q-leg-then-r-leg walk; r-leg starts at aR+dR to skip the
- * shared corner cell (bQ, aR) already drawn by the q-leg. */
+/* Same walk as path_lpath, drawn as dots; the second leg starts past the
+ * corner so the turn isn't drawn twice. */
 static void preview_lpath_draw(const GridCtx *g, const SceneCfg *cfg,
                                 int bQ, int bR)
 {
@@ -643,11 +463,9 @@ static void preview_lpath_draw(const GridCtx *g, const SceneCfg *cfg,
 }
 
 /*
- * path_preview_draw — show in bright green where SPACE would stamp.
- *
- * Uses the same algorithm as the stamp functions but draws '.' at each
- * hex centre instead of committing to the pool.  B falls back to cursor
- * when not explicitly fixed ('b' not yet pressed).
+ * Show, in green dots, exactly where SPACE would stamp right now. If B hasn't
+ * been pinned with 'b', the cursor stands in for it so the preview follows the
+ * '@' as you move.
  */
 static void path_preview_draw(const GridCtx *g, const Cursor *cur,
                                const SceneCfg *cfg)
@@ -667,7 +485,7 @@ static void path_preview_draw(const GridCtx *g, const Cursor *cur,
 
 static void scene_stamp(Pool *pool, const Cursor *cur, const SceneCfg *cfg)
 {
-    /* B falls back to cursor when 'b' has not been pressed */
+    /* If B was never pinned, treat the cursor as B. */
     int bQ = cfg->has_b ? cfg->bQ : cur->q;
     int bR = cfg->has_b ? cfg->bR : cur->r;
     char glyph = (cfg->path_mode == PATH_LINE)  ? '*' :
@@ -688,7 +506,7 @@ static void scene_stamp(Pool *pool, const Cursor *cur, const SceneCfg *cfg)
     }
 }
 
-/* Bright bold yellow fps readout (top-right) + bold cyan key hints (bottom). */
+/* Status line top-right (mode, endpoints, fps) and key hints along the bottom. */
 static void hud_draw(const GridCtx *g, const Pool *p, const SceneCfg *cfg,
                       double fps)
 {
@@ -732,9 +550,7 @@ static void scene_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -747,9 +563,7 @@ static void screen_init(void)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §10 app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §10 app ── */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 

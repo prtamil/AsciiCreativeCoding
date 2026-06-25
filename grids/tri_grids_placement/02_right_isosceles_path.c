@@ -1,139 +1,17 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 02_right_isosceles_path.c — line-of-sight path on the half-rect grid
+ * 02_right_isosceles_path.c — draw a straight-line path across a triangle grid.
  *
- * DEMO: Two markers — START (green S) and END (red E) — sit on a square
- *       grid bisected by '\' diagonals into UR / LL right-isosceles
- *       triangles. Move '@' with arrows; press 's' to set START at the
- *       cursor, 'e' to set END. The path between markers is computed by
- *       walking pixel coordinates along the centroid-to-centroid line
- *       and recording which triangle each sampled pixel lies in.
+ * The screen is graph paper where each square is sliced by a '\' into two
+ * right triangles. Move the '@' cursor, drop a START and an END marker, and
+ * the program lights up every triangle a straight line between them passes
+ * through — like stretching a string from S to E and seeing which tiles it
+ * crosses.
  *
- * Study alongside: 02_right_isosceles_direct.c (manual placement),
- *                  grids/tri_grids/02_right_isosceles.c (rasterizer),
- *                  01_equilateral_path.c (same idea on equilateral grid).
- *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, TRI_SIZE, MAX_OBJ
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 7 pairs: edge / cursor / start / end / path / HUD / hint
- *   §4 gridctx  — GridCtx + pixel/centroid/edge formula
- *   §5 pool     — Pool: place / find / clear / draw
- *   §6 cursor   — Cursor + TRI_DIR + reset / move / draw + marker
- *   §7 path     — pixel walk between two centroids → triangle list
- *   §8 scene    — hud_draw + scene_draw
- *   §9 screen   — ncurses init / cleanup
- *  §10 app      — signals, main loop
- *
- * Keys:  arrows:move  s:set-start  e:set-end  spc:clear-path
- *        +/-:size  t:theme  r:reset  q/ESC:quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/02_right_isosceles_path.c \
- *       -o 02_right_isosceles_path -lncurses -lm
+ * Sister files: 02_right_isosceles_direct.c (place tiles by hand),
+ *               grids/tri_grids/02_right_isosceles.c (the grid renderer),
+ *               01_equilateral_path.c (same idea, equilateral grid).
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Line-rasterize between two centroids in PIXEL space;
- *                  for each sampled pixel, ask pixel_to_tri "which UR/LL
- *                  triangle am I in?" and record uniques. The result is
- *                  the ordered set of right-isosceles triangles traversed
- *                  by the straight line — a "line of sight" path.
- *
- * Data-structure : Pool — flat array of Obj{col, row, up, glyph, alive}.
- *                  pool_place deduplicates via pool_find (linear scan;
- *                  fine because paths stay short for any visible line).
- *
- * Why pixel walk : Graph BFS on the half-rect lattice would also work,
- *                  but the pixel-walk is simpler and produces an
- *                  intuitively "straight" path. Adjacent path entries
- *                  always differ by exactly one edge crossing.
- *
- * Sampling step  : The pixel walk samples every ~size/4 pixels — fine
- *                  enough that a unit-square triangle is never skipped.
- *
- * References     :
- *   Bresenham line — https://en.wikipedia.org/wiki/Bresenham%27s_line_algorithm
- *   Line-of-sight on grids — Red Blob Games
- *   Half-rect tiling — https://en.wikipedia.org/wiki/Triangular_tiling
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Stretch a string from S to E on graph-paper-with-diagonals. The path
- * is the ordered list of half-squares the string passes through. We
- * find that list by walking the string in pixel space and asking the
- * SAME pixel→lattice formula the grid uses, "which triangle owns this
- * point?" — every unique answer joins the path.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * The grid is square cells split by '\'. Above the diagonal lives UR
- * (up=1), below lives LL (up=0). The cursor walks half-squares; START
- * and END pin two of them. The path is rediscovered each time a marker
- * moves — no stored topology, just a fine 1-D scan through the same
- * pixel_to_tri the renderer uses.
- *
- * DRAWING METHOD  (per frame)
- * ──────────────
- *  1. erase()
- *  2. ctx_draw_bg — raster scan: pixel_to_tri → tri_edge_char ('|', '_',
- *     '\\') when min weight < border_w.
- *  3. pool_draw — '*' at each Pool entry's centroid screen cell.
- *  4. marker_draw — 'S' at start (if has_start), 'E' at end.
- *  5. cursor_draw — '@' at the cursor address.
- *
- *  path_compute runs only on START/END change or size change.
- *
- * KEY FORMULAS
- * ────────────
- *  Pixel → lattice  (axis-aligned, no shear):
- *    a = px / size,   b = py / size
- *    col = ⌊a⌋,       row = ⌊b⌋
- *    fa  = a - col,   fb  = b - row
- *    up  = (fa ≥ fb) ? UR : LL
- *
- *  Centroid lattice → pixel:
- *    UR centroid:  a = col + 2/3,  b = row + 1/3
- *    LL centroid:  a = col + 1/3,  b = row + 2/3
- *    px = a · size,   py = b · size
- *
- *  Walk parameters:
- *    dx = ex - sx,   dy = ey - sy
- *    dist = sqrt(dx² + dy²)
- *    step = tri_size · 0.25
- *    n    = floor(dist / step) + 1
- *
- *  Walk loop:
- *    for i in 0..n:
- *      t  = i / n
- *      px = sx + t·dx,  py = sy + t·dy
- *      pixel_to_tri(px, py) → (tC, tR, tU)
- *      pool_place(tC, tR, tU)         // dedup via pool_find
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Zero-length: when start == end, dist < 1e-6 returns early after
- *    adding the start triangle.
- *  • Sampling step: size/4 is fine for any reasonable angle; relaxing
- *    to size/2 risks skipping a triangle the line crosses corner-on.
- *  • MAX_OBJ cap: a long path can saturate; further entries are
- *    silently dropped.
- *  • Recompute on size change: '+'/'-' must call path_compute,
- *    otherwise stored centroids drift.
- *
- * HOW TO VERIFY
- * ─────────────
- *  Set START and END at the same triangle: path size = 1. Move END one
- *  edge away (LEFT/RIGHT/UP/DOWN once): path size = 2. A purely
- *  vertical line of length L pixels crosses ≈ L/size unit squares,
- *  each contributing 1–2 entries depending on angle.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -146,9 +24,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config — sizes, colors, and other knobs ── */
 
 #define TARGET_FPS 60
 #define CELL_W 2
@@ -171,9 +47,7 @@
 #define PAIR_HUD    6
 #define PAIR_HINT   7
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock — read the time and sleep to pace frames ── */
 
 static int64_t clock_ns(void)
 {
@@ -188,9 +62,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color — themes and the color slots we draw with ── */
 
 static const short THEME_FG[N_THEMES][3] = {
     {  75,  82, 196 }, {  39, 226, 207 }, { 207,  82,  39 }, {  15,  82, 196 },
@@ -217,19 +89,24 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx — half-rect lattice                                         */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx — the grid itself, plus the math that maps points to triangles ── */
 
+/* Everything the program needs to know about the current grid and the two
+ * markers on it. One of these lives for the whole run; the keypress handlers
+ * and the drawing code all read and tweak it. */
 typedef struct {
-    int    rows, cols;
-    double tri_size;
-    int    cell_w, cell_h;
-    int    ox, oy;
-    double border_w;
-    int    theme;
-    int    paused;
+    int    rows, cols;        /* screen size in terminal cells */
+    double tri_size;          /* width of one grid square in pixels; bigger = zoom in */
+    int    cell_w, cell_h;    /* how many pixels one terminal cell stands for (chars are tall) */
+    int    ox, oy;            /* screen cell the grid's origin sits at, so it stays centered */
+    double border_w;          /* how close to a triangle's edge a point must be to draw a line */
+    int    theme;             /* which color theme is active (0..N_THEMES-1) */
+    int    paused;            /* unused toggle kept for the 'p' key */
+
+    /* The START marker: which triangle it sits in. up=1 is the upper triangle
+     * of a square, up=0 the lower one. has_start says whether it's been placed. */
     int    sCol, sRow, sUp;
+    /* The END marker, same layout as START. */
     int    eCol, eRow, eUp;
     int    has_start, has_end;
 } GridCtx;
@@ -258,6 +135,11 @@ static void ctx_resize(GridCtx *g, int rows, int cols)
     g->ox = cols / 2; g->oy = (rows - 1) / 2;
 }
 
+/* Given a point in pixels, work out which triangle it falls in. The square is
+ * (col, row); whether you're above or below the '\' diagonal decides the half
+ * (up). fa/fb are how far into the square you are, handed back so the caller
+ * can tell how close to an edge you are. This is the one bit of math the grid
+ * drawing and the path finder both rely on, so they always agree. */
 static void pixel_to_tri(double px, double py, double size,
                          int *col, int *row, int *up,
                          double *fa, double *fb)
@@ -323,11 +205,14 @@ static void ctx_draw_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_BORDER));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool — the list of triangles that make up the path ── */
 
+/* One triangle on the path: which square (col, row), which half (up), the
+ * character to draw, and whether it's in use. */
 typedef struct { int col, row, up; char glyph; bool alive; } Obj;
+
+/* The whole path as a plain fixed-size array — no malloc, just fill from the
+ * front. count is how many slots are used; entries past it are ignored. */
 typedef struct { Obj items[MAX_OBJ]; int count; } Pool;
 
 static int pool_find(const Pool *p, int col, int row, int up)
@@ -364,12 +249,16 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_PATH) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 cursor — the '@' you move, and the S/E markers ── */
 
+/* The '@' you steer: which square (col, row) and which half of it (up). */
 typedef struct { int col, row, up; } Cursor;
 
+/* How one arrow press moves the cursor. Moving off a triangle usually just
+ * flips to its neighbor inside the same square, but sometimes you step into
+ * the next square — so the move depends on which half you're standing in.
+ * Indexed [direction][current up], giving {dcol, drow, new up}.
+ * Directions: 0=left 1=right 2=up 3=down. */
 static const int TRI_DIR[4][2][3] = {
     { { -1,  0,  1 }, {  0,  0,  0 } },
     { {  0,  0,  1 }, { +1,  0,  0 } },
@@ -412,9 +301,7 @@ static void marker_draw(const GridCtx *g, int col, int row, int up,
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  path                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 path — find every triangle the S→E line touches ── */
 
 static void path_compute(Pool *p, const GridCtx *g)
 {
@@ -437,9 +324,7 @@ static void path_compute(Pool *p, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 scene — draw one full frame ── */
 
 static void hud_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
                      double fps)
@@ -472,9 +357,7 @@ static void scene_draw(const GridCtx *g, const Pool *p, const Cursor *cur, doubl
     wnoutrefresh(stdscr); doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 screen — start and stop ncurses ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(int theme)
@@ -485,9 +368,7 @@ static void screen_init(int theme)
     color_init(theme); atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §10 app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §10 app — signals, keys, and the main loop ── */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 static void on_signal(int s)

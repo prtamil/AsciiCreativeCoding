@@ -1,134 +1,15 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 03_fine_dense.c — tight small-cell rectangular grid
+ * 03_fine_dense.c — a rectangular grid drawn with the smallest cells that
+ * still leave room inside. Same drawing math as 01_uniform_rect.c, but the
+ * cells are tiny (4 chars wide, 2 tall), so the screen fills up with many
+ * more of them. The point: how packed the grid looks is just the cell size.
  *
- * DEMO: Same formula as 01_uniform_rect but CELL_W=4, CELL_H=2 — the
- *       minimum usable cell size. With cells this small the grid fills
- *       the terminal with many more rows and columns, demonstrating how
- *       parameter choice alone controls grid density.
+ * Sister files: 01_uniform_rect.c (the base version), 04_coarse_sparse.c
+ * (the opposite — big roomy cells).
  *
- * Study alongside: 01_uniform_rect.c (base), 04_coarse_sparse.c (large)
- *
- * Section map:
- *   §1 config   — CELL_W=4, CELL_H=2, EWMA constant
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — grid / active / cursor / HUD / HINT pairs
- *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_grid_char / ctx_draw_bg
- *   §5 cursor   — Cursor + cursor_reset / cursor_move / cursor_draw
- *   §6 scene    — hud_draw + scene_draw
- *   §7 screen   — ncurses init / cleanup
- *   §8 app      — signals, main loop
- *
- * Keys:  arrows move @   r reset   q/ESC quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/rect_grids/03_fine_dense.c \
- *       -o 03_fine_dense -lncurses
+ * Move the '@' with the arrow keys, r resets it, q or ESC quits.
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Identical to 01_uniform_rect. Only CELL_W and CELL_H
- *                  change. This file exists to show how the same formula
- *                  produces a completely different visual density.
- *
- * Minimum cell   : With CELL_H=2 and CELL_W=4 the interior of each cell
- *                  (inside the border lines) is exactly 1 row × 3 cols.
- *                  Going smaller would leave no interior space — the lines
- *                  would touch and the grid would become unreadable.
- *
- * Cell count     : On an 80×24 terminal:
- *                    cols / CELL_W = 80 / 4 = 20 columns
- *                    rows / CELL_H = 22 / 2 = 11 rows  (220 cells total)
- *                  Compare to 01_uniform_rect (8×4): 10 × 5 = 50 cells.
- *                  Same formula, 4.4× more cells just from halving cell size.
- *
- * Cursor cell    : With CELL_H=2 the interior is only 1 row tall.
- *                  The '@' sits on the single interior row; no dot fill.
- *
- * References     :
- *   Resolution vs cell-size tradeoff — any grid-game design article
- *   Same formula as 01_uniform_rect — see §4 there for full derivation
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * The formula is IDENTICAL to 01_uniform_rect.  Only the constants differ.
- * This file exists to teach one thing: grid density is purely a function of
- * cell size.  Halving cell size quadruples the number of cells on screen.
- * No structural change — just a parameter change.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Think of cell size as a zoom level.  Large cells = zoomed out (few cells,
- * lots of interior space per cell).  Small cells = zoomed in (many cells,
- * tiny interior).  The same formula renders both; you just dial CELL_W/H.
- *
- * Density formula:   cells_on_screen = (COLS / CELL_W) * ((LINES-1) / CELL_H)
- *   CELL_W=8, CELL_H=4  on 80×24:  10 *  5 =  50 cells
- *   CELL_W=4, CELL_H=2  on 80×24:  20 * 11 = 220 cells    (4.4× more)
- *   CELL_W=2, CELL_H=1  on 80×24:  40 * 23 = 920 cells    (18× more!)
- *
- * DRAWING METHOD
- * ──────────────
- *  Exactly as in 01_uniform_rect.  The only decision is choosing CELL_W/H:
- *
- *  1. Decide the MINIMUM acceptable interior space per cell:
- *       interior_rows = CELL_H - 1      (rows inside the borders)
- *       interior_cols = CELL_W - 1
- *     For just a single char of interior: CELL_H=2, CELL_W=2.
- *     For a small '.' dot interior:       CELL_H=2, CELL_W=4 (3 interior cols).
- *
- *  2. Draw using the standard modular test.
- *
- *  3. For the cursor cell: with CELL_H=2, interior is only 1 row.
- *     Place '@' in that single interior row at the column centre.
- *     There is no room for '.' fill; just the '@' character.
- *
- * KEY FORMULAS
- * ────────────
- *  Same as 01.  The relationship to understand:
- *
- *  Interior size:
- *    interior_rows = CELL_H - 1      (CELL_H=2 -> 1 interior row)
- *    interior_cols = CELL_W - 1      (CELL_W=4 -> 3 interior cols)
- *
- *  First interior position of cell (r, c):
- *    first_interior_row = r * CELL_H + 1
- *    first_interior_col = c * CELL_W + 1
- *
- *  '@' placement (centre of interior row):
- *    at_row = r * CELL_H + 1              (CELL_H=2: only row available)
- *    at_col = c * CELL_W + CELL_W / 2
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • CELL_H=1: the horizontal line IS the only row.  There is NO interior.
- *    Every row is a grid line — you cannot place '@' in the interior.
- *    Minimum: CELL_H=2 so you have at least 1 interior row.
- *
- *  • CELL_W=2: interior is 1 col wide — you can fit exactly one character.
- *    CELL_W=3: interior is 2 cols — you can fit '@' but not a label.
- *    CELL_W=4: interior is 3 cols — fits '@' centred and one space each side.
- *
- *  • Dense grids and ncurses performance: at CELL_W=2, CELL_H=1 you call
- *    mvaddch() for nearly every screen position.  On slow terminals this
- *    can reduce FPS.  Use erase() not clear(), and wnoutrefresh/doupdate
- *    to minimise actual writes.
- *
- *  • Cursor bounds recomputation after resize: the dense grid has many more
- *    cells, so resizing is more likely to need cursor_reset().
- *
- * HOW TO VERIFY
- * ─────────────
- *  Count '+' characters in the top row (sr=0).  With CELL_W=4 on 80 cols:
- *  '+' at cols 0, 4, 8, 12, ..., 76, 80 → 21 corners in row 0.
- *  Formula: floor(COLS / CELL_W) + 1 = 80/4 + 1 = 21. ✓
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
@@ -140,33 +21,30 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS  30
 
 /*
- * CELL_W=4, CELL_H=2 — smallest useful cell.
- * Interior = (CELL_H-1)=1 row × (CELL_W-1)=3 cols.
- * Halving either value below this erases the cell interior entirely.
+ * The cell size, in screen characters: 4 wide, 2 tall. This is about as
+ * small as it gets — one cell has a border on every side and exactly one
+ * blank row by three blank cols inside. Shrink either number and there's
+ * no room left inside the borders for the '@'.
  */
 #define CELL_W  4
 #define CELL_H  2
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How heavily to smooth the FPS number on screen so it doesn't jitter. */
 #define FPS_EWMA_ALPHA  0.05
 
-/* Color pair IDs */
-#define PAIR_GRID    1   /* dim grid lines               */
-#define PAIR_ACTIVE  2   /* highlighted cell fill        */
-#define PAIR_CURSOR  3   /* bright '@'                   */
+/* Color slots */
+#define PAIR_GRID    1   /* the grid lines               */
+#define PAIR_ACTIVE  2   /* the cell the '@' sits in     */
+#define PAIR_CURSOR  3   /* the '@' itself               */
 #define PAIR_HUD     4   /* status bar (yellow)          */
 #define PAIR_HINT    5   /* key-hint footer (cyan)       */
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -181,14 +59,13 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static void color_init(void)
 {
     start_color(); use_default_colors();
-    /* Dimmer grid color — with dense lines a bright color overwhelms */
+    /* Grid lines get a calmer color — there are so many of them that a
+     * bright one would drown out the '@'. */
     init_pair(PAIR_GRID,   COLORS >= 256 ?  75 : COLOR_BLUE,   -1);
     init_pair(PAIR_ACTIVE, COLORS >= 256 ?  82 : COLOR_GREEN,  -1);
     init_pair(PAIR_CURSOR, COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
@@ -196,22 +73,20 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx and the cell ↔ screen mapping                    */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula ── */
 
 /*
- * GridCtx — geometry of the active grid plus cursor bounds.
- * Same shape as 01_uniform_rect; only the cw/ch values differ.
+ * GridCtx — everything we need to know about the grid on screen right now:
+ * how big the terminal is, how big one cell is, and how far the '@' is
+ * allowed to roam. Recomputed whenever the window changes size.
  */
 typedef struct {
-    /* terminal extent */
-    int rows, cols;
+    int rows, cols;   /* size of the terminal, in characters             */
+    int cw, ch;       /* one cell's width and height, in characters      */
 
-    /* cell size in screen characters */
-    int cw, ch;
-
-    /* cursor bounds — last whole cell that fits in (rows-1) × cols */
+    /* The highest cell row/col the '@' can land on — the last whole cell
+     * that still fits. We leave the bottom row free for the key hints,
+     * so the usable height is rows-1, not rows. */
     int max_r, max_c;
 } GridCtx;
 
@@ -223,25 +98,17 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->max_c = cols / CELL_W - 1;
 }
 
-/*
- * ctx_to_screen — THE FORMULA (unchanged from 01_uniform_rect):
- *
- *   screen_row = r * ch    (= r * 2)
- *   screen_col = c * cw    (= c * 4)
- */
+/* Turn a cell's (row, col) into where its top-left corner sits on screen:
+ * just multiply by the cell size. Cell 0 starts at the very top-left. */
 static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
     *sr = r * g->ch;
     *sc = c * g->cw;
 }
 
-/*
- * ctx_grid_char — unchanged from 01:
- *   sr % ch == 0  →  horizontal line
- *   sc % cw == 0  →  vertical line
- *
- * Every 2nd row and every 4th column is a grid line.
- */
+/* Decide what character belongs at one screen spot. Every cell-height row
+ * is a horizontal line, every cell-width column is a vertical line; where
+ * they cross we draw a corner, and everywhere else is blank. */
 static char ctx_grid_char(const GridCtx *g, int sr, int sc)
 {
     bool h = (sr % g->ch == 0);
@@ -264,10 +131,9 @@ static void ctx_draw_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_GRID));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 cursor ── */
 
+/* Cursor — which cell the '@' is currently in, as a (row, col) pair. */
 typedef struct { int r, c; } Cursor;
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
@@ -283,10 +149,9 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
     if (nc >= 0 && nc <= g->max_c) cur->c = nc;
 }
 
-/*
- * cursor_draw — CELL_H=2: interior is exactly row sr+1, cols sc+1..sc+3
- * Place '@' at centre of that single interior row.
- */
+/* Because cells are only 2 tall, each one has just a single blank row
+ * inside. We fill that row across with dashes to highlight the cell, then
+ * drop the '@' in the middle of it. */
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc;
@@ -297,15 +162,13 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
         mvaddch(sr + 1, sc + dc, (chtype)'-');
     attroff(COLOR_PAIR(PAIR_ACTIVE));
 
-    /* '@' at centre of interior */
+    /* the '@', centred on that one interior row */
     attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
     mvaddch(sr + 1, sc + g->cw / 2, (chtype)'@');
     attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
 {
@@ -333,9 +196,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(void)
@@ -346,9 +207,7 @@ static void screen_init(void)
     color_init(); atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 static void on_signal(int s)

@@ -1,165 +1,21 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 10_pinwheel.c — pinwheel-inspired 5-way substitution of a 1-2-√5 triangle
+ * 10_pinwheel.c — a triangle that keeps splitting into 5 smaller copies of
+ * itself, over and over, making a busy pinwheel-like pattern of nested
+ * rotated triangles. Press +/- to add or remove layers of detail.
  *
- * DEMO: A right triangle with legs 1 and 2 (hypotenuse √5) is recursively
- *       split into 5 sub-triangles. The split combines the standard 4-way
- *       midpoint subdivision with one extra cut: the inverted centre
- *       child is bisected by its altitude from the right-angle vertex.
- *       Use +/- to change recursion depth (0..6); leaf count grows as 5^N.
+ * The starting shape is a right triangle whose legs are 1 and 2 (so the
+ * long side is √5). Every split makes 5 children that are all the same
+ * 1-2-√5 shape, just smaller and turned. This is loosely inspired by the
+ * real pinwheel tiling, but simplified — see the note in §5 for how it
+ * differs from the strict version.
  *
- * Study alongside: 08_triforce.c — the underlying 4-way midpoint split.
- *                  12_penrose.c — another aperiodic substitution but
- *                  with golden-ratio (φ) splits and 2 prototiles.
- *                  ../README.md — GridCtx primitive (this file builds a
- *                  mesh on demand instead of a per-pixel inverse).
- *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, DEPTH, SIZE_FRAC, EWMA constant
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — depth-keyed palette + HUD / hint
- *   §4 formula  — GridCtx + ctx_init + slope_char + Bresenham line_draw
- *                 + foot_perp helper
- *   §5 mesh     — 5-way recursive subdivide
- *                 (no Cursor — depth is the user-controlled parameter,
- *                  arrow keys go unused; +/- adjusts depth instead)
- *   §6 scene    — hud_draw + scene_draw (1-2-√5 seed + recursion)
- *   §7 screen   — ncurses init / cleanup
- *   §8 app      — signals, main loop
- *
- * Keys:  +/- depth   [/] size   r reset   t theme   p pause   q/ESC quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids/10_pinwheel.c \
- *       -o 10_pinwheel -lncurses -lm
+ * Sister files: 08_triforce.c (the plain 4-way split this builds on) and
+ *               12_penrose.c (another never-repeating tiling, golden-ratio).
+ * References:   pinwheel tiling — https://en.wikipedia.org/wiki/Pinwheel_tiling
+ *               Radin, "The Pinwheel Tilings of the Plane" (1994)
+ *               Conway & Radin, "Quaquaversal Tilings and Rotations" (1998)
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : "Pinwheel-style" substitution of a 1-2-√5 right triangle.
- *                  Step:
- *                    1. Compute midpoints M01, M12, M20 — the standard
- *                       4-way midpoint subdivision.
- *                    2. The inverted centre child (M01, M12, M20) is
- *                       similar to the parent. Find its right-angle vertex
- *                       and the foot of perpendicular F to the opposite
- *                       hypotenuse. Split the centre into halves using F.
- *                    3. Emit 5 children: 3 corner triangles + 2 altitude
- *                       halves of the centre.
- *                  All 5 children are similar to the parent (1:2:√5 ratio).
- *
- * Data-structure : GridCtx carries the recursion parameters (depth,
- *                  size_frac) and screen extent. No persistent mesh array
- *                  — the recursion emits each leaf's edges directly into
- *                  the framebuffer. See ../README.md "The two primitives".
- *
- * NOTE: This is NOT strict Conway-Radin pinwheel. The original uses 5
- *       IDENTICALLY-scaled children at scale 1/√5 with specific rotations
- *       of arctan(1/2). This file uses a related substitution where the
- *       5 children are similar but at TWO scales (1/2 for the corners,
- *       1/√5 and 1/(2√5) for the altitude halves). Visually it's just as
- *       aperiodic-looking; the difference is bookkeeping not topology.
- *
- * Formula        : Midpoints + foot of perpendicular (see §4 foot_perp).
- *                  Recursion depth controlled by +/- keys (0..6).
- *
- * Edge chars     : Same Bresenham + slope_char as 07/08/09. Color keyed
- *                  to depth.
- *
- * Movement       : None — depth is the user-controlled parameter.
- *
- * References     :
- *   Pinwheel tiling — https://en.wikipedia.org/wiki/Pinwheel_tiling
- *   Radin, "The Pinwheel Tilings of the Plane" (1994)
- *   Conway & Radin, "Quaquaversal Tilings and Rotations" (1998)
- *   Sadun, "Topology of Tiling Spaces" (2008) §1
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Take a 1-2-√5 right triangle. Apply midpoint subdivision (4 children).
- * The inverted centre child is itself a 1-2-√5 right triangle — split it
- * once more along its altitude from the right-angle corner. Net: 5 child
- * triangles per parent, all similar to the parent. Recurse on each.
- *
- * Why "pinwheel-inspired"? The strict Conway-Radin pinwheel rule produces
- * 5 children of EQUAL size with rotations of arctan(1/2) ≈ 26.57°
- * relative to the parent. That irrational rotation is what makes the
- * tiling truly aperiodic and produces the famous pinwheel pattern. Our
- * simpler 4+1-cut rule keeps the 5-way fan-out and the visual character
- * of nested rotated triangles, but loses the equal-size constraint.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * At every depth, the inverted centre child is a 1-2-√5 right triangle
- * rotated 180° from the parent. Cutting it along its altitude from the
- * right angle slices it into TWO smaller 1-2-√5 right triangles (a known
- * property of right triangles: the altitude from the right angle to the
- * hypotenuse splits the triangle into two similar to itself). So now we
- * have 3 corner children + 2 altitude halves = 5, all 1-2-√5.
- *
- * The corner children are at scale 1/2; the altitude halves are at
- * scales 1/√5 and 1/(2√5) respectively (corresponding to the cosine and
- * sine of the smaller acute angle).
- *
- * DRAWING METHOD  (recursive emit)
- * ──────────────
- *  1. Pick DEPTH and SIZE_FRAC.
- *  2. Build seed triangle as 3 (x, y) pixel coords (legs along screen axes,
- *     right angle at the lower-right corner — convention: v[1] is the
- *     right-angle vertex).
- *  3. subdivide(t, depth):
- *       if depth == max_depth: draw 3 edges
- *       else:
- *         compute 3 midpoints
- *         build 3 corner children (scale 1/2)
- *         compute foot of altitude from m20 to hypotenuse m01-m12
- *         build 2 altitude halves
- *         recurse on all 5
- *  4. Bresenham line_draw per leaf edge.
- *
- * KEY FORMULAS
- * ────────────
- *  Midpoints:
- *    M01 = (V0+V1)/2,  M12 = (V1+V2)/2,  M20 = (V2+V0)/2
- *
- *  Foot of perpendicular from point P to line segment AB:
- *    t = ((P − A) · (B − A)) / |B − A|²
- *    F = A + t · (B − A)
- *
- *  Five children:
- *    Corner-V0:  (V0, M01, M20)        — scale 1/2
- *    Corner-V1:  (M01, V1, M12)        — scale 1/2
- *    Corner-V2:  (M20, M12, V2)        — scale 1/2
- *    Centre half 1:  (M20, M01, F)     — scale 1/√5
- *    Centre half 2:  (M20, F,   M12)   — scale 1/(2√5)
- *
- *  Leaf count at depth N: 5^N
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • The inverted centre's right angle is at M20 (opposite the longest
- *    side M01-M12). The altitude from M20 lands somewhere on M01-M12;
- *    foot_perp computes that exactly.
- *  • Different child scales mean the recursion at depth N has a mix of
- *    triangle sizes — UNLIKE 08_triforce where all leaves at depth N
- *    are the same size. Visual gives more variety.
- *  • 5^6 = 15625 leaves; 5^7 = 78125 — too slow at 60 fps. DEPTH_MAX = 6.
- *
- * HOW TO VERIFY
- * ─────────────
- *  At depth 0: 1 leaf — the seed 1-2-√5 right triangle.
- *  At depth 1: 5 leaves — 3 corner + 2 altitude halves of the centre.
- *  At depth 2: 25 leaves; visible aperiodic-ish pattern.
- *  Leaf count formula: 5^N.
- *
- *  The hypotenuse of every leaf at depth N is ≈ √5/2^N (for corner
- *  children) or various rational multiples thereof (for altitude halves).
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -176,9 +32,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 
@@ -197,16 +51,15 @@
 #define MAX_DEPTH_LEVELS (DEPTH_MAX + 1)
 #define N_THEMES         3
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How much each new frame nudges the on-screen fps number, so it reads
+ * steady instead of jittering. Smaller = smoother but slower to react. */
 #define FPS_EWMA_ALPHA 0.05
 
 #define PAIR_DEPTH_BASE  1
 #define PAIR_HUD        (PAIR_DEPTH_BASE + MAX_DEPTH_LEVELS)
 #define PAIR_HINT       (PAIR_HUD + 1)
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -223,9 +76,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static const short PAL256[N_THEMES][MAX_DEPTH_LEVELS] = {
     /* spin   */ { 15, 39, 82, 226, 207, 196, 21 },
@@ -253,20 +104,19 @@ static void color_init(int theme)
     init_pair(PAIR_HINT, COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx + slope_char + Bresenham line + foot_perp         */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula ── */
 
 /*
- * GridCtx — geometry + recursion parameters for the substitution mesh.
- * See 07_barycentric.c for the canonical version of this struct.
+ * GridCtx — everything the drawing code needs to know about the screen
+ * and how detailed the pattern should be. Built fresh each frame so it
+ * always matches the current terminal size. (Same struct as 07_barycentric.c.)
  */
 typedef struct {
-    int    rows, cols;
-    int    cw, ch;
-    int    ox, oy;
-    int    depth;
-    double size_frac;
+    int    rows, cols;   /* terminal size, in character cells */
+    int    cw, ch;       /* size of one cell in sub-pixels (width, height) */
+    int    ox, oy;       /* sub-pixel coords of screen centre, where we anchor */
+    int    depth;        /* how many times to split (more = finer detail) */
+    double size_frac;    /* how much of the screen the whole figure fills, 0..1 */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols, int depth, double size_frac)
@@ -311,13 +161,10 @@ static void line_draw(const GridCtx *g, double px0, double py0,
 }
 
 /*
- * foot_perp — foot of perpendicular from point P to segment AB.
- *
- * THE FORMULA:
- *   t = ((P − A) · (B − A)) / |B − A|²
- *   F = A + t · (B − A)
- *
- * Used to find the altitude foot on the hypotenuse of the inverted centre.
+ * foot_perp — given a point P and a line through A and B, find the spot on
+ * that line directly "below" P (the closest point on the line to P). We use
+ * it to find where a straight drop from the centre triangle's corner lands
+ * on its long side — that's the cut that splits the centre into two halves.
  */
 static void foot_perp(double Px, double Py,
                       double Ax, double Ay, double Bx, double By,
@@ -330,20 +177,16 @@ static void foot_perp(double Px, double Py,
     *Fy = Ay + tt * dy;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  mesh — pinwheel-style 5-way subdivide                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 mesh ── */
 /*
- * No Cursor struct: as in 07/08/09, the user navigates by changing DEPTH
- * and SIZE_FRAC, not by stepping through individual leaves.
+ * Tri — one triangle, just its three corners as screen positions.
+ * The corners always keep the same roles so the splitting code can treat
+ * every triangle the same way: corner 0 is one sharp tip, corner 1 is the
+ * square (right-angle) corner, and corner 2 is the other sharp tip.
+ * Children get the same labelling, which is what lets the recursion stay
+ * uniform all the way down.
  *
- * Triangle convention:
- *   t.v[0] = "v0", t.v[1] = "v1" (right-angle vertex), t.v[2] = "v2"
- * For the pinwheel parent (legs 2 and 1):
- *   v0 = acute angle arctan(1/2)
- *   v1 = right angle      (90°)
- *   v2 = acute angle arctan(2)
- * Children inherit the same role labelling so the recursion is uniform.
+ * x[0..2], y[0..2] — the three corners, in sub-pixel screen coordinates.
  */
 typedef struct { double x[3], y[3]; } Tri;
 
@@ -357,19 +200,11 @@ static void tri_draw_edges(const GridCtx *g, Tri t, int depth)
 }
 
 /*
- * subdivide — pinwheel-style 5-way split.
- *
- *   1. Compute midpoints m01, m12, m20.
- *   2. Three corner children (scale 1/2):
- *        c0: (v0, m01, m20)
- *        c1: (m01, v1, m12)            ← right angle stays at v1 slot
- *        c2: (m20, m12, v2)
- *   3. Inverted centre = (m01, m12, m20). Its right angle is at m20
- *      (opposite the longest side m01-m12). Compute the altitude foot
- *      F on m01-m12 from m20.
- *   4. Two altitude halves:
- *        c3: (m20, m01, F)
- *        c4: (m20, F,   m12)
+ * subdivide — replace one triangle with 5 smaller copies of itself, then
+ * keep going until we hit the chosen depth. The trick: marking the three
+ * edge midpoints carves out the usual 4 pieces, and the flipped middle
+ * piece gets cut once more down the middle, giving 5 children in all.
+ * Every child is the same 1-2-√5 shape as the parent, just smaller.
  */
 static void subdivide(const GridCtx *g, Tri t, int depth, int max_depth)
 {
@@ -378,12 +213,13 @@ static void subdivide(const GridCtx *g, Tri t, int depth, int max_depth)
     double m12x = (t.x[1] + t.x[2]) * 0.5, m12y = (t.y[1] + t.y[2]) * 0.5;
     double m20x = (t.x[2] + t.x[0]) * 0.5, m20y = (t.y[2] + t.y[0]) * 0.5;
 
-    /* Corner children (scale 1/2) */
+    /* The three corner triangles, each half the size of the parent. */
     Tri c0 = { {t.x[0], m01x, m20x}, {t.y[0], m01y, m20y} };
     Tri c1 = { {m01x, t.x[1], m12x}, {m01y, t.y[1], m12y} };
     Tri c2 = { {m20x, m12x, t.x[2]}, {m20y, m12y, t.y[2]} };
 
-    /* Altitude foot on hypotenuse m01-m12, dropped from m20 */
+    /* Cut the leftover middle triangle in two: drop straight from its
+     * square corner (m20) onto its long side (m01-m12) and split there. */
     double fx, fy;
     foot_perp(m20x, m20y, m01x, m01y, m12x, m12y, &fx, &fy);
     Tri c3 = { {m20x, m01x, fx}, {m20y, m01y, fy} };
@@ -397,16 +233,15 @@ static void subdivide(const GridCtx *g, Tri t, int depth, int max_depth)
 }
 
 /*
- * Seed: a 1-2-√5 right triangle centered on screen.
- *   v0 = lower-left  (acute, far end of long leg)
- *   v1 = lower-right (right angle)
- *   v2 = upper-right (acute, far end of short leg)
+ * scene_seed — the very first triangle everything grows from: a 1-2-√5
+ * right triangle, sized and centred to fit the current screen. Corners
+ * go lower-left, lower-right (the square corner), upper-right.
  */
 static Tri scene_seed(const GridCtx *g)
 {
     double pw = (double)g->cols * CELL_W;
     double ph = (double)(g->rows - 1) * CELL_H;
-    double base = (pw < ph ? pw : ph) * g->size_frac * 0.5;   /* leg-2 = base */
+    double base = (pw < ph ? pw : ph) * g->size_frac * 0.5;   /* length of the long leg */
     double cxp = (double)g->ox;
     double cyp = (double)g->oy + base * 0.25;
     Tri t = {
@@ -416,15 +251,17 @@ static Tri scene_seed(const GridCtx *g)
     return t;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
+/*
+ * Scene — the handful of settings the viewer can change live, all in one
+ * place so reset and redraw stay simple.
+ */
 typedef struct {
-    int    depth;
-    double size_frac;
-    int    theme;
-    int    paused;
+    int    depth;        /* how many split levels to draw (+/- keys), 0..DEPTH_MAX */
+    double size_frac;    /* how big the figure is on screen ([ ] keys), 0..1 */
+    int    theme;        /* which colour set is active (t key) */
+    int    paused;       /* p key froze the view; 1 = paused */
 } Scene;
 
 static void scene_reset(Scene *s)
@@ -463,9 +300,7 @@ static void scene_draw(const GridCtx *g, const Scene *s, double fps)
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -480,9 +315,7 @@ static void screen_init(int theme)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;
@@ -511,6 +344,7 @@ int main(void)
 
     while (g_running) {
         if (g_need_resize) {
+            /* terminal was resized; this makes ncurses pick up the new size */
             g_need_resize = 0;
             endwin(); refresh();
         }

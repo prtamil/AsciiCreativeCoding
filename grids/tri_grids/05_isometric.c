@@ -1,137 +1,22 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 05_isometric.c — equilateral grid rendered as solid colored blocks
+ * 05_isometric.c — a triangle grid colored to look like a stack of cubes.
  *
- * DEMO: Same triangular tiling as 01, but each triangle is filled with
- *       a solid color and the colors rotate through a 6-cycle so
- *       neighbouring triangles around any vertex spell out the
- *       characteristic "stacked cubes" isometric pattern. Arrow keys
- *       move the cursor across edges.
+ * It's the same triangular tiling as 01_equilateral.c, but instead of
+ * drawing the edges between triangles, we fill each triangle with one of
+ * six colors. Picked the right way, the colors trick the eye into seeing
+ * a wall of stacked 3-D cubes (the classic isometric look). Arrow keys
+ * walk a cursor from triangle to triangle.
  *
- * Study alongside: 01_equilateral.c — same lattice, same cursor logic;
- *                  this file fills cells (background color) instead of
- *                  drawing edge characters.
+ * Sister file: 01_equilateral.c — same grid and same cursor logic; that
+ * one draws the edges, this one fills the cells with color.
  *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, TRI_SIZE, FPS_EWMA_ALPHA
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 6-color rotating palette + cursor / HUD / HINT
- *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_pixel_to_tri /
- *                 ctx_draw_bg + tri_centroid_pixel + palette_index
- *   §5 cursor   — Cursor + cursor_reset / cursor_move, TRI_DIR (same as 01)
- *   §6 scene    — hud_draw + scene_draw
- *   §7 screen   — ncurses init / cleanup
- *   §8 app      — signals, main loop
- *
- * Keys:  arrows move @   r reset   t theme   p pause
- *        +/- size        q/ESC quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids/05_isometric.c \
- *       -o 05_isometric -lncurses -lm
- */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : The equilateral triangular tiling is the standard
- *                  "isometric grid" used in graphics — three axes 120°
- *                  apart, six triangles meeting at every vertex. To make
- *                  the iso character pop visually, each triangle gets a
- *                  color from a 6-cycle indexed by (col + 2·row + up) mod 6.
- *                  Pairs of triangles that share a horizontal edge pick
- *                  adjacent indices, so the screen reads as stacked rhombi
- *                  (= cube faces in iso projection).
- *
- * Data-structure : Two structs — GridCtx (terminal extent, tri_size,
- *                  CELL_W/CELL_H, screen origin ox/oy) and Cursor
- *                  (col, row, up) — same as 01. No grid array.
- *
- * Formula        : Same skew-lattice pixel→triangle as 01_equilateral.c.
- *                  Then palette_index(col, row, up) = (col + 2·row + up) mod 6.
- *                  No edge characters — each cell is filled with the
- *                  triangle's background color.
- *
- * Edge chars     : None — the visual boundary between triangles is the
- *                  color discontinuity itself. No '/'/'\\'/'_' rendering.
- *
- * Movement       : Same TRI_DIR as 01_equilateral.c.
- *
- * References     :
+ * Why six triangles meet at a vertex and why that reads as cubes:
  *   Isometric projection — https://en.wikipedia.org/wiki/Isometric_projection
  *   Triangular tiling    — https://en.wikipedia.org/wiki/Triangular_tiling
- *   Red Blob Games (iso) — https://www.redblobgames.com/grids/hexagons/  (axial = iso)
  *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * The equilateral triangular grid IS the isometric grid — the projection
- * of a 3-D cubic lattice viewed along its main diagonal. Six triangles
- * meet at every vertex; if we color them in a 6-cycle, the result reads
- * as stacked cubes with three visible faces (top, left, right) shaded
- * differently. No special projection math — just the lattice from 01
- * plus a hash that picks one of 6 colors per triangle.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Picture a stack of unit cubes viewed from the (1,1,1) direction. Each
- * cube projects to a hexagon, and the hexagon decomposes into 3 rhombi
- * (the cube's 3 visible faces) which further decompose into 6 triangles.
- * Adjacent triangles in the same rhombus get similar colors; triangles in
- * different rhombi (= different cube faces) get contrasting colors.
- *
- * The hash (col + 2·row + up) mod 6 achieves this without any explicit
- * "which face am I on?" reasoning. The "·2" gives different colors to
- * triangles in adjacent strips at the same column; the "+up" splits
- * down vs up in the same rhombus into different colors. Cycling through 6
- * indices around any vertex produces the stacked-cube illusion.
- *
- * DRAWING METHOD  (raster scan, the approach used here)
- * ──────────────
- *  1. Pick TRI_SIZE — side length in pixels.
- *  2. Loop every screen cell; convert to centred pixel.
- *  3. Skew lattice inverse → (col, row, up) as in 01.
- *  4. p = palette_index(col, row, up).
- *  5. Draw a SPACE in the cell with background color = palette[p].
- *  6. If this cell is the cursor, overwrite with '@' in the cursor color.
- *
- * KEY FORMULAS
- * ────────────
- *  Same lattice inverse as 01_equilateral.c.
- *
- *  Palette hash:
- *    k = (col + 2·row + up) mod 6     (positive remainder)
- *
- *  Why "·2" and "+up": at any vertex of the triangular tiling, six
- *  triangles meet in a fan. Walking around the vertex CCW visits them
- *  in an order whose (col, row, up) sequence yields six DISTINCT residues
- *  mod 6. That's the stacked-cube property in a single line.
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • The "filled cell" rendering relies on the terminal's background-color
- *    paint. On terminals that don't honour color pairs for spaces, this
- *    file shows a blank screen. Modern xterm/iTerm/foot are fine.
- *  • Negative col or row: the modulo of a negative integer can be
- *    negative in C. We force a positive remainder with "if (k < 0) k += 6".
- *  • Cursor visibility: the '@' is drawn with the SAME background color
- *    as the underlying triangle, plus A_REVERSE — so it's always visible
- *    no matter which palette slot the triangle sits in.
- *  • CELL_W=2, CELL_H=4 produces the correct equilateral aspect.
- *
- * HOW TO VERIFY
- * ─────────────
- *  At cursor (col, row, up) = (0, 0, 0): palette = (0+0+0) mod 6 = 0.
- *  Move cursor RIGHT → (0, 0, 1) → palette = 1.
- *  Move cursor RIGHT again → (1, 0, 0) → palette = 1. (Same color as the
- *    previous up — they are the same hex face in the iso analogy.)
- *  Move cursor RIGHT again → (1, 0, 1) → palette = 2.
- *  → Walking right cycles through 0, 1, 1, 2, 2, 3, 3, … (each color
- *  used twice in a row because adjacent down/up pairs share a face).
- *
- * ─────────────────────────────────────────────────────────────────────── */
+ * Keys: arrows move @   r reset   t theme   p pause   +/- size   q/ESC quit
+ */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -144,9 +29,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 
@@ -161,7 +44,7 @@
 #define N_PALETTE  6
 #define N_THEMES   3
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How fast the FPS number on screen reacts. Small = smooth and steady. */
 #define FPS_EWMA_ALPHA 0.05
 
 #define PAIR_FILL_BASE  1                              /* 1..6 */
@@ -169,9 +52,7 @@
 #define PAIR_HUD       (PAIR_CURSOR + 1)
 #define PAIR_HINT      (PAIR_HUD + 1)
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -188,13 +69,12 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 /*
- * Three iso-flavoured 6-cycle palettes. Each row is a 6-color rotation —
- * 256-color values (preferred) and 8-color fallback row.
+ * Three color themes, six colors each. Press 't' to cycle them. We keep two
+ * copies: rich 256-color values for modern terminals, and a plain 8-color
+ * version as a fallback for old ones.
  */
 static const short PAL256[N_THEMES][N_PALETTE] = {
     /* warm  */ { 196, 214, 226, 118, 39, 129 },
@@ -213,7 +93,7 @@ static void color_init(int theme)
     use_default_colors();
     for (int i = 0; i < N_PALETTE; i++) {
         short bg = (COLORS >= 256) ? PAL256[theme][i] : PAL8[theme][i];
-        /* fg=black so the SPACE character is invisible — only background shows */
+        /* We fill cells with a blank space, so only the background color shows. */
         init_pair(PAIR_FILL_BASE + i, COLOR_BLACK, bg);
     }
     init_pair(PAIR_CURSOR, COLOR_WHITE, COLOR_BLACK);
@@ -221,28 +101,27 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx, pixel ↔ lattice + palette hash                   */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula — screen ↔ triangle, plus the cube-coloring trick ── */
 
 /*
- * GridCtx — geometry of the active iso (equilateral) grid.
+ * GridCtx — everything we need to know about the current grid layout.
  *
- * Same skew-lattice geometry as 01; no border_w because rendering is
- * solid-fill (no edge characters).
+ * It answers two questions: how big are the triangles, and where on screen
+ * does the grid sit. Given a screen cell, the helpers below use these
+ * numbers to figure out which triangle that cell falls inside. Same idea as
+ * 01_equilateral.c, but with no edge-width field since we only fill cells.
  */
 typedef struct {
-    /* terminal extent */
+    /* Size of the terminal, in character cells. */
     int rows, cols;
 
-    /* triangle geometry */
-    double tri_size;       /* side length in pixels                          */
-    int    cw, ch;         /* sub-pixel scaling — CELL_W, CELL_H             */
+    double tri_size;       /* triangle side length, measured in pixels       */
+    int    cw, ch;         /* how many pixels wide/tall one character cell is */
 
-    /* screen origin = pixel (0,0) */
+    /* Where pixel (0,0) lands on screen — we center the grid here.          */
     int    ox, oy;
 
-    /* advisory cursor bounds in lattice space */
+    /* Rough guess at how far the cursor can roam; just an advisory bound.    */
     int    max_col, max_row;
 } GridCtx;
 
@@ -274,9 +153,7 @@ static void ctx_pixel_to_tri(const GridCtx *g, double px, double py,
     *up = (*fa + *fb >= 1.0) ? 1 : 0;
 }
 
-/*
- * tri_centroid_pixel — pure forward map for cursor mark (same as 01).
- */
+/* Finds the center point of a triangle, so we can mark it (same as 01). */
 static void tri_centroid_pixel(int col, int row, int up, double size,
                                double *cx_pix, double *cy_pix)
 {
@@ -298,14 +175,10 @@ static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
 }
 
 /*
- * palette_index — assign each triangle a 6-cycle color slot.
- *
- *   k = (col + 2·row + up) mod 6
- *
- * The "·2" gives different colors to triangles in adjacent strips at the
- * same column; the "+up" gives different colors to down vs up in the same
- * rhombus. Around any vertex, the 6 distinct slots appear in cyclic order
- * — the visual signature of an isometric "stack of cubes".
+ * Picks which of the six colors a triangle gets — this is the whole trick.
+ * Six triangles meet at every grid corner, and this little formula hands
+ * each of those six a different color. The result reads as the three faces
+ * of stacked cubes (top, left, right), so the flat grid looks 3-D.
  */
 static int palette_index(int col, int row, int up)
 {
@@ -316,9 +189,9 @@ static int palette_index(int col, int row, int up)
 }
 
 /*
- * ctx_draw_bg — solid-fill rendering. Each cell gets the background color
- * matching its triangle's palette slot. Cursor cell overlaid with '@' in
- * reverse video so it is visible regardless of palette slot.
+ * Paints the whole screen. For every cell we find its triangle, look up that
+ * triangle's color, and fill the cell with it. The cursor's cell gets an '@'
+ * in reverse video on top, so it stands out no matter what color it sits on.
  */
 static void ctx_draw_bg(const GridCtx *g, int cC, int cR, int cU)
 {
@@ -347,19 +220,24 @@ static void ctx_draw_bg(const GridCtx *g, int cC, int cR, int cU)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 cursor ── */
 
 /*
- * Cursor — same as 01_equilateral.c: (col, row, up) on the equilateral
- * lattice. The visual cursor mark is rendered inside ctx_draw_bg (so it
- * lands on the correct palette colour), so this file does not need a
- * separate cursor_draw().
+ * Cursor — which triangle the '@' is sitting on. Same as 01_equilateral.c.
+ *   col, row : which rhombus of the grid, like a square-grid x and y.
+ *   up       : 0 for the lower triangle of that rhombus, 1 for the upper one.
+ * There's no separate draw function — ctx_draw_bg paints the '@' as it goes,
+ * which keeps it on the right background color.
  */
 typedef struct { int col, row, up; } Cursor;
 
-/* Same TRI_DIR as 01_equilateral.c */
+/*
+ * Movement table, same as 01_equilateral.c. To move in a direction we need
+ * to know which triangle we're on (the 'up' flag), because a left arrow from
+ * an upper triangle lands somewhere different than from a lower one. Each row
+ * is a direction; the two entries inside are the up=0 and up=1 cases; the
+ * three numbers are how much col, row, and up change.
+ */
 static const int TRI_DIR[4][2][3] = {
     /* LEFT  */ { { -1,  0,  1 }, {  0,  0,  0 } },
     /* RIGHT */ { {  0,  0,  1 }, { +1,  0,  0 } },
@@ -384,9 +262,7 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dir)
     cur->up   = t[2];
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, int theme,
                      int paused, double fps)
@@ -417,9 +293,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, int theme,
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -429,13 +303,11 @@ static void screen_init(void)
     keypad(stdscr, TRUE);
     nodelay(stdscr, TRUE);
     curs_set(0);
-    typeahead(-1);
+    typeahead(-1);   /* stop ncurses peeking at input mid-draw; avoids tearing */
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;
@@ -469,6 +341,8 @@ int main(void)
     while (g_running) {
         if (g_need_resize) {
             g_need_resize = 0;
+            /* Terminal was resized: poke ncurses to learn the new size, then
+             * re-center the grid for it. */
             endwin(); refresh();
             ctx_init(&g, LINES, COLS);
         }

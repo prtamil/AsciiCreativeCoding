@@ -1,183 +1,19 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 01_polar_direct.c — direct cursor placement on a polar grid background
+ * 01_polar_direct.c — move a cursor over a round (polar) grid and drop markers.
  *
- * DEMO: A cursor navigates over one of 7 polar backgrounds, with arrow-key
- *       movement adapted to each grid type.  Rings/spokes grids snap to ring
- *       and spoke intersections; spirals walk along the curve; sunflower jumps
- *       between Vogel seeds by index; elliptic moves in (e_r, ell_θ) space.
- *       Space places or removes an object.  'a'/'e' cycles all 7 backgrounds.
+ * You steer a cursor across one of seven round backgrounds (rings, spirals,
+ * a sunflower, an ellipse, ...).  The arrow keys behave differently on each
+ * grid so the cursor always moves the way that grid naturally wants — hop
+ * between rings, walk along a spiral, jump seed to seed.  Space drops or
+ * picks up a marker; 'a'/'e' flip to the previous/next background.
  *
- * Study alongside: grids/rect_grids_placement/01_direct.c (rectangular version),
- *                  grids/polar_grids/01_rings_spokes.c (background drawing)
- *
- * Section map:
- *   §1 config   — pool size, per-grid step constants, background names/hints
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 5 pairs: grid, active object, anchor, HUD (yellow), hint (cyan)
- *   §4 gridctx  — GridCtx (mode + per-mode params), cell_to_polar, polar_to_screen
- *   §5 pool     — Pool: place, remove, toggle, find, clear, draw
- *   §6 cursor   — Cursor (r, theta, row, col, seed_idx), grid-aware move/reset
- *   §7 mode     — draw_polar_bg: 7 inline polar background types in one switch
- *   §8 scene    — hud_draw + scene_draw
- *   §9 screen   — ncurses init / cleanup
- *   §10 app     — signals, resize, main loop
- *
- * Keys:  q/ESC quit   p pause   t theme
- *        arrows  move cursor (grid-aware: ring/spoke/spiral/seed/elliptic)
- *        space  place/remove   a/e  prev/next background   C clear   r reset
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/polar_grids_placement/01_polar_direct.c \
- *       -o 01_polar_direct -lncurses -lm
+ * Sister files: grids/rect_grids_placement/01_direct.c is the square-grid
+ *               version of this same idea; grids/polar_grids/01_rings_spokes.c
+ *               (through 07_elliptic.c) draw each background on its own.
+ * References:   polar coordinates — en.wikipedia.org/wiki/Polar_coordinate_system
+ *               object pool pattern — gameprogrammingpatterns.com/object-pool.html
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Grid-aware polar cursor.  Arrow-key movement is
- *                  dispatched per background type:
- *
- *                  Rings+spokes (0): UP/DOWN snap to next ring (±RING_SP);
- *                  LEFT/RIGHT snap to next spoke (±30°).
- *
- *                  Log-polar (1): UP/DOWN multiply/divide r by RATIO=e^0.25;
- *                  LEFT/RIGHT snap to next spoke (±30°).
- *
- *                  Archimedean (2): LEFT/RIGHT walk along the curve (Δθ +
- *                  matching Δr = a×Δθ); UP/DOWN jump one full pitch.
- *
- *                  Log-spiral (3): LEFT/RIGHT walk along the curve (Δθ +
- *                  r scaled by e^(growth×Δθ)); UP/DOWN flip between the
- *                  two golden arms (θ ± π).
- *
- *                  Sunflower (4): LEFT/RIGHT step seed index ±1; UP/DOWN
- *                  step by ±13 (one Fibonacci family of spirals).
- *
- *                  Equal-area (5): UP/DOWN snap to next equal-area ring
- *                  (r = sqrt(k) × R_UNIT); LEFT/RIGHT snap to spokes.
- *
- *                  Elliptic (6): UP/DOWN step e_r by ±BG_ELLIP_SP;
- *                  LEFT/RIGHT step ell_θ by ±30° in elliptic frame.
- *
- * Data-structure : Pool — fixed array of (row, col, glyph, alive).
- *                  pool_toggle: finds a match and removes (swap-last, O(1)),
- *                  or appends if not found.  Identical shape to the pool in
- *                  grids/rect_grids_placement/01_direct.c.
- *
- * GridContext    : A single GridCtx struct carries the mode plus origin/range
- *                  parameters.  Switching grids re-initialises GridCtx but
- *                  the pool is NOT cleared — placed objects persist across
- *                  modes (they may appear off-screen until you switch back).
- *
- * Rendering      : Background in PAIR_GRID (theme color), objects in
- *                  PAIR_ACTIVE (bright white), cursor in A_REVERSE.
- *
- * Performance    : Background O(rows × cols) per frame for sweep-based
- *                  types (0–3, 5–6); O(N_BG_SEEDS) for sunflower (type 4).
- *
- * References     :
- *   Polar coordinate system — en.wikipedia.org/wiki/Polar_coordinate_system
- *   Object pool pattern — gameprogrammingpatterns.com/object-pool.html
- *   Rectangular analogue — grids/rect_grids_placement/01_direct.c
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ──────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Seven background grids share the same polar coordinate system, but each
- * defines its own natural cursor movement.  On rings+spokes, UP/DOWN hop
- * between rings (r ± BG_RING_SP) and LEFT/RIGHT rotate between spokes
- * (θ ± 30°).  On the archimedean spiral, LEFT/RIGHT walk ALONG the curve
- * (both r and θ change so the cursor stays on the line).  On sunflower,
- * movement jumps between indexed seeds via the Vogel formula.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Two coordinate layers are in play: screen (row, col) and polar (r, θ in
- * pixels).  The cursor stores (r, θ); cursor_sync() converts these to
- * (row, col) after every move.  Exception: sunflower stores seed_idx i and
- * cursor_apply_seed() derives (r, θ, row, col) from i via the Vogel formula.
- *
- * Elliptic mode (mode=6) adds a third layer: (e_r, ell_θ) in the
- * ellipse's own stretched frame.  Arrows modify (e_r, ell_θ); the result
- * converts back via dx=e_r×A×cos(ell_θ), dy=e_r×B×sin(ell_θ).
- *
- * DRAWING METHOD
- * ──────────────
- * 1. draw_polar_bg() sweeps every cell (row,col), converts to polar,
- *    tests against the grid equation, draws if matched.
- * 2. pool_draw() draws placed objects from the pool.
- * 3. cursor_draw() draws '+' with A_REVERSE at (cursor.row, cursor.col).
- * 4. hud_draw() draws yellow status (top-right) + cyan key hints (bottom).
- *
- * KEY FORMULAS
- * ────────────
- * cell_to_polar (§4):
- *   dx = (col − ox) × CELL_W        [pixels; aspect correction]
- *   dy = (row − oy) × CELL_H
- *   r  = sqrt(dx² + dy²)
- *   θ  = atan2(dy, dx)               [−π to +π]
- *
- * polar_to_screen (§4):
- *   col = ox + round(r × cos(θ) / CELL_W)
- *   row = oy + round(r × sin(θ) / CELL_H)
- *
- * Archimedean cursor walk (mode=2):
- *   a = BG_ARCH_PITCH / (2π)         [pitch parameter, px/rad]
- *   Δr = a × Δθ                       [r advances proportionally to θ]
- *   → cursor stays on spiral after each LEFT/RIGHT press
- *
- * Log-spiral cursor walk (mode=3):
- *   growth = 2 × ln(φ) / π ≈ 0.3065
- *   new r = r × e^(growth × Δθ)      [radius scales exponentially]
- *   UP/DOWN: θ ± π switches between the two arms (arms are π apart)
- *
- * Equal-area ring snap (mode=5):
- *   k_float = (r / R_UNIT)²           [fractional ring index]
- *   UP:   k = ceil(k_float) − 1;   new r = sqrt(k) × R_UNIT
- *   DOWN: k = floor(k_float) + 1;  new r = sqrt(k) × R_UNIT
- *
- * Elliptic cursor (mode=6):
- *   e_r    = sqrt((dx/A)² + (dy/B)²)  [elliptic radius]
- *   ell_θ  = atan2(dy/B, dx/A)        [angle in normalised frame]
- *   convert back: col = ox + round(e_r × A × cos(ell_θ) / CELL_W)
- *                 row = oy + round(e_r × B × sin(ell_θ) / CELL_H)
- *
- * Vogel sunflower (cursor_apply_seed, mode=4):
- *   r = sqrt(i) × BG_SEED_SP          [equal-area seed density]
- *   θ = i × GOLDEN_ANGLE              [golden angle ≈ 137.508°]
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- * - r < R_POLAR_MIN=4 is clamped everywhere.  Without this, any radial
- *   move that overshoots the origin collapses r to 0 and the angle is
- *   lost permanently (atan2(0,0) is undefined).
- * - Log-spiral arm flip: UP/DOWN shifts θ by ±π.  With N=2 arms they
- *   are exactly π apart, so UP always lands on the "other" arm.
- * - Elliptic mode updates cursor.r / cursor.theta via cell_to_polar after
- *   each move; these values are used only if you switch mode from elliptic
- *   to another mode without resetting.
- *
- * HOW TO VERIFY
- * ─────────────
- * Terminal 80×24 → ox=40, oy=12.
- *
- * polar_to_screen:
- *   r=20, θ=0:   col=40+round(20/2)=50, row=12        ✓
- *   r=20, θ=π/2: col=40, row=12+round(20/4)=17        ✓
- *
- * Archimedean step (PITCH=32, start r=32, θ=0):
- *   a=32/(2π)≈5.09; press RIGHT (Δθ=π/4):
- *   Δr=5.09×0.785≈4.0 → new r=36, new θ=45°           ✓
- *
- * Equal-area snap (R_UNIT=18, start r=20):
- *   k_float=(20/18)²=1.235
- *   UP:   k=ceil(1.235)−1=1, new r=sqrt(1)×18=18      ✓
- *   DOWN: k=floor(1.235)+1=2, new r=sqrt(2)×18≈25.5   ✓
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
@@ -194,33 +30,32 @@
 #  define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS     30
-#define CELL_W          2
-#define CELL_H          4
+#define CELL_W          2     /* a terminal cell is roughly 2 wide... */
+#define CELL_H          4     /* ...and 4 tall in pixels; correcting this keeps circles round */
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How fast the on-screen FPS number settles: small = smooth but laggy. */
 #define FPS_EWMA_ALPHA  0.05
 
-#define R_POLAR_MIN     4.0   /* minimum cursor radius — avoids origin singularity */
+/* Don't let the cursor sit right on the centre — angle is meaningless there. */
+#define R_POLAR_MIN     4.0
 
-/* Object pool */
+/* Markers the user drops */
 #define MAX_OBJ       256
 #define OBJ_GLYPH     'o'
 
-/* Golden ratio constants (for sunflower and log-spiral backgrounds) */
+/* Golden ratio, used by the sunflower and the golden spiral. */
 #define PHI            1.61803398874989484820
 #define GOLDEN_ANGLE  (2.0 * M_PI / (PHI * PHI))
 
-/* Sunflower background seed count */
+/* How many seeds the sunflower background draws. */
 #define N_BG_SEEDS    600
 
-/* ── Per-grid cursor step sizes ────────────────────────────────────────── *
- * Each background mode defines its own natural step: ring spacing for
- * circular grids, pitch for spirals, seed count for sunflower, etc.      */
+/* How far one arrow press moves on each background.  Every grid has its
+ * own natural step — ring spacing here, spiral pitch there, seed counts
+ * for the sunflower, and so on. */
 #define BG_RING_SP     20.0            /* rings+spokes: ring spacing (px)    */
 #define BG_SPOKE_ANG   (M_PI / 6.0)   /* rings/log/sector/elliptic: 30°     */
 #define BG_LOG_RATIO    0.25           /* log-polar: ln(RATIO) per ring      */
@@ -245,12 +80,12 @@ static const char *const BG_MOVE_HINTS[] = {
     "ud:ellipse  lr:ell-ang",
 };
 
-/* Color pairs */
+/* Colour slots: background grid, markers/cursor, anchor, status bar, key hints. */
 #define PAIR_GRID    1
 #define PAIR_ACTIVE  2
 #define PAIR_ANCHOR  3
-#define PAIR_HUD     4   /* status bar (yellow)  */
-#define PAIR_HINT    5   /* key-hint footer (cyan) */
+#define PAIR_HUD     4
+#define PAIR_HINT    5
 
 static const char *const BG_NAMES[] = {
     "rings+spokes", "log-polar",  "archimedean",
@@ -267,9 +102,7 @@ static const short THEME_FG[][2] = {
 };
 #define N_THEMES  5
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -284,9 +117,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static void color_init(int theme)
 {
@@ -299,19 +130,20 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx                                                             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx ── */
 
 /*
- * GridCtx — geometry for the current polar grid mode.
+ * GridCtx — everything we need to know about the round grid right now: which
+ * background is showing and where its centre sits on screen.  Rebuilt whenever
+ * the user switches grids or the terminal is resized.
  *
- *   mode    — which of the 7 polar backgrounds is active (0..6).
- *   rows/cols — terminal extent (cached for resize handling).
- *   cw/ch   — terminal cell aspect (pixels per column / per row).
- *   ox/oy   — screen-space origin (centre of terminal).
- *   max_ring/max_spoke — informational caps for HUD; cursor uses R_POLAR_MIN
- *                        and screen clamping rather than a hard ring index.
+ *   mode      — which background is active, 0..6 (see BG_NAMES).
+ *   rows,cols — current terminal size; remembered so a resize can re-centre.
+ *   cw,ch     — pixels per cell across and down; used to keep circles round.
+ *   ox,oy     — the centre of the screen, the point everything is measured from.
+ *   max_ring,
+ *   max_spoke — rough "how many rings/spokes fit" counts, only shown in the HUD.
+ *               The cursor itself is kept on-screen by clamping, not by these.
  */
 typedef struct {
     int mode;
@@ -327,20 +159,16 @@ static void ctx_init(GridCtx *g, int mode, int rows, int cols)
     g->mode = mode; g->rows = rows; g->cols = cols;
     g->cw = CELL_W; g->ch = CELL_H;
     g->ox = cols / 2; g->oy = rows / 2;
-    g->max_spoke = 12;     /* default spoke count for ring-style modes */
-    /* approximate ring count fitting on screen */
+    g->max_spoke = 12;
+    /* roughly how many rings reach from the centre to the far corner */
     int half_diag_px = (int)(sqrt((double)(g->ox*g->cw)*(g->ox*g->cw) +
                                    (double)(g->oy*g->ch)*(g->oy*g->ch)));
     g->max_ring = (int)(half_diag_px / BG_RING_SP);
 }
 
 /*
- * cell_to_polar — convert screen cell (col, row) to polar (r_px, theta).
- *
- *   dx = (col − ox) × CELL_W      [pixel-space x offset]
- *   dy = (row − oy) × CELL_H      [pixel-space y offset]
- *   r  = sqrt(dx² + dy²)
- *   θ  = atan2(dy, dx)             ∈ (−π, π]
+ * cell_to_polar — given a cell on screen, find how far it is from the centre
+ * and which direction it points (its distance r and angle theta).
  */
 static void cell_to_polar(int col, int row, int ox, int oy,
                            double *r_px, double *theta)
@@ -352,9 +180,8 @@ static void cell_to_polar(int col, int row, int ox, int oy,
 }
 
 /*
- * polar_to_screen — inverse of cell_to_polar; (r, θ) → (col, row).
- * Used by cursor_sync, sunflower seed placement, and (in 02–04) by
- * arc/spoke/spiral/scatter rasterisers.
+ * polar_to_screen — the reverse: take a distance and angle and find which
+ * cell on screen lands there.
  */
 static void polar_to_screen(double r, double theta, int ox, int oy,
                               int *col, int *row)
@@ -372,11 +199,14 @@ static char angle_char(double theta)
     return '/';
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool ── */
 
+/* Obj — one dropped marker: where it sits, what it looks like, and whether
+ * the slot is in use (alive==false means the slot is free to reuse). */
 typedef struct { int row, col; char glyph; bool alive; } Obj;
+
+/* Pool — all the markers, held in one fixed array so we never allocate while
+ * running.  count is how many of the slots are currently filled. */
 typedef struct { Obj items[MAX_OBJ]; int count; } Pool;
 
 static int pool_find(const Pool *p, int row, int col)
@@ -420,17 +250,24 @@ static void pool_draw(const Pool *p)
     attroff(COLOR_PAIR(PAIR_ACTIVE) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 cursor ── */
 
+/*
+ * Cursor — where the user is pointing.  Its real position is the round one:
+ * a distance from centre and an angle.  The cell (row, col) is just that
+ * position rounded to the nearest character, recomputed after every move.
+ *
+ *   r, theta — distance from centre (pixels) and direction (radians).
+ *   row, col — the screen cell the cursor lands on.
+ *   seed_idx — only the sunflower uses this: which numbered seed we're on.
+ */
 typedef struct {
-    double r, theta;  /* polar position: pixels and radians        */
-    int    row, col;  /* terminal cell derived from (r, theta)     */
-    int    seed_idx;  /* Vogel seed index (sunflower bg only)      */
+    double r, theta;
+    int    row, col;
+    int    seed_idx;
 } Cursor;
 
-/* Recompute (row,col) after polar coords change; clamp to screen. */
+/* After r or theta changes, work out the screen cell and keep it on-screen. */
 static void cursor_sync(Cursor *c, const GridCtx *g)
 {
     polar_to_screen(c->r, c->theta, g->ox, g->oy, &c->col, &c->row);
@@ -441,8 +278,9 @@ static void cursor_sync(Cursor *c, const GridCtx *g)
 }
 
 /*
- * cursor_apply_seed — update (r, θ, row, col) from seed_idx for sunflower bg.
- * Vogel model: r = sqrt(i) × spacing, θ = i × GOLDEN_ANGLE.
+ * cursor_apply_seed — for the sunflower, snap the cursor exactly onto seed
+ * number seed_idx.  Seeds spiral out by the golden angle, each a little
+ * farther from the centre, the way real sunflower seeds pack.
  */
 static void cursor_apply_seed(Cursor *c, const GridCtx *g)
 {
@@ -461,9 +299,9 @@ static void cursor_reset(Cursor *c, const GridCtx *g)
     else              cursor_sync(c, g);
 }
 
-/* Wrap θ into [0, 2π) and clamp r to R_POLAR_MIN — shared tail of every
- * (r, θ)-mutating cursor mode (modes 0, 1, 2, 3, 5).  Mode 4 (sunflower)
- * and mode 6 (elliptic) use bespoke clamps that touch (row, col) directly. */
+/* Tidy up after a move: keep the angle in one full turn and don't let the
+ * cursor reach the dead centre.  Shared by the ring/spiral modes; the
+ * sunflower and ellipse clean up their own way. */
 static void cursor_normalise_polar(Cursor *c, const GridCtx *g)
 {
     const double two_pi = 2.0 * M_PI;
@@ -472,7 +310,7 @@ static void cursor_normalise_polar(Cursor *c, const GridCtx *g)
     cursor_sync(c, g);
 }
 
-/* Mode 0 — rings+spokes: UP/DOWN snap to next ring, LEFT/RIGHT to next spoke. */
+/* Rings + spokes: up/down hop to the next ring, left/right turn to the next spoke. */
 static void cursor_move_rings_spokes(Cursor *c, const GridCtx *g, int key)
 {
     switch (key) {
@@ -485,7 +323,8 @@ static void cursor_move_rings_spokes(Cursor *c, const GridCtx *g, int key)
     cursor_normalise_polar(c, g);
 }
 
-/* Mode 1 — log-polar: UP/DOWN multiply r by RATIO=e^0.25, LR snaps to spokes. */
+/* Log-polar: rings get wider the farther out you go, so up/down scale the
+ * distance by a fixed ratio instead of adding a fixed amount; left/right snap to spokes. */
 static void cursor_move_log_polar(Cursor *c, const GridCtx *g, int key)
 {
     switch (key) {
@@ -498,7 +337,8 @@ static void cursor_move_log_polar(Cursor *c, const GridCtx *g, int key)
     cursor_normalise_polar(c, g);
 }
 
-/* Mode 2 — archimedean: LR walks ALONG the curve (Δr = a×Δθ); UD jumps one turn. */
+/* Archimedean spiral: left/right slide along the curve (turn a little, step out a
+ * matching little, so the cursor stays on the line); up/down jump a whole turn. */
 static void cursor_move_archimedean(Cursor *c, const GridCtx *g, int key)
 {
     double a = BG_ARCH_PITCH / (2.0 * M_PI);
@@ -518,7 +358,8 @@ static void cursor_move_archimedean(Cursor *c, const GridCtx *g, int key)
     cursor_normalise_polar(c, g);
 }
 
-/* Mode 3 — log-spiral: LR walks the curve, UD flips between the two golden arms. */
+/* Golden spiral: left/right slide along the curve (each turn multiplies the
+ * distance); up/down jump straight across to the other of the two arms. */
 static void cursor_move_log_spiral(Cursor *c, const GridCtx *g, int key)
 {
     double scale = exp(2.0 * log(PHI) / M_PI * BG_LOG_ANG);
@@ -531,14 +372,15 @@ static void cursor_move_log_spiral(Cursor *c, const GridCtx *g, int key)
         c->theta += BG_LOG_ANG;
         c->r     *= scale;
         break;
-    case KEY_UP:   c->theta -= M_PI; break;  /* 2-arm: arms are π apart */
+    case KEY_UP:   c->theta -= M_PI; break;  /* the two arms sit half a turn apart */
     case KEY_DOWN: c->theta += M_PI; break;
     default: return;
     }
     cursor_normalise_polar(c, g);
 }
 
-/* Mode 4 — sunflower: step seed index; cursor_apply_seed snaps to the exact seed. */
+/* Sunflower: move by seed number — left/right step one seed, up/down jump 13
+ * (a Fibonacci number, so you hop along one of the visible spiral arms). */
 static void cursor_move_sunflower(Cursor *c, const GridCtx *g, int key)
 {
     switch (key) {
@@ -551,7 +393,8 @@ static void cursor_move_sunflower(Cursor *c, const GridCtx *g, int key)
     cursor_apply_seed(c, g);
 }
 
-/* Mode 5 — equal-area: UP/DOWN snap to sqrt(k)×R_UNIT rings, LR = spokes. */
+/* Equal-area rings: every ring covers the same area, so outer ones sit closer
+ * together.  Up/down snap to the next such ring; left/right snap to spokes. */
 static void cursor_move_equal_area(Cursor *c, const GridCtx *g, int key)
 {
     double kf = (c->r / BG_RUNIT) * (c->r / BG_RUNIT);
@@ -574,7 +417,8 @@ static void cursor_move_equal_area(Cursor *c, const GridCtx *g, int key)
     cursor_normalise_polar(c, g);
 }
 
-/* Mode 6 — elliptic: move in the (e_r, ell_θ) frame, then convert back to (col,row). */
+/* Ellipse: pretend the screen is stretched into a circle, move on that circle,
+ * then squash the answer back so it lands on the real ellipse. */
 static void cursor_move_elliptic(Cursor *c, const GridCtx *g, int key)
 {
     double dx   = (double)(c->col - g->ox) * CELL_W;
@@ -585,7 +429,7 @@ static void cursor_move_elliptic(Cursor *c, const GridCtx *g, int key)
 
     switch (key) {
     case KEY_UP: {
-        /* snap to inner ring: ceil(e_r/sp)-1 steps in e_r space */
+        /* snap inward to the next ellipse ring */
         double k = ceil(e_r / BG_ELLIP_SP) - 1.0;
         e_r = k * BG_ELLIP_SP;
         if (e_r < 1.0) e_r = 1.0;
@@ -601,7 +445,7 @@ static void cursor_move_elliptic(Cursor *c, const GridCtx *g, int key)
     default: return;
     }
 
-    /* convert back from elliptic to screen: dx=e_r×A×cos, dy=e_r×B×sin */
+    /* squash the circle answer back onto the ellipse and onto a screen cell */
     c->col = g->ox + (int)round(e_r * BG_ELLIP_A * cos(e_th) / CELL_W);
     c->row = g->oy + (int)round(e_r * BG_ELLIP_B * sin(e_th) / CELL_H);
     if (c->row < 0)          c->row = 0;
@@ -612,11 +456,8 @@ static void cursor_move_elliptic(Cursor *c, const GridCtx *g, int key)
     if (c->r < R_POLAR_MIN) c->r = R_POLAR_MIN;
 }
 
-/*
- * cursor_move — grid-aware movement: dispatches per mode so arrows
- * always follow the natural geometry of the active background.
- * Routes to one of seven cursor_move_* helpers (one per BG_NAMES entry).
- */
+/* Hand the arrow key to whichever background is showing, so the cursor moves
+ * the way that grid wants. */
 static void cursor_move(Cursor *c, const GridCtx *g, int key)
 {
     switch (g->mode) {
@@ -639,11 +480,13 @@ static void cursor_draw(const Cursor *c, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_ACTIVE) | A_REVERSE | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  mode  (polar background dispatcher)                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 mode ── */
 
-/* Mode 0 — rings + spokes (defaults from polar_grids/01_rings_spokes.c). */
+/* Each bg_*_draw paints one background by walking every cell, turning it into
+ * distance-and-angle, and lighting it up if it lands on a grid line.  The
+ * line spacings here mirror the standalone demos in grids/polar_grids/. */
+
+/* Rings + spokes. */
 static void bg_rings_spokes_draw(const GridCtx *g)
 {
     const double two_pi = 2.0 * M_PI;
@@ -665,7 +508,7 @@ static void bg_rings_spokes_draw(const GridCtx *g)
     }
 }
 
-/* Mode 1 — log-polar grid (defaults from polar_grids/02_log_polar.c). */
+/* Log-polar: rings spaced so they look evenly spread under zoom. */
 static void bg_log_polar_draw(const GridCtx *g)
 {
     const double two_pi = 2.0 * M_PI;
@@ -691,7 +534,7 @@ static void bg_log_polar_draw(const GridCtx *g)
     }
 }
 
-/* Mode 2 — archimedean 2-arm spiral (polar_grids/03_archimedean_spiral.c). */
+/* Archimedean spiral, two arms — even spacing between turns. */
 static void bg_archimedean_draw(const GridCtx *g)
 {
     const double two_pi = 2.0 * M_PI;
@@ -712,7 +555,7 @@ static void bg_archimedean_draw(const GridCtx *g)
     }
 }
 
-/* Mode 3 — golden log-spiral, 2 arms (polar_grids/04_log_spiral.c). */
+/* Golden spiral, two arms — each turn farther out than the last. */
 static void bg_log_spiral_draw(const GridCtx *g)
 {
     const double two_pi = 2.0 * M_PI;
@@ -734,10 +577,11 @@ static void bg_log_spiral_draw(const GridCtx *g)
     }
 }
 
-/* Mode 4 — Vogel sunflower phyllotaxis (polar_grids/05_sunflower.c). */
+/* Sunflower: seeds placed by the golden angle, the way real seed heads pack. */
 static void bg_sunflower_draw(const GridCtx *g)
 {
     const double sp = BG_SEED_SP;
+    /* one flag per cell so two seeds don't fight over the same spot; freed below */
     bool *vis = calloc((size_t)(g->rows * g->cols), 1);
     if (!vis) return;
 
@@ -754,7 +598,7 @@ static void bg_sunflower_draw(const GridCtx *g)
     free(vis);
 }
 
-/* Mode 5 — equal-area sector grid (polar_grids/06_sector.c). */
+/* Equal-area rings + spokes — every ring band covers the same area. */
 static void bg_equal_area_draw(const GridCtx *g)
 {
     const double two_pi = 2.0 * M_PI;
@@ -779,7 +623,7 @@ static void bg_equal_area_draw(const GridCtx *g)
     }
 }
 
-/* Mode 6 — elliptic ring grid (polar_grids/07_elliptic.c). */
+/* Ellipse rings — circles stretched wider than they are tall. */
 static void bg_elliptic_draw(const GridCtx *g)
 {
     const double A = 1.6, B = 1.0, sp = 20.0, rwu = 0.07;
@@ -798,11 +642,7 @@ static void bg_elliptic_draw(const GridCtx *g)
     }
 }
 
-/*
- * draw_polar_bg — dispatch on g->mode and draw the matching polar grid.
- * Routes to one of seven bg_*_draw helpers (rings_spokes, log_polar,
- * archimedean, log_spiral, sunflower, equal_area, elliptic).  No mutation.
- */
+/* Draw whichever background is currently selected. */
 static void draw_polar_bg(const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_GRID));
@@ -818,11 +658,9 @@ static void draw_polar_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_GRID));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 scene ── */
 
-/* Bright bold yellow status (top-right) + bold cyan key hints (bottom). */
+/* The on-screen readouts: grid name and stats up top, key hints along the bottom. */
 static void hud_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
                      int theme, double fps, bool paused)
 {
@@ -856,9 +694,7 @@ static void scene_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
     wnoutrefresh(stdscr); doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(int theme)
@@ -869,9 +705,7 @@ static void screen_init(int theme)
     color_init(theme); atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §10  app                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §10 app ── */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 static void on_signal(int s)
@@ -921,7 +755,7 @@ int main(void)
             int m = (ch == 'a') ? (ctx.mode - 1 + N_BG_TYPES) % N_BG_TYPES
                                 : (ctx.mode + 1) % N_BG_TYPES;
             ctx_init(&ctx, m, rows, cols);
-            /* entering sunflower: snap seed_idx to nearest seed at current r */
+            /* switching to the sunflower: pick the seed nearest where we already are */
             if (ctx.mode == 4) {
                 cur.seed_idx = (int)round((cur.r / BG_SEED_SP) * (cur.r / BG_SEED_SP));
                 cursor_apply_seed(&cur, &ctx);

@@ -1,159 +1,21 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 04_30_60_90.c — kisrhombille tiling (equilaterals subdivided into 6 right tris)
+ * 04_30_60_90.c — a grid of equilateral triangles, each sliced into six.
  *
- * DEMO: The equilateral grid from 01 is dressed with the three medians
- *       of each triangle. Each median connects a vertex to the midpoint
- *       of the opposite edge; together they cut every equilateral into 6
- *       congruent 30-60-90 right triangles. Arrow keys move the cursor
- *       between whole equilaterals (medians render automatically); the 6
- *       sub-triangles are visible by the median lines.
+ * We start with the equilateral grid from 01 and draw three lines inside
+ * every triangle, each running from a corner to the middle of the opposite
+ * side. Those three lines cut each triangle into six smaller right triangles
+ * (the 30-60-90 kind). Arrow keys walk a cursor over the whole triangles;
+ * the little ones are just lines on screen, nothing we store.
  *
- * Study alongside: 01_equilateral.c — same skew-lattice rasterizer.
- *                  03_double_diagonal.c — the analogous "kis" operation
- *                  applied to squares (6-way for triangles, 4-way for
- *                  squares).
+ * Companion files: 01_equilateral.c (same grid math) and 03_double_diagonal.c
+ * (the same "slice each tile" idea, but applied to squares).
  *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, TRI_SIZE, BORDER_W, MEDIAN_T, FPS_EWMA_ALPHA
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 5 pairs: edge / median / cursor / HUD / HINT
- *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_pixel_to_tri /
- *                 ctx_draw_bg + tri_centroid_pixel + tri_edge_char +
- *                 tri_median_char
- *   §5 cursor   — Cursor + cursor_reset / cursor_move / cursor_draw, TRI_DIR
- *   §6 scene    — hud_draw + scene_draw
- *   §7 screen   — ncurses init / cleanup
- *   §8 app      — signals, main loop
- *
- * Keys:  arrows move @   r reset   t theme   p pause
- *        +/- size        [/] border thickness   q/ESC quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids/04_30_60_90.c \
- *       -o 04_30_60_90 -lncurses -lm
+ * Names for the curious: this pattern is the "kisrhombille tiling", and the
+ * three slicing lines are a triangle's "medians".
+ *   https://en.wikipedia.org/wiki/Kisrhombille_tiling
+ *   https://en.wikipedia.org/wiki/Special_right_triangle  (30-60-90 triangle)
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Kisrhombille = "kis" (apply triangulation) of the
- *                  rhombille. Every equilateral triangle is split by its
- *                  three medians (vertex → opposite-edge midpoint) into 6
- *                  right triangles with angles 30°-60°-90°. The medians
- *                  meet at the centroid where six 60° angles complete
- *                  to 360°. Twelve 30-60-90s meet at every original vertex.
- *
- * Data-structure : Two structs — GridCtx (terminal extent, tri_size,
- *                  CELL_W/CELL_H, screen origin ox/oy, border_w, median_t)
- *                  and Cursor (col, row, up) — same as 01.
- *
- * Formula        : Same pixel→skew-lattice as 01_equilateral.c. Inside
- *                  each triangle, three additional median-line proximity
- *                  tests use signed-distance to line equations:
- *                    down medians:  fa−fb=0,  fa+2·fb−1=0,  2·fa+fb−1=0
- *                    up   medians:  fa−fb=0,  2·fa+fb−2=0,  fa+2·fb−2=0
- *                  Distance is normalized by √(aL²+bL²) for each line.
- *
- * Edge chars     : Equilateral edges as in 01. Median characters keyed
- *                  to the median's slope:
- *                    down: '\\', '/', '|'
- *                    up  : '\\', '|', '/'
- *                  (the diagonal fa=fb is shared between adjacent triangles)
- *
- * Movement       : Same TRI_DIR as 01_equilateral.c — cursor walks whole
- *                  equilaterals; the 6 sub-triangles are visual only.
- *
- * References     :
- *   Kisrhombille tiling   — https://en.wikipedia.org/wiki/Kisrhombille_tiling
- *   30-60-90 triangle     — https://en.wikipedia.org/wiki/Special_right_triangle
- *   Conway, "Symmetries of Things" §22 — kis-/truncation operations
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Take 01's equilateral grid. Inside every triangle, draw the three
- * medians. Each median is a straight line from a vertex to the midpoint
- * of the opposite edge — they all meet at the centroid. The result is
- * the "kisrhombille" tiling: each equilateral is now 6 small 30-60-90
- * right triangles. We don't store any of them; we add 3 extra distance
- * tests per pixel on top of 01's edge tests.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * The medians live in lattice space as straight lines aL·fa + bL·fb + cL = 0.
- * The perpendicular distance from a fractional lattice point (fa, fb) to
- * such a line is |aL·fa + bL·fb + cL| / √(aL² + bL²). If this distance is
- * below MEDIAN_T, the pixel is "on" the median — paint it with the median
- * color and the angle-appropriate ASCII character.
- *
- * For down (lower-left half of rhombus, fa+fb < 1):
- *   - Median from P00 to mid(P10, P01) lives on line  fa − fb = 0.
- *   - Median from P10 to mid(P00, P01) lives on line  fa + 2·fb − 1 = 0.
- *   - Median from P01 to mid(P00, P10) lives on line  2·fa + fb − 1 = 0.
- *
- * For up (upper-right half, fa+fb ≥ 1):
- *   - Median from P11 to mid(P10, P01) lives on line  fa − fb = 0.
- *     (the SAME line as down's first median — together they form one rhombus
- *     diagonal that passes through both centroids)
- *   - Median from P10 to mid(P11, P01) lives on line  2·fa + fb − 2 = 0.
- *   - Median from P01 to mid(P10, P11) lives on line  fa + 2·fb − 2 = 0.
- *
- * DRAWING METHOD  (raster scan, the approach used here)
- * ──────────────
- *  1. Pick TRI_SIZE; compute h = TRI_SIZE · √3/2.
- *  2. For every screen cell, run pixel→lattice as in 01.
- *  3. Compute the 3 edge weights (l1, l2, l3) and minimum em + char ech.
- *  4. Compute the 3 median signed distances and minimum mm + char mch.
- *  5. Choose what to draw:
- *       em < BORDER_W and em ≤ mm  →  EDGE character (PAIR_BORDER)
- *       mm < MEDIAN_T               →  MEDIAN character (PAIR_MEDIAN)
- *       otherwise                   →  interior, skip
- *  6. Cursor highlight uses PAIR_CURSOR for whichever wins.
- *
- * KEY FORMULAS
- * ────────────
- *  Same lattice inverse as 01:  b = py/h,  a = px/size − 0.5·b.
- *  Triangle id and barycentric weights — also same as 01.
- *
- *  Median signed distances (lattice-perpendicular):
- *    down: m1 = |fa − fb| / √2
- *          m2 = |fa + 2·fb − 1| / √5
- *          m3 = |2·fa + fb − 1| / √5
- *    up  : m1 = |fa − fb| / √2
- *          m2 = |2·fa + fb − 2| / √5
- *          m3 = |fa + 2·fb − 2| / √5
- *
- *  Median character choice:
- *    down: m1→'\\'  m2→'/'   m3→'|'
- *    up  : m1→'\\'  m2→'|'   m3→'/'
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Lattice space is skew, so "lattice perpendicular distance" is not
- *    quite the same as "pixel perpendicular distance". The medians render
- *    with a slight thickness anisotropy. Acceptable for a teaching demo.
- *  • The diagonal fa = fb is the SAME line for down's M1 and up's M2 — at
- *    the rhombus boundary they merge into one continuous rendered line.
- *  • Edge wins ties with the median: we draw the equilateral edge if the
- *    edge weight is below border_w AND ≤ the median minimum. This keeps
- *    the outer triangles' edges visually dominant over internal medians.
- *  • MEDIAN_T tuned by trial — too small and medians vanish; too big and
- *    they bleed into the interior.
- *
- * HOW TO VERIFY
- * ─────────────
- *  At lattice (fa, fb) = (0.5, 0.5) — the rhombus centre, on the diagonal:
- *    side test fa+fb=1 → pick up branch (boundary, classifier picks one).
- *    M2 distance = |2·0.5 + 0.5 − 2| / √5 = 0.5/√5 ≈ 0.224 — far from M2.
- *    M3 distance = |0.5 + 2·0.5 − 2| / √5 = 0.5/√5 ≈ 0.224 — far from M3.
- *    M1 distance = |0.5 − 0.5| / √2 = 0 — exactly on M1.
- *  Result: draws '\\' (M1's character). ✓ The rhombus diagonal renders
- *  as a single '\\' through the centre.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -166,9 +28,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 
@@ -185,12 +45,14 @@
 #define BORDER_W_MAX     0.30
 #define BORDER_W_STEP    0.02
 
-/* MEDIAN_T = perpendicular-distance threshold in lattice units. */
+/* How close a point must be to a slicing line to count as "on" it.
+   Bigger = thicker lines; smaller = thinner. Tuned by eye. */
 #define MEDIAN_T 0.05
 
 #define N_THEMES 4
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* The FPS number jitters frame to frame, so we smooth it: each frame nudges
+   the shown value a little toward the latest reading instead of replacing it. */
 #define FPS_EWMA_ALPHA 0.05
 
 #define PAIR_BORDER 1
@@ -199,9 +61,7 @@
 #define PAIR_HUD    4
 #define PAIR_HINT   5
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -218,9 +78,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static const short THEME_FG[N_THEMES][2] = {
     /* edge,  median */
@@ -250,30 +108,30 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx, pixel ↔ lattice + edge + median                  */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula — grid geometry, pixel↔triangle, edge + median ── */
 
 /*
- * GridCtx — geometry of the active kisrhombille grid.
- *
- * Same skew-lattice geometry as 01; adds median_t for the three median
- * proximity tests inside each equilateral triangle.
+ * GridCtx — everything we need to know about the current grid: how big the
+ * triangles are, how thick the lines are, and where the grid sits on screen.
+ * All the drawing math reads from one of these. Same geometry as 01, plus the
+ * median_t setting for the three internal slicing lines.
  */
 typedef struct {
-    /* terminal extent */
+    /* size of the terminal window, in character cells */
     int rows, cols;
 
-    /* triangle geometry */
-    double tri_size;       /* side length in pixels                          */
-    double border_w;       /* barycentric threshold for edge proximity       */
-    double median_t;       /* perpendicular-distance threshold for medians   */
-    int    cw, ch;         /* sub-pixel scaling — CELL_W, CELL_H             */
+    /* the triangles */
+    double tri_size;       /* triangle side length, in pixels                 */
+    double border_w;       /* how close to an outer edge counts as "on" it    */
+    double median_t;       /* how close to a slicing line counts as "on" it   */
+    int    cw, ch;         /* pixels per character cell (CELL_W, CELL_H);
+                              terminal cells are taller than wide, so these
+                              differ to keep triangles looking even           */
 
-    /* screen origin = pixel (0,0) */
+    /* where pixel (0,0) lands on screen — we centre the grid here */
     int    ox, oy;
 
-    /* advisory cursor bounds in lattice space */
+    /* rough count of triangles that fit across/down; advisory only */
     int    max_col, max_row;
 } GridCtx;
 
@@ -293,7 +151,9 @@ static void ctx_init(GridCtx *g, int rows, int cols)
 }
 
 /*
- * ctx_pixel_to_tri — same skew-lattice inverse as 01_equilateral.c §4.
+ * Given a pixel, tell us which triangle it falls in and where inside it.
+ * (fa, fb) are how far along the triangle's two slanted axes we are — like
+ * reading off a tilted graph-paper grid. Same math as 01_equilateral.c.
  */
 static void ctx_pixel_to_tri(const GridCtx *g, double px, double py,
                              int *col, int *row, int *up,
@@ -311,7 +171,8 @@ static void ctx_pixel_to_tri(const GridCtx *g, double px, double py,
 }
 
 /*
- * tri_centroid_pixel — pure forward map for cursor mark (same as 01).
+ * Find the centre point of a given triangle, in pixels — that's where we
+ * park the cursor mark. Same map as 01.
  */
 static void tri_centroid_pixel(int col, int row, int up, double size,
                                double *cx_pix, double *cy_pix)
@@ -333,7 +194,9 @@ static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
 }
 
 /*
- * tri_edge_char — same as 01_equilateral.c §4.
+ * For a point inside a triangle, find which of the three outer edges is
+ * closest, and report that distance plus the character that draws it
+ * (/, \, or _). Same as 01_equilateral.c.
  */
 static char tri_edge_char(int up, double fa, double fb, double *out_min)
 {
@@ -357,14 +220,12 @@ static char tri_edge_char(int up, double fa, double fb, double *out_min)
 }
 
 /*
- * tri_median_char — three median signed distances, return min and char.
- *
- * THE FORMULA (perpendicular distance to line aL·fa + bL·fb + cL = 0):
- *
- *   d = |aL·fa + bL·fb + cL| / √(aL² + bL²)
- *
- * Three lines per triangle (different per orientation). The smallest
- * distance picks the median character.
+ * For a point inside a triangle, find which of the three slicing lines is
+ * closest, and report that distance plus the character that draws it.
+ * Each line is described by a little equation; how far the point is from a
+ * line is just how far that equation is from zero (scaled so different lines
+ * compare fairly). The closest of the three wins. A triangle points either
+ * down or up, and the two cases use different lines, so we handle them apart.
  */
 static char tri_median_char(int up, double fa, double fb, double *out_min)
 {
@@ -372,11 +233,11 @@ static char tri_median_char(int up, double fa, double fb, double *out_min)
     static const double INV_SQRT5 = 0.44721359549995793928;
     double m1, m2, m3;
     char   ch1, ch2, ch3;
-    if (up == 0) {                          /* down */
+    if (up == 0) {                          /* downward-pointing triangle */
         m1 = fabs(fa - fb)         * INV_SQRT2; ch1 = '\\';
         m2 = fabs(fa + 2.0*fb - 1.0) * INV_SQRT5; ch2 = '/';
         m3 = fabs(2.0*fa + fb - 1.0) * INV_SQRT5; ch3 = '|';
-    } else {                                /* up */
+    } else {                                /* upward-pointing triangle */
         m1 = fabs(fa - fb)         * INV_SQRT2; ch1 = '\\';
         m2 = fabs(2.0*fa + fb - 2.0) * INV_SQRT5; ch2 = '|';
         m3 = fabs(fa + 2.0*fb - 2.0) * INV_SQRT5; ch3 = '/';
@@ -390,11 +251,11 @@ static char tri_median_char(int up, double fa, double fb, double *out_min)
 }
 
 /*
- * ctx_draw_bg — raster scan with edge AND median proximity tests.
- *
- * Per cell: if the equilateral edge wins (em < border_w and em ≤ mm),
- * draw the edge character; else if the median wins (mm < median_t),
- * draw the median character; else interior, skip.
+ * Walk every character cell on screen and decide what, if anything, it shows.
+ * For each cell we find its triangle and how close it is to an outer edge and
+ * to a slicing line. An outer edge wins ties and gets drawn first; otherwise a
+ * nearby slicing line gets drawn; otherwise the cell is empty interior. Cells
+ * inside the cursor's triangle are recoloured to highlight it.
  */
 static void ctx_draw_bg(const GridCtx *g, int cC, int cR, int cU)
 {
@@ -427,18 +288,19 @@ static void ctx_draw_bg(const GridCtx *g, int cC, int cR, int cU)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 cursor ── */
 
 /*
- * Cursor — same as 01_equilateral.c: (col, row, up) on the equilateral
- * lattice. The medians are visual overlays only — the cursor walks whole
- * triangles, not sub-triangles.
+ * Cursor — which triangle is currently selected. col/row pick the spot on the
+ * grid; up says whether it's the upward- or downward-pointing triangle there.
+ * The slicing lines are just decoration — the cursor only ever sits on a whole
+ * triangle, never one of the six little ones. Same as 01_equilateral.c.
  */
 typedef struct { int col, row, up; } Cursor;
 
-/* Same TRI_DIR as 01_equilateral.c — see that file for the derivation. */
+/* Lookup table for moving the cursor. Stepping in a direction can flip an
+   up triangle to a down one (or move to a neighbour), so each direction
+   stores how col/row/up change. Same table as 01_equilateral.c. */
 static const int TRI_DIR[4][2][3] = {
     /* LEFT  */ { { -1,  0,  1 }, {  0,  0,  0 } },
     /* RIGHT */ { {  0,  0,  1 }, { +1,  0,  0 } },
@@ -474,9 +336,7 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, int theme,
                      int paused, double fps)
@@ -508,9 +368,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, int theme,
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -524,9 +382,7 @@ static void screen_init(void)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;

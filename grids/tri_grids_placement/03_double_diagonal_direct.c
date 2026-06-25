@@ -1,131 +1,17 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 03_double_diagonal_direct.c — direct placement on tetrakis (4-wedge) grid
+ * 03_double_diagonal_direct.c — place glyphs on a grid of square cells,
+ * where each square is cut by both diagonals into 4 triangular wedges.
  *
- * DEMO: Each square is split by BOTH diagonals into 4 right-isosceles
- *       triangles labelled by the direction their apex points: N, E, S,
- *       W. Move '@' with arrows; SPACE toggles a glyph at the cursor
- *       wedge. An arrow key moves toward that compass direction —
- *       within the current square if possible, jumping squares when at
- *       the matching apex.
+ * Move '@' with the arrows; SPACE drops or removes a glyph at the wedge
+ * under the cursor. An arrow nudges you toward that compass direction,
+ * staying in the same square when it can and hopping to the next square
+ * when you're already at the matching point.
  *
- * Study alongside: grids/tri_grids/03_double_diagonal.c (rasterizer),
- *                  02_right_isosceles_direct.c (1 diagonal, 2 wedges).
- *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, TRI_SIZE, MAX_OBJ, DIR_N/E/S/W
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 5 pairs: edge / cursor / object / HUD / hint
- *   §4 gridctx  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg
- *   §5 pool     — Pool: place / remove / toggle / find / clear / draw
- *   §6 cursor   — Cursor + TETRA_DIR + reset / move / draw
- *   §7 mode     — direct toggle (lives in main loop)
- *   §8 scene    — hud_draw + scene_draw
- *   §9 screen   — ncurses init / cleanup
- *  §10 app      — signals, main loop
- *
- * Keys:  arrows:move  spc:toggle  g:glyph  C:clear  r:reset
- *        +/-:size  t:theme  q/ESC:quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/03_double_diagonal_direct.c \
- *       -o 03_double_diagonal_direct -lncurses -lm
+ * Sister files: grids/tri_grids/03_double_diagonal.c draws the same grid;
+ *               02_right_isosceles_direct.c uses 1 diagonal (2 wedges).
+ * Tetrakis square tiling: https://en.wikipedia.org/wiki/Tetrakis_square_tiling
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Tetrakis (a.k.a. "kis-square") tiling — every square
- *                  cut by both diagonals into 4 right-isosceles wedges
- *                  meeting at the centre. The cursor lives in
- *                  (col, row, wedge) where wedge ∈ {N, E, S, W}; SPACE
- *                  toggles an object at that address.
- *
- * Data-structure : Pool — flat array of Obj{col, row, wedge, glyph,
- *                  alive}. pool_remove swaps the dead slot with the
- *                  last item (O(1) removal, O(n) find).
- *
- * Wedge picker   : Translate (fa, fb) so the square centre is the origin
- *                  by computing (dx, dy) = (fa-0.5, fb-0.5). The wedge
- *                  is named by which axis dominates and the sign:
- *                    |dx| > |dy|, dx > 0 → E
- *                    |dx| > |dy|, dx ≤ 0 → W
- *                    |dy| ≥ |dx|, dy > 0 → S
- *                    |dy| ≥ |dx|, dy ≤ 0 → N
- *
- * References     :
- *   Tetrakis square tiling — https://en.wikipedia.org/wiki/Tetrakis_square_tiling
- *   Object pool pattern — gameprogrammingpatterns.com/object-pool.html
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * The grid is square cells, each cut into 4 wedges by the two diagonals.
- * An address is (col, row, wedge) where wedge ∈ {N, E, S, W} — the apex
- * direction of the wedge. The cursor walks wedges; SPACE pins a glyph
- * at the current wedge. The grid lives only as arithmetic; objects
- * live in an array of (col, row, wedge) records.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Picture a square cake split into 4 triangular slices by an X cut.
- * Each slice points outward in one cardinal direction. The cursor sits
- * in one slice; pressing N steps to the slice that points N — INSIDE
- * the same square if the current wedge is on the SOUTH side, or by
- * jumping to the square above when already pointing N. The TETRA_DIR
- * table encodes all 16 (arrow, current wedge) → (Δcol, Δrow, new wedge)
- * transitions.
- *
- * DRAWING METHOD  (per frame)
- * ──────────────
- *  1. erase()
- *  2. ctx_draw_bg — raster scan: for every screen cell, pixel_to_tri
- *     classifies the wedge, tri_edge_char picks an ASCII glyph by
- *     barycentric proximity to the wedge's three edges (two diagonals
- *     and one square side).
- *  3. pool_draw — for each placed object, glyph at wedge centroid
- *     screen cell.
- *  4. cursor_draw — '@' on top.
- *  5. hud_draw — top-right status, bottom-row hint.
- *
- * KEY FORMULAS
- * ────────────
- *  Pixel → square + wedge:
- *    a = px / size,   b = py / size
- *    col = ⌊a⌋,        row = ⌊b⌋
- *    fa  = a - col,    fb  = b - row
- *    dx  = fa - 0.5,   dy  = fb - 0.5
- *    if |dx| > |dy|:   wedge = (dx > 0) ? E : W
- *    else:             wedge = (dy > 0) ? S : N
- *
- *  Centroid lattice → pixel  (each centroid is 1/3 from the apex):
- *    N: (col + 1/2,    row + 1/6) · size
- *    E: (col + 5/6,    row + 1/2) · size
- *    S: (col + 1/2,    row + 5/6) · size
- *    W: (col + 1/6,    row + 1/2) · size
- *
- *  Cursor step: TETRA_DIR[arrow][cur->wedge] → (Δcol, Δrow, new_wedge).
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Centre tie: at fa == fb == 0.5 the cursor sits exactly at the
- *    apex meeting point. The classifier then resolves via the |dx| vs
- *    |dy| comparison (using ≥), defaulting to N/S over E/W. Harmless.
- *  • Glyph cycle, MAX_OBJ cap, resize behaviour: identical to
- *    01_equilateral_direct.c.
- *  • Aspect: CELL_W=2, CELL_H=4 → cells are 1:2 wide:tall. Wedges are
- *    right-isosceles in PIXEL space; on screen they appear taller than
- *    wide. This is a faithful aspect-corrected rendering, not a bug.
- *
- * HOW TO VERIFY
- * ─────────────
- *  Place a glyph in the N wedge of (0,0). Press DOWN: cursor → S
- *  wedge of (0,0) (same square). Press DOWN again: cursor → N wedge
- *  of (0,1) (next row). Two DOWNs traverse one whole square.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -138,9 +24,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 #define CELL_W 2
@@ -158,7 +42,7 @@
 
 #define FPS_EWMA_ALPHA 0.05
 
-/* Apex direction indices */
+/* The 4 wedges, named by which compass way their point faces */
 #define DIR_N 0
 #define DIR_E 1
 #define DIR_S 2
@@ -167,15 +51,13 @@
 #define PAIR_BORDER 1
 #define PAIR_CURSOR 2
 #define PAIR_OBJECT 3
-#define PAIR_HUD    4   /* status bar (yellow 226) */
-#define PAIR_HINT   5   /* key-hint footer (cyan 51) */
+#define PAIR_HUD    4   /* status bar (yellow) */
+#define PAIR_HINT   5   /* key-hint footer (cyan) */
 
 static const char  GLYPHS[N_GLYPHS] = { '*', 'o', '+', '#', 'X', '%' };
 static const char *DIR_NAME[4]      = { "N", "E", "S", "W" };
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -192,9 +74,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static const short THEME_FG[N_THEMES][2] = {
     {  82, 226 }, { 207, 226 }, { 207,  82 }, {  15,  39 },
@@ -218,22 +98,20 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx — tetrakis pixel↔lattice + background raster                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx — grid math + drawing the background ── */
 
 /*
- * GridCtx — tetrakis geometry + screen origin.
- *
- * tri_size lives here so the rest of the file does not depend on the
- * cursor for pure-grid math; the cursor only owns the user's address.
+ * GridCtx — everything needed to turn grid coordinates into screen
+ * positions and back. The square size lives here (not on the cursor) so
+ * all the grid math stays in one place; the cursor only remembers where
+ * the user is.
  */
 typedef struct {
-    int    rows, cols;
-    int    cw, ch;          /* terminal-cell size in sub-pixels */
-    int    ox, oy;          /* lattice origin in screen chars */
-    double tri_size;        /* square side length in pixels */
-    double border_w;        /* edge-render threshold (lattice units) */
+    int    rows, cols;      /* terminal size, in characters */
+    int    cw, ch;          /* how many sub-pixels one character is wide/tall */
+    int    ox, oy;          /* where the grid's origin sits on screen */
+    double tri_size;        /* side length of one square, in pixels */
+    double border_w;        /* how close to an edge a cell must be to draw it */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols, double tri_size)
@@ -247,15 +125,10 @@ static void ctx_init(GridCtx *g, int rows, int cols, double tri_size)
 }
 
 /*
- * pixel_to_tri — square cell + wedge classifier.
- *
- *   a = px / size,   b = py / size
- *   col = ⌊a⌋, row = ⌊b⌋, fa = a-col, fb = b-row
- *   dx = fa - ½, dy = fb - ½
- *   |dx| > |dy|, dx > 0  →  E
- *   |dx| > |dy|, dx < 0  →  W
- *   |dy| ≥ |dx|, dy > 0  →  S
- *   |dy| ≥ |dx|, dy < 0  →  N
+ * pixel_to_tri — given a point, find which square it's in and which of
+ * the 4 wedges. We measure how far the point sits from the square's
+ * centre: whichever direction it leans the most (left/right vs up/down)
+ * names the wedge.
  */
 static void pixel_to_tri(double px, double py, double size,
                          int *col, int *row, int *wedge,
@@ -273,9 +146,9 @@ static void pixel_to_tri(double px, double py, double size,
 }
 
 /*
- * tri_centroid_pixel — forward map for cursor / object / mark.
- *
- *   N: (½, 1/6)    E: (5/6, ½)    S: (½, 5/6)    W: (1/6, ½)
+ * tri_centroid_pixel — the middle point of a wedge, so we know where to
+ * draw the cursor or an object. Each wedge's middle sits a third of the
+ * way out from the square's centre toward its edge.
  */
 static void tri_centroid_pixel(int col, int row, int wedge, double size,
                                double *cx, double *cy)
@@ -292,21 +165,11 @@ static void tri_centroid_pixel(int col, int row, int wedge, double size,
 }
 
 /*
- * tri_edge_char — barycentric weights → edge character per wedge.
- *
- * Each wedge has C=(½,½) as apex; its two diagonal half-edges meet at C.
- *   N (A=(0,0), B=(1,0), C=(½,½)):
- *     l_A = 1−fa−fb,    l_B = fa−fb,        l_C = 2·fb
- *     l_A → '/'   l_B → '\\'  l_C → '_'
- *   E (A=(1,0), B=(1,1), C=(½,½)):
- *     l_A = fa−fb,      l_B = fa+fb−1,      l_C = 2·(1−fa)
- *     l_A → '\\'  l_B → '/'   l_C → '|'
- *   S (A=(0,1), B=(1,1), C=(½,½)):
- *     l_A = fb−fa,      l_B = fa+fb−1,      l_C = 2·(1−fb)
- *     l_A → '\\'  l_B → '/'   l_C → '_'
- *   W (A=(0,0), B=(0,1), C=(½,½)):
- *     l_A = 1−fa−fb,    l_B = fb−fa,        l_C = 2·fa
- *     l_A → '\\'  l_B → '/'   l_C → '|'
+ * tri_edge_char — pick the line character ('/', '\', '_' or '|') for a
+ * point, based on which of the wedge's three edges it's closest to. We
+ * measure the distance to each edge and let the nearest one win; the
+ * smallest distance also comes back so the caller can skip cells that
+ * aren't near any edge.
  */
 static char tri_edge_char(int wedge, double fa, double fb, double *out_min)
 {
@@ -340,7 +203,7 @@ static char tri_edge_char(int wedge, double fa, double fb, double *out_min)
     return ch;
 }
 
-/* Map (col, row, wedge) → terminal cell. */
+/* Turn a wedge address into the screen cell where it should be drawn. */
 static void ctx_to_screen(const GridCtx *g, int col, int row, int wedge,
                           int *scol, int *srow)
 {
@@ -367,11 +230,20 @@ static void ctx_draw_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_BORDER));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool ── */
 
+/*
+ * Obj — one placed glyph. col/row/wedge is its address on the grid;
+ * glyph is the character shown; alive marks whether the slot is in use.
+ */
 typedef struct { int col, row, wedge; char glyph; bool alive; } Obj;
+
+/*
+ * Pool — a fixed array of objects, holding the first `count` of them.
+ * Removing one is fast: we copy the last object over the gap instead of
+ * shuffling everything down, so the order isn't kept (which is fine,
+ * nothing here cares about order).
+ */
 typedef struct { Obj items[MAX_OBJ];  int count; } Pool;
 
 static int pool_find(const Pool *p, int col, int row, int wedge)
@@ -421,10 +293,14 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_OBJECT) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 cursor ── */
 
+/*
+ * Cursor — where the user is and their current settings. col/row/wedge
+ * is the wedge under '@'; glyph_idx picks which character SPACE drops;
+ * theme is the colour scheme; paused freezes nothing here but is shown
+ * in the status bar.
+ */
 typedef struct {
     int col, row, wedge;
     int glyph_idx;
@@ -433,17 +309,15 @@ typedef struct {
 } Cursor;
 
 /*
- * TETRA_DIR — arrow-key transitions (Δcol, Δrow, target_wedge).
- *   index 0:LEFT  1:RIGHT  2:UP  3:DOWN
- *   row   0:N     1:E      2:S   3:W
+ * TETRA_DIR — the lookup table for moving. Given which arrow you pressed
+ * and which wedge you're in, it gives back how far to shift the square
+ * (left/right, up/down) and which wedge you land in.
  *
- * Arrow press moves the cursor "toward" the compass direction. If the
- * current triangle's apex already points that way and its base edge is
- * the boundary, jump to the matching triangle in the adjacent square
- * (apex flipped). Otherwise toggle to the matching triangle in the same
- * square.
- *   W + LEFT  → E in (col-1, row)        N + LEFT → W in same square
- *   N + UP    → S in (col, row-1)        E + UP   → N in same square
+ * Pressing an arrow moves you toward that compass direction. Usually you
+ * just flip to the neighbouring wedge in the same square; but if your
+ * wedge already points that way, you hop into the next square and land
+ * in the wedge pointing back. For example, pressing LEFT while in the W
+ * wedge carries you into the E wedge of the square to the left.
  */
 static const int TETRA_DIR[4][4][3] = {
     /* LEFT  */ { {  0,  0, DIR_W }, {  0,  0, DIR_W }, {  0,  0, DIR_W }, { -1,  0, DIR_E } },
@@ -478,17 +352,13 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  mode — direct toggle (logic in main loop)                           */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 mode — direct toggle (logic in main loop) ── */
 
-/* Direct mode is the "identity" placement: SPACE toggles a single object
- * at the cursor's current (col, row, wedge). All mode logic lives in
- * the main loop's switch — there is nothing to abstract here. */
+/* There's only one placement mode here: SPACE drops or removes a single
+ * glyph at the cursor. There's nothing to factor out, so the handling
+ * just lives in the main loop's switch. */
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, const Pool *pool,
                      double fps)
@@ -521,9 +391,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, const Pool *pool,
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -536,9 +404,7 @@ static void screen_init(int theme)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §10 app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §10 app ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;

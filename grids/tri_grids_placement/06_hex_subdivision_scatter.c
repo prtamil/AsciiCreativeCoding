@@ -1,138 +1,17 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 06_hex_subdivision_scatter.c — distance-coloured scatter on hex-subdivision
+ * 06_hex_subdivision_scatter.c
  *
- * DEMO: A random scatter of N wedges fills a region around the cursor on
- *       a flat-top hex grid where each hex is split into 6 wedges by 3
- *       long diagonals. Each wedge is coloured on a 6-stop gradient by
- *       hex-axial distance from the cursor — closer = warm, farther =
- *       cool. Move '@' with arrows; ',' / '.' rotate the cursor sector.
- *       SPACE reseeds; +/- changes density.
+ * Scatters random dots over a flat-top hex grid where every hex is sliced
+ * into 6 pie wedges. The dots are fixed once you reseed; their colour is
+ * just how far each one sits from the cursor, so moving the cursor repaints
+ * the same dots warm-near / cool-far without re-rolling them.
  *
- * Study alongside: grids/tri_grids/06_hex_subdivision.c (rasterizer),
- *                  06_hex_subdivision_direct.c (manual placement),
- *                  01_equilateral_scatter.c (same idea on tri).
- *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, HEX_SIZE, SCATTER_RADIUS, DENSITY
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 6-bucket gradient palette + cursor / HUD / hint
- *   §4 gridctx  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg
- *   §5 pool     — Pool: place / find / draw  (scatter entries)
- *   §6 cursor   — Cursor + cursor_reset / cursor_move / cursor_rotate
- *   §7 mode     — scatter_seed (LCG random spawn) + bucket colouring
- *   §8 scene    — hud_draw + scene_draw
- *   §9 screen   — ncurses init / cleanup
- *  §10 app      — signals, main loop
- *
- * Keys:  arrows:move-hex  ,/.:rotate  spc:reseed  +/-:density
- *        r:reset  t:theme  q/ESC:quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/06_hex_subdivision_scatter.c \
- *       -o 06_hex_subdivision_scatter -lncurses -lm
+ * Sister files: grids/tri_grids/06_hex_subdivision.c (the grid itself),
+ *               06_hex_subdivision_direct.c (hand-placed version),
+ *               01_equilateral_scatter.c (same idea on a triangle grid).
+ * Hex coords + distance: https://www.redblobgames.com/grids/hexagons/
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Random scatter on the hex-subdivision grid. Pick N
- *                  random (ΔQ, ΔR, sector) within ±SCATTER_RADIUS of the
- *                  cursor; colour by hex-axial distance bucketed into 6
- *                  gradient slots.
- *
- * Data-structure : Pool — flat array of Obj{q, r, sector, glyph='*',
- *                  alive}. Bucket assignment is recomputed every frame
- *                  from cursor's current position; entries change only
- *                  on reseed.
- *
- * Distance metric: Hex axial (cube) distance for the (q, r) part; plus a
- *                  small sector-mismatch penalty if Δsector ≠ 0. This is
- *                  the proper hex graph distance — exact, not a Manhattan
- *                  proxy.
- *
- * Re-seeding     : SPACE re-randomises with a new seed (xor'd by clock).
- *                  +/- density also reseeds. Cursor movement does NOT.
- *
- * References     :
- *   Hexagonal coordinates — https://www.redblobgames.com/grids/hexagons/
- *   Hex distance — Red Blob Games "hex grid distance"
- *   Linear congruential generator — Numerical Recipes ch. 7
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Two halves: STORAGE (random scatter of (q, r, sector) addresses,
- * generated once per reseed) and COLOURING (a pure function of cursor
- * distance, recomputed every frame). Moving the cursor never reseeds; it
- * only repaints the same scatter through a different distance lens.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Sprinkle salt on a soccer-ball-pattern grid with diameter cuts —
- * grains land in random wedges within a disc around the cursor's hex.
- * Now point a coloured spotlight at the cloth: grains close to the beam
- * glow warm, farther ones cool. Move the spotlight: same grains,
- * different colours.
- *
- * DRAWING METHOD  (per frame)
- * ──────────────
- *  1. erase()
- *  2. ctx_draw_bg — hex border via angle_char + 3-radii proximity
- *     overlay.
- *  3. For each scatter entry:
- *       d = hex_dist(obj.q - cur.q, obj.r - cur.r)
- *           + (obj.sector != cur.sector ? 1 : 0)
- *       bucket = min(d, N_BUCKETS - 1)
- *       attron(COLOR_PAIR(PAIR_BUCKET_0 + bucket))
- *       mvaddch(wedge_centroid_screen, '*')
- *  4. cursor_draw — '@' on top.
- *
- *  Reseed (only on SPACE or +/- density):
- *    pool->count = 0
- *    g_seed ^= clock_ns()
- *    for i in 0..density:
- *      dQ = floor(frand·(2·R+1)) - R    ; dR = same
- *      s  = (int)floor(frand · 6)       // 0..5
- *      pool_place(cur.q+dQ, cur.r+dR, s)   // dedup
- *
- * KEY FORMULAS
- * ────────────
- *  Hex axial (cube) distance:
- *    d_hex = max(|ΔQ|, |ΔR|, |ΔQ + ΔR|)
- *  This is exact for the hex graph (NOT a Manhattan approximation).
- *
- *  Wedge centroid (used by pool_draw):
- *    angle = sector · π/3
- *    radius = size · √3 / 3
- *    cx_w   = cx + radius · cos(angle)
- *    cy_w   = cy + radius · sin(angle)
- *
- *  LCG step:
- *    g_seed = g_seed · 1103515245 + 12345
- *    frand  = ((g_seed >> 16) & 0x7FFF) / 32767.0
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Hex distance vs sector: the sector mismatch only adds 1 unit; two
- *    wedges of the same hex can be visually quite distant but share
- *    d_hex = 0. The "+1 if Δsector" term keeps neighbours inside one
- *    hex from all collapsing to the same colour bucket.
- *  • SCATTER_RADIUS is in HEX cells, not pixels.
- *  • Density vs MAX_OBJ: dedup and high density may give fewer dots
- *    than requested.
- *
- * HOW TO VERIFY
- * ─────────────
- *  Place cursor at the centre of a fresh scatter — colours warmest near
- *  '@'. Walk the cursor a few hexes outward: same dots persist; the
- *  warm/cool boundary follows the cursor. Press ',' to rotate cursor
- *  sector — the bucket of any dot in the cursor's hex shifts by 0 or 1
- *  depending on whether its sector now matches.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -149,9 +28,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 
@@ -180,13 +57,11 @@
 #define PAIR_BORDER 1
 #define PAIR_RADIUS 2
 #define PAIR_CURSOR 3
-#define PAIR_BUCK0  4   /* 4..9  (6 buckets) */
+#define PAIR_BUCK0  4   /* the 6 distance colours live in pairs 4..9 */
 #define PAIR_HUD    10
 #define PAIR_HINT   11
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -201,9 +76,11 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
+
+/* Six warm-to-cool stops, one per distance ring. Themes 0/1 just flip the
+ * direction; theme 2 is a grey fallback. The _8 table is the same idea on
+ * terminals that only have 8 colours. */
 
 static const short THEME_GRAD[N_THEMES][N_BUCKETS] = {
     { 196, 202, 214, 226,  82,  39 },
@@ -230,10 +107,17 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx                                                             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx ── */
 
+/* Everything needed to turn a hex address into a spot on the screen, kept in
+ * one place so a resize just rebuilds this and the rest of the code follows.
+ *   rows, cols      screen size in characters
+ *   cw, ch          how many sub-pixels one character cell is wide/tall
+ *   hex_size        radius of a hex in those sub-pixels (bigger = zoom in)
+ *   ox, oy          where hex (0,0) lands, in character cells (the centre)
+ *   max_q, max_r    how far the cursor may roam before it leaves the screen
+ *   border_w        how thick the hex outline is, as a fraction of a hex
+ *   radius_t_frac   how close to a diagonal a cell must be to draw the cut */
 typedef struct {
     int    rows, cols;
     int    cw, ch;
@@ -256,6 +140,7 @@ static void ctx_init(GridCtx *g, int rows, int cols, double hex_size)
     g->radius_t_frac = RADIUS_T_FRAC;
 }
 
+/* Picks the ASCII glyph that best fakes a line tilted at this angle. */
 static char angle_char(double theta)
 {
     double t = fmod(theta, M_PI);
@@ -267,6 +152,9 @@ static char angle_char(double theta)
     return '-';
 }
 
+/* Given a pixel, finds which hex it falls in and how far it is from that
+ * hex's centre (0 at the middle, ~0.5 at the edge). The rounding dance fixes
+ * the case where naive rounding would pick a hex that isn't actually closest. */
 static void pixel_to_hex(double px, double py, double size,
                          int *Q, int *R, double *dist)
 {
@@ -298,6 +186,8 @@ static void hex_centre_pixel(int Q, int R, double size,
     *cy = size * (sq3*0.5 * (double)Q + sq3 * (double)R);
 }
 
+/* Centre point of one pie wedge: step out from the hex centre toward the
+ * middle of that sector, so a dot lands inside its slice not on the seam. */
 static void wedge_centroid_pixel(int Q, int R, int sector, double size,
                                  double *cx_pix, double *cy_pix)
 {
@@ -318,6 +208,9 @@ static void ctx_to_screen(const GridCtx *g, int q, int r, int sector,
     *srow = g->oy + (int)(cy / g->ch);
 }
 
+/* Paints the grid lines: walks every screen cell, asks which hex it's in,
+ * and inks it if it sits on the hex outline or on one of the three diagonal
+ * cuts. The whole grid is just this proximity test, no per-hex loop. */
 static void ctx_draw_bg(const GridCtx *g)
 {
     double sq3 = sqrt(3.0), sq3_2 = sq3 * 0.5;
@@ -352,16 +245,22 @@ static void ctx_draw_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_BORDER));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool ── */
 
+/* One scattered dot.
+ *   q, r     which hex it sits in (axial coords)
+ *   sector   which of the 6 pie wedges, 0..5
+ *   glyph    the character to draw (always '*' here)
+ *   alive    false skips it when drawing; lets us blank a dot without moving
+ *            everything after it in the array */
 typedef struct {
     int  q, r, sector;
     char glyph;
     bool alive;
 } Obj;
 
+/* All the scattered dots in one fixed-size bag. count is how many slots are
+ * actually used; we never free or realloc, just refill from the front. */
 typedef struct {
     Obj items[MAX_OBJ];
     int count;
@@ -369,16 +268,20 @@ typedef struct {
 
 static void pool_clear(Pool *p) { p->count = 0; }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 cursor ── */
 
+/* The user's '@' marker plus the live settings it carries around.
+ *   q, r, sector   where the cursor is, in hex + wedge terms
+ *   density        how many dots a reseed tries to spawn
+ *   theme          which colour set is active, 0..N_THEMES-1
+ *   paused         currently unused by the loop, kept for the 'p' key */
 typedef struct {
     int q, r, sector;
     int density;
     int theme, paused;
 } Cursor;
 
+/* Arrow keys map to these q,r steps. */
 static const int HEX_DIR[4][2] = {
     { 0, -1 },   /* UP    */
     { 0, +1 },   /* DOWN  */
@@ -394,6 +297,7 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->theme = 0; cur->paused = 0;
 }
 
+/* Steps one hex in the given direction, but refuses to walk off the grid. */
 static void cursor_move(Cursor *cur, const GridCtx *g, int idx)
 {
     int nq = cur->q + HEX_DIR[idx][0];
@@ -419,10 +323,11 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  mode — scatter (LCG spawn + bucket colouring)                       */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 mode ── */
 
+/* A tiny home-grown random number generator: each call scrambles g_seed and
+ * hands back a number in [0,1). Good enough for sprinkling dots, and it lets
+ * us reproduce a scatter from a known seed. */
 static unsigned int g_seed = 1;
 static double frand(void)
 {
@@ -430,7 +335,8 @@ static double frand(void)
     return ((double)((g_seed >> 16) & 0x7FFF)) / 32767.0;
 }
 
-/* Cube distance between two hexes (axial → cube via s = -q - r). */
+/* How many hex steps apart two hexes are — the true grid distance, not a
+ * straight-line guess. */
 static int hex_distance(int aQ, int aR, int bQ, int bR)
 {
     int aS = -aQ - aR, bS = -bQ - bR;
@@ -442,6 +348,9 @@ static int hex_distance(int aQ, int aR, int bQ, int bR)
     return m;
 }
 
+/* Distance between two wedges: the hex distance, plus a little extra for
+ * pointing at different sectors. Without that nudge, all 6 wedges of one hex
+ * would share a colour; the sector term spreads them across nearby buckets. */
 static int wedge_distance(int aQ, int aR, int aS, int bQ, int bR, int bS)
 {
     int hd = hex_distance(aQ, aR, bQ, bR);
@@ -449,6 +358,7 @@ static int wedge_distance(int aQ, int aR, int aS, int bQ, int bR, int bS)
     return hd + sd;
 }
 
+/* Maps a distance onto one of the 6 colour rings, 0 = nearest. */
 static int distance_bucket(int dist, int max_d)
 {
     if (max_d <= 0) return 0;
@@ -457,6 +367,9 @@ static int distance_bucket(int dist, int max_d)
     return b;
 }
 
+/* Throws a fresh batch of dots into random wedges within a disc around the
+ * cursor. Mixing the clock into the seed makes each reseed look different.
+ * The tries cap stops us spinning forever if the pool fills up. */
 static void scatter_seed(Pool *pool, const Cursor *cur)
 {
     pool_clear(pool);
@@ -472,6 +385,8 @@ static void scatter_seed(Pool *pool, const Cursor *cur)
     }
 }
 
+/* Draws every live dot, colouring it by how far it is from the cursor right
+ * now. This is where "move cursor, colours follow" actually happens. */
 static void scatter_draw(const Pool *p, const Cursor *cur, const GridCtx *g)
 {
     for (int i = 0; i < p->count; i++) {
@@ -489,9 +404,7 @@ static void scatter_draw(const Pool *p, const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, const Pool *p,
                      double fps)
@@ -523,9 +436,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, const Pool *p,
     wnoutrefresh(stdscr); doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(int theme)
@@ -536,9 +447,7 @@ static void screen_init(int theme)
     color_init(theme); atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §10 app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §10 app ── */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 static void on_signal(int s)

@@ -1,134 +1,16 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 06_hex_subdivision_path.c — line-of-sight path on hex-subdivision grid
+ * 06_hex_subdivision_path.c — draw the straight line between two wedges
+ * on a hex grid where each hex is cut into 6 pie slices.
  *
- * DEMO: Two markers (S/E) on a flat-top hex grid where each hex is split
- *       into 6 wedges by 3 long diagonals. Move '@' with arrows (whole
- *       hexes); ',' / '.' rotate the cursor sector. Press 's' to set
- *       START at the cursor wedge, 'e' to set END. The path is computed
- *       by pixel-walking the centroid-to-centroid line and recording
- *       each (q, r, sector) wedge it passes through.
+ * Pick a start slice (s) and an end slice (e); the program traces the
+ * straight line between them and lights up every slice it passes through.
  *
- * Study alongside: grids/tri_grids/06_hex_subdivision.c (rasterizer),
- *                  06_hex_subdivision_direct.c (manual placement),
- *                  01_equilateral_path.c (same idea on equilateral).
- *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, HEX_SIZE, MAX_OBJ
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 7 pairs: edge / radius / cursor / start / end / path / HUD
- *   §4 gridctx  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg
- *   §5 pool     — Pool: place / find / draw  (path entries, glyph='*')
- *   §6 cursor   — Cursor + cursor_reset / cursor_move / cursor_rotate
- *   §7 mode     — path: state machine (set start, set end) + line walk
- *   §8 scene    — hud_draw + scene_draw
- *   §9 screen   — ncurses init / cleanup
- *  §10 app      — signals, main loop
- *
- * Keys:  arrows:move-hex  ,/.:rotate  s:set-start  e:set-end
- *        spc:clear-path  +/-:size  t:theme  r:reset  q/ESC:quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/06_hex_subdivision_path.c \
- *       -o 06_hex_subdivision_path -lncurses -lm
+ * Sister files: grids/tri_grids/06_hex_subdivision.c (draws the grid),
+ *               06_hex_subdivision_direct.c (place slices by hand),
+ *               01_equilateral_path.c (same idea on a triangle grid).
+ * Hex coordinate math: https://www.redblobgames.com/grids/hexagons/
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Line-rasterize between two wedge centroids in PIXEL
- *                  space. For each sampled pixel, compute (q, r) via
- *                  cube-rounding, then classify the SECTOR by atan2 of
- *                  the offset from the hex centre. The result is the
- *                  ordered set of (q, r, sector) wedges traversed by the
- *                  straight line.
- *
- * Data-structure : Pool — flat array of Obj{q, r, sector, glyph='*',
- *                  alive}. Dedup via pool_find.
- *
- * Sector test    : sector_of(dx, dy) bins atan2(dy, dx) into 6 wedges
- *                  rotated by 30°:
- *                    s = floor((ang + π/6) / (π/3)) mod 6
- *
- * Sampling step  : ~hex_size/4 — fine enough that no wedge is skipped.
- *
- * References     :
- *   Hexagonal coordinates — https://www.redblobgames.com/grids/hexagons/
- *   Bresenham line — https://en.wikipedia.org/wiki/Bresenham%27s_line_algorithm
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Stretch a string from S to E across a hex grid with diameters drawn
- * inside every hex. The path is the ordered list of wedges the string
- * passes through. We rediscover that list by pixel-walking the string
- * and asking — at every sample — which (q, r, sector) wedge owns the
- * point. Cube-rounding answers (q, r); atan2 answers the sector.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * The grid topology is two-tiered: hex membership (cube-rounding) and
- * wedge angle (atan2 from hex centre). The line walks across hex
- * boundaries and across diameter boundaries; each crossing introduces a
- * new (q, r, sector) into the path. Sampling at hex_size/4 is more than
- * fine enough — wedges are large fractions of a hex.
- *
- * DRAWING METHOD  (per frame)
- * ──────────────
- *  1. erase()
- *  2. ctx_draw_bg — for each screen cell:
- *       pixel_to_hex → (q, r, dist)
- *       hex_centre_pixel → (cx, cy)
- *       if dist > limit_inner: render hex border via angle_char
- *       else: test proximity to the 3 radii; if near, render the radius
- *             character.
- *  3. pool_draw — '*' at each path wedge centroid screen cell.
- *  4. marker_draw — 'S' at start, 'E' at end.
- *  5. cursor_draw — '@' at cursor wedge.
- *
- *  path_compute runs only on START/END change or size change.
- *
- * KEY FORMULAS
- * ────────────
- *  Pixel → axial hex: cube-round (fq, fr, fs=-fq-fr) → integer (q, r).
- *
- *  Sector classifier:
- *    dx = px - cx,   dy = py - cy
- *    ang = atan2(dy, dx)
- *    sector = floor((ang + π/6) / (π/3)) mod 6
- *
- *  Wedge centroid:
- *    angle = sector · π/3
- *    radius = size · √3 / 3
- *    cx_w   = cx + radius · cos(angle)
- *    cy_w   = cy + radius · sin(angle)
- *
- *  Walk parameters:
- *    dx = ex - sx,  dy = ey - sy
- *    dist = sqrt(dx² + dy²)
- *    step = hex_size · 0.25
- *    n    = floor(dist / step) + 1
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Sector tie at hex centre: when (dx, dy) ≈ (0, 0) the atan2 angle is
- *    undefined; sector_of returns 0 deterministically because the +π/6
- *    bias places the centre solidly in sector 0.
- *  • Cube-round drift: the largest residual is snapped back; this can
- *    flip the chosen hex by 1 in pathological floating-point cases.
- *  • Recompute on size change: '+'/'-' must call path_compute.
- *  • Zero-length, MAX_OBJ cap: identical to other _path siblings.
- *
- * HOW TO VERIFY
- * ─────────────
- *  Set START at sector 0 (east wedge) of (0,0); set END at sector 3
- *  (west wedge) of (0,0): path size ≈ 4 (the line crosses sectors 0 → 1
- *  → 2 → 3 inside one hex). Walk END to (1, 0, 0): path reaches across
- *  the hex boundary; sector-0 entries appear in two different hexes.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -145,9 +27,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 
@@ -176,9 +56,7 @@
 #define PAIR_HUD    7
 #define PAIR_HINT   8
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -193,12 +71,10 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static const short THEME_FG[N_THEMES][4] = {
-    /* edge,  radius, start, end */
+    /* colors in order: hex outline, the 3 inner diagonals, start marker, end marker */
     {  75,  39,  82, 196 },
     {  82, 226, 226, 207 },
     { 207, 196,  82,  39 },
@@ -232,16 +108,20 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx                                                             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx ── */
 
+/*
+ * Everything we need to turn hex coordinates into screen positions and back.
+ * Built once at startup and rebuilt on resize or when the hexes change size.
+ */
 typedef struct {
-    int    rows, cols;
-    int    cw, ch;
-    double hex_size;
-    int    ox, oy;
-    int    max_q, max_r;
+    int    rows, cols;            /* terminal size, in characters */
+    int    cw, ch;               /* width and height of one character cell, in sub-pixels */
+    double hex_size;             /* radius of a hex, in pixels — bigger means fewer, larger hexes */
+    int    ox, oy;               /* screen cell that hex (0,0) sits on */
+    int    max_q, max_r;         /* how far the cursor may roam from the centre */
+    /* border_w: how thick the hex outline is, as a fraction of a hex.
+     * radius_t_frac: how close a point must be to a diagonal to count as on it. */
     double border_w, radius_t_frac;
 } GridCtx;
 
@@ -366,16 +246,16 @@ static void ctx_draw_bg(const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool ── */
 
+/* One wedge on the path: which hex (q,r) and which of its 6 slices (sector). */
 typedef struct {
     int  q, r, sector;
-    char glyph;
-    bool alive;
+    char glyph;                  /* character drawn for it, '*' here */
+    bool alive;                  /* false if this slot was cleared */
 } Obj;
 
+/* The whole path as a plain list of wedges, filled fresh each time it's recomputed. */
 typedef struct {
     Obj items[MAX_OBJ];
     int count;
@@ -414,18 +294,22 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_PATH) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 cursor ── */
 
+/*
+ * The user's current selection plus the two chosen endpoints.
+ * The cursor (@) is where they're pointing now; sQ/sR/sSec and eQ/eR/eSec
+ * are the start and end wedges they've locked in with 's' and 'e'.
+ */
 typedef struct {
-    int q, r, sector;
-    int sQ, sR, sSec;
-    int eQ, eR, eSec;
-    int has_start, has_end;
-    int theme, paused;
+    int q, r, sector;            /* wedge the cursor is on right now */
+    int sQ, sR, sSec;            /* start wedge, valid only when has_start */
+    int eQ, eR, eSec;            /* end wedge, valid only when has_end */
+    int has_start, has_end;      /* whether each endpoint has been set */
+    int theme, paused;           /* current color theme; paused is unused here */
 } Cursor;
 
+/* Arrow keys map to these whole-hex steps. */
 static const int HEX_DIR[4][2] = {
     { 0, -1 },   /* UP    */
     { 0, +1 },   /* DOWN  */
@@ -466,13 +350,12 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  mode — path state machine + line walk                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 mode — path state machine + line walk ── */
 
 /*
- * path_compute — pixel-walk between two wedge centroids; for each
- * sample, identify the (q, r, sector) triple it falls in.
+ * Walk the straight line from the start wedge to the end wedge in small steps,
+ * and at each step note which wedge that point lands in. Re-run whenever the
+ * endpoints or the hex size change.
  */
 static void path_compute(Pool *pool, const Cursor *cur, const GridCtx *g)
 {
@@ -511,9 +394,7 @@ static void marker_draw(const GridCtx *g, int q, int r, int s,
     attroff(COLOR_PAIR(pair) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, const Pool *p,
                      double fps)
@@ -549,9 +430,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, const Pool *p,
     wnoutrefresh(stdscr); doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(int theme)
@@ -562,9 +441,7 @@ static void screen_init(int theme)
     color_init(theme); atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §10 app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §10 app ── */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 static void on_signal(int s)

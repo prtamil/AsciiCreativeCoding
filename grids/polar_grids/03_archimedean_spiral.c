@@ -1,147 +1,44 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 03_archimedean_spiral.c — Archimedean spiral grid (constant pitch)
+ * 03_archimedean_spiral.c — an Archimedean spiral grid.
  *
- * DEMO: One or more spiral arms wind outward at constant pitch — the gap
- *       between successive passes at any radius is always the same.  The
- *       N_ARMS trick renders all arms simultaneously with a single modular
- *       test per cell.  An '@' cursor sits at the (turn, spoke) cell — arrows
- *       step it across the grid.  +/- adjusts the pitch (tighter vs looser
- *       coil); [/] changes the number of arms.
+ * One or more spiral arms wind outward, and the gap between turns stays the
+ * same no matter how far out you go (that's what "Archimedean" means). A '@'
+ * cursor rides the spiral; arrows move it, +/- tighten or loosen the coil,
+ * [/] add or remove arms.
  *
- * Study alongside: 04_log_spiral.c (variable pitch),
- *                  01_rings_spokes.c (constant ring spacing),
- *                  ../rect_grids/01_uniform_rect.c (the GridCtx template)
+ * Study alongside: 04_log_spiral.c (gap grows as you go out),
+ *                  01_rings_spokes.c (evenly spaced rings, same idea),
+ *                  ../rect_grids/01_uniform_rect.c (the GridCtx template).
  *
- * Section map:
- *   §1 config   — pitch, arm count, themes, EWMA
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — theme-switchable PAIR_GRID + HUD/HINT/CURSOR
- *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg + angle_char
- *   §5 cursor   — Cursor (turn, spoke) + cursor_reset / cursor_move / cursor_draw
- *   §6 scene    — hud_draw + scene_draw
- *   §7 screen   — ncurses init / cleanup
- *   §8 app      — signals, resize, main loop
- *
- * Keys:  q/ESC quit   p pause   t theme   r reset
- *        arrows move @   +/- pitch (pixels/turn)   [/] arm count
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/polar_grids/03_archimedean_spiral.c \
- *       -o 03_archimedean_spiral -lncurses -lm
+ * Reference: en.wikipedia.org/wiki/Archimedean_spiral
  */
 
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
+/* ── HOW THE SPIRAL IS DRAWN ──
  *
- * Algorithm      : Archimedean spiral arm detection via the N-arm phase test.
+ * A single Archimedean spiral arm follows r = a·θ: the radius grows in step
+ * with the angle. So a point sits on the arm when its angle θ matches r/a.
  *
- *                  An Archimedean spiral satisfies r = a × θ (one arm).
- *                  Rearranging: θ = r / a.  For N arms equally spaced by
- *                  2π/N, arm k satisfies θ = r/a + k × 2π/N.
+ * We test every cell: how far is its actual angle from r/a? Call that gap the
+ * "phase". Phase near zero means the cell lands on the arm — draw it.
  *
- *                  The N-arm phase trick: multiply the "offset" (θ − r/a) by
- *                  N and test whether the result is near a multiple of 2π:
+ * The arm-count trick: for N evenly spaced arms, multiply the phase by N
+ * before testing. That lines up all N arms onto the same target at once, so a
+ * single test catches every arm with no loop. (The reason: arm k sits exactly
+ * k·2π/N off the base arm, and multiplying by N turns that offset into a whole
+ * number of full turns, which the wrap-around test reads as "on the arm".)
  *
- *                    phase = fmod(N × (θ − r/a) + N×2π, 2π)
- *                    on_spiral : phase < W || phase > 2π − W
+ * The pitch is the pixel gap between successive turns. We store it directly in
+ * pixels; a = pitch / (2π) is just how much the radius grows per radian.
  *
- *                  Why it works: for point on arm k, θ = r/a + k×2π/N, so
- *                  N×(θ−r/a) = N×k×2π/N = k×2π.  fmod(k×2π, 2π) = 0. ✓
- *                  Any k tests as on-spiral, so ALL arms are detected at once.
- *
- * Data-structure : Two structs — GridCtx (terminal extent, pitch, n_arms,
- *                  ox/oy) and Cursor (turn index, spoke index in the angular
- *                  fineness chosen for placement).  ctx_to_screen samples the
- *                  spiral at angle (turn × 2π + spoke × 2π/CURSOR_SPOKES)
- *                  and lays the cursor on the resulting (r, θ) point.
- *
- * Math           : The pitch (gap between successive turns at fixed θ) is
- *                  PITCH = a × 2π for a single arm, or PITCH/N for N arms.
- *                  The parameter a = PITCH / (2π).  Pitch is set in pixels
- *                  and relates to RING_SPACING in 01_rings_spokes: equal
- *                  pitch gives equal turn-to-turn gap for any radius.
- *
- * Rendering      : Because the spiral is neither purely horizontal nor
- *                  vertical, angle_char(theta) naturally produces the
- *                  correct slanted line character at each point.
- *
- * Performance    : Same O(rows × cols) sweep as 01.
- *
- * References     :
- *   Archimedean spiral — en.wikipedia.org/wiki/Archimedean_spiral
- *   Spirals in nature — Livio 2002, "The Golden Ratio", chapter 5
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ──────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- *   An Archimedean spiral winds outward at constant pitch: at any radius, the
- *   gap between successive turns is always PITCH pixels.  The N-arm phase test
- *   detects ALL arms simultaneously with one modular expression — no loop.
- *   The Cursor address (turn t, spoke s) names a sample taken on arm 0 at
- *   angle (t × 2π + (s + 0.5) × 2π / CURSOR_SPOKES), giving exactly one
- *   well-defined screen position per (t, s).
- *
- * HOW TO THINK ABOUT IT
- *   For arm 0: r = a × θ.  Every point on the spiral satisfies θ = r/a.
- *   The "phase" of a cell (r, θ) is how far θ deviates from the spiral's
- *   prediction r/a.  Phase ≈ 0 → on the spiral.  Phase ≈ π → opposite side.
- *
- *   For N arms equally spaced by 2π/N, arm k satisfies θ = r/a + k×2π/N.
- *   Multiplying the phase by N maps all N arms to the SAME modular value 0.
- *   One test catches every arm.
- *
- * DRAWING METHOD
- *   1. dx = (col−ox)×CELL_W,  dy = (row−oy)×CELL_H
- *   2. r = √(dx²+dy²),  θ = atan2(dy,dx)
- *   3. If r < MIN_R: skip
- *   4. θ_norm = fmod(θ + 2π, 2π)            ← [0, 2π)
- *   5. a = PITCH / (2π)                      ← radial advance per radian
- *   6. raw = N × (θ_norm − r/a)             ← N-arm phase, unbounded
- *   7. phase = fmod(raw + N×2π, 2π)          ← normalise to [0, 2π)
- *   8. on_spiral = phase < SPIRAL_W  ||  phase > 2π − SPIRAL_W
- *   9. Draw angle_char(θ) if on_spiral.
- *
- * KEY FORMULAS
- *   Single arm: r = a × θ,  so  a = PITCH / (2π)
- *     After one turn Δθ = 2π the radius increases by a×2π = PITCH.  ✓
- *
- *   N-arm phase derivation:
- *     On arm k: θ = r/a + k×2π/N
- *     phase = N × (θ_norm − r/a)
- *           = N × (r/a + k×2π/N − r/a)     [substitute arm k equation]
- *           = k × 2π
- *     fmod(k×2π, 2π) = 0  →  every arm k tests as "on_spiral".  ✓
- *
- *   Cursor → screen (turn t, spoke s):
- *     theta_sample = (t + (s + 0.5) / CURSOR_SPOKES) × 2π
- *     r_sample     = a × theta_sample
- *     cx = r_sample × cos theta_sample;  cy = r_sample × sin theta_sample
- *     sc = ox + (int)round(cx / CELL_W);  sr = oy + (int)round(cy / CELL_H)
- *
- * EDGE CASES TO WATCH
- *   • PITCH=0: a=0 → r/a = ∞.  Constrained to [PITCH_MIN, PITCH_MAX].
- *   • Centre smear: near origin θ_norm − r/a changes rapidly.
- *     Hard guard: skip cells with r < MIN_R.
- *   • Large N: each arm's angular width is SPIRAL_W/N in θ space.  At N=8
- *     arms may look very thin.  Increase SPIRAL_W if arms disappear.
- *   • Cursor max_turn comes from the visible radius vs pitch; recomputed
- *     on resize and on +/- pitch changes.
- *
- * HOW TO VERIFY
- *   PITCH=32, N=1, ox=40, oy=12.  a = 32/(2π) ≈ 5.093.
- *
- *   Point on arm 0 at θ=0 (rightward), k-th pass (k≥1):
- *     r = a × 2πk = PITCH × k  →  first pass at r=32px
- *     col = 40 + round(32/2) = 56.
- *   Check cell (col=56, row=12):
- *     dx=(56−40)×2=32, dy=0  →  r=32, θ=0  →  θ_norm=0
- *     raw = 1×(0 − 32/5.093) = −6.284 ≈ −2π
- *     phase = fmod(−6.284 + 2π, 2π) = fmod(0, 2π) = 0
- *     0 < SPIRAL_W(0.20)  →  on_spiral = true  ✓
- *
- * ─────────────────────────────────────────────────────────────────────── */
+ * Watch out for:
+ *   • Very near the centre the angle-vs-r/a math swings wildly, so we skip
+ *     cells closer than MIN_R to avoid a smeary blob at the origin.
+ *   • With many arms each arm gets thin (its width is shared N ways). Bump
+ *     SPIRAL_W if arms start vanishing.
+ *   • The cursor's reach (max_turn) depends on screen size and pitch, so it's
+ *     recomputed on resize and whenever pitch changes.
+ */
 
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
@@ -158,21 +55,19 @@
 #  define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS      30
 #define CELL_W          2
 #define CELL_H          4
 
-/* Spiral pitch: pixel distance between successive turns (= a × 2π for 1 arm) */
+/* Pitch: the pixel gap between one turn of the spiral and the next. */
 #define PITCH_DEFAULT   32.0
 #define PITCH_MIN        8.0
 #define PITCH_MAX       80.0
 #define PITCH_STEP       4.0
 
-/* Angular half-width of the spiral line (radians in N×phase space) */
+/* How thick the spiral line is — bigger means a fatter, easier-to-see arm. */
 #define SPIRAL_W        0.20
 
 /* Number of spiral arms */
@@ -180,13 +75,13 @@
 #define N_ARMS_MIN       1
 #define N_ARMS_MAX       8
 
-/* Minimum pixel radius — avoids a dense smear at the very centre */
+/* Skip cells this close to the centre — keeps the origin from smearing. */
 #define MIN_R            3.0
 
-/* Cursor angular fineness within one turn (samples per 2π) */
+/* How many stops the cursor can land on per full turn of the spiral. */
 #define CURSOR_SPOKES    12
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* Smooths the FPS number so it doesn't jitter every frame. */
 #define FPS_EWMA_ALPHA   0.05
 
 #define PAIR_GRID    1
@@ -203,9 +98,7 @@ static const short THEME_FG[][2] = {
 };
 #define N_THEMES 5
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -220,9 +113,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static void color_init(int theme)
 {
@@ -234,36 +125,30 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,  -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx and the spiral ↔ screen mapping                  */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula — GridCtx and turning a spiral spot into a screen cell ── */
 
 /*
- * GridCtx — geometry of the Archimedean spiral plus cursor bounds.
- *
- * a = pitch / (2π) is the per-radian radial advance for arm 0.
- * max_turn is the largest cursor turn that still fits visibly on screen.
+ * GridCtx — everything we need to draw the spiral and to know where the
+ * cursor is allowed to go. Built once from the terminal size, then reused.
  */
 typedef struct {
-    int rows, cols;
+    int rows, cols;        /* terminal size, in character cells              */
 
-    double pitch;          /* pixels per full turn                          */
-    double a;              /* = pitch / (2π); cached in ctx_init             */
-    int    n_arms;
-    int    cell_w, cell_h;
+    double pitch;          /* pixel gap between one turn and the next        */
+    double a;              /* how fast the radius grows per radian; pitch/2π */
+    int    n_arms;         /* how many arms wind out (1..N_ARMS_MAX)         */
+    int    cell_w, cell_h; /* pixels per cell, since cells aren't square     */
 
-    int    ox, oy;
+    int    ox, oy;         /* the centre cell the spiral winds out from      */
 
-    int    max_turn, max_spoke;
+    int    max_turn;       /* farthest turn the cursor can reach on-screen   */
+    int    max_spoke;      /* highest spoke index per turn (SPOKES − 1)      */
 } GridCtx;
 
 /*
- * ctx_init — derive geometry from terminal size.
- *
- * For a sample at (turn t, spoke s) on arm 0:
- *   theta = (t + 0.5) × 2π   (worst case: the largest sample for that turn)
- *   r     = a × theta = pitch × (t + 0.5)
- * max_turn = floor(r_visible / pitch − 0.5).
+ * Sets up the spiral for the current terminal size. The interesting part is
+ * max_turn: we figure out how far the spiral can reach before it runs off the
+ * shorter edge of the screen, then cap the cursor there.
  */
 static void ctx_init(GridCtx *g, int rows, int cols)
 {
@@ -286,18 +171,11 @@ static void ctx_init(GridCtx *g, int rows, int cols)
 }
 
 /*
- * ctx_to_screen — sample the spiral on arm 0 at (turn t, spoke s).
- *
- * THE FORMULA:
- *   theta_sample = (t + (s + 0.5) / CURSOR_SPOKES) × 2π
- *   r_sample     = a × theta_sample           (the Archimedean law)
- *   cx = r_sample × cos theta_sample
- *   cy = r_sample × sin theta_sample
- *   sc = ox + (int)round(cx / CELL_W)
- *   sr = oy + (int)round(cy / CELL_H)
- *
- * The (s + 0.5) shift centres the cursor inside its angular wedge so it
- * does not overlap the previous-spoke sample at integer s.
+ * Turns a cursor address (turn, spoke) into the screen cell it sits on. We
+ * pick the matching angle on the spiral, walk out to the radius the spiral
+ * has there, then convert that point to a row/col. The half-step nudge
+ * (spoke + 0.5) centres the cursor in its slice so neighbouring spokes don't
+ * land on the same cell.
  */
 static void ctx_to_screen(const GridCtx *g, int turn, int spoke,
                           int *sr, int *sc)
@@ -313,12 +191,9 @@ static void ctx_to_screen(const GridCtx *g, int turn, int spoke,
 }
 
 /*
- * angle_char — pick the ASCII line character that best matches orientation theta.
- *
- * THE FORMULA:
- *   a = fmod(theta + 2π, π)  ← fold into [0, π) (orientation, not direction)
- *   a ∈ [0, π/8) or [7π/8, π) → '-';  a ∈ [π/8, 3π/8) → '\'
- *   a ∈ [3π/8, 5π/8) → '|';          a ∈ [5π/8, 7π/8) → '/'
+ * Picks the ASCII character that best matches the slope at this point, so the
+ * spiral looks like a line and not a field of dots: nearly flat → '-', steep
+ * → '|', and '/' or '\' for the diagonals in between.
  */
 static char angle_char(double theta)
 {
@@ -330,17 +205,11 @@ static char angle_char(double theta)
 }
 
 /*
- * ctx_draw_bg — sweep every cell, apply N-arm Archimedean phase test, draw.
- *
- * THE PIPELINE:
- *   a = pitch / (2π)                      per-radian radial advance
- *   for each cell:
- *     dx = (col−ox)×CELL_W,  dy = (row−oy)×CELL_H
- *     r  = √(dx²+dy²),  θ = atan2(dy,dx); if r < MIN_R: skip
- *     θ_norm = fmod(θ + 2π, 2π)
- *     raw    = N × (θ_norm − r/a)         N-arm phase (unbounded)
- *     phase  = fmod(raw + N×2π, 2π)       normalised to [0, 2π)
- *     on_spiral = phase < SPIRAL_W  ||  phase > 2π − SPIRAL_W
+ * Walks every cell and draws the ones that land on a spiral arm. For each
+ * cell we find its distance and angle from the centre, ask "does this angle
+ * match where an arm should be at this radius?", and if so draw a line
+ * character there. The N-arm trick (see the top of the file) lets one test
+ * catch all arms at once.
  */
 static void ctx_draw_bg(const GridCtx *g)
 {
@@ -358,11 +227,8 @@ static void ctx_draw_bg(const GridCtx *g)
             double theta = atan2(dy, dx);
             double theta_norm = fmod(theta + two_pi, two_pi);
 
-            /*
-             * N-arm phase test:
-             *   phase = N × (θ − r/a)  mod 2π
-             * On arm k: phase = N×k×2π/N = k×2π ≡ 0.  ✓
-             */
+            /* Multiply the angle gap by the arm count, then wrap it. Cells on
+             * any arm land near zero here; everything else is far from it. */
             double raw = (double)g->n_arms * (theta_norm - r_px / a);
             double phase = fmod(raw + (double)g->n_arms * two_pi, two_pi);
 
@@ -375,18 +241,15 @@ static void ctx_draw_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_GRID));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 cursor ── */
 
 /*
- * Cursor — (turn, spoke) on arm 0.
+ * Cursor — where the '@' marker sits, named by how far along the spiral it is
+ * rather than by row/col. Pair it with a GridCtx and ctx_to_screen() turns it
+ * into an actual screen cell.
  *
- * turn  : which winding pass (0 = first pass through (s+0.5)/N angle)
- * spoke : which angular sample within the turn (0..CURSOR_SPOKES−1)
- *
- * Bounds and geometry live in GridCtx.  The two structs compose:
- * Cursor + GridCtx → screen position via ctx_to_screen().
+ * turn  : which loop of the spiral, counting out from the centre.
+ * spoke : which stop within that loop (0 .. CURSOR_SPOKES − 1).
  */
 typedef struct { int turn, spoke; } Cursor;
 
@@ -397,14 +260,9 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
 }
 
 /*
- * cursor_move — apply (d_turn, d_spoke); turn clamped, spoke wraps mod
- * CURSOR_SPOKES.
- *
- * Arrow-key dispatch:
- *   UP    → turn  −1   (inward / earlier pass)
- *   DOWN  → turn  +1   (outward / later pass)
- *   LEFT  → spoke −1   (counter-clockwise within turn)
- *   RIGHT → spoke +1   (clockwise within turn — y-down convention)
+ * Nudges the cursor. Turn is clamped to the visible range (so it can't fly
+ * off-screen); spoke wraps around, so stepping past the last stop in a loop
+ * lands back at the first.
  */
 static void cursor_move(Cursor *cur, const GridCtx *g, int d_turn, int d_spoke)
 {
@@ -430,9 +288,7 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, int theme,
                      bool paused, double fps)
@@ -462,9 +318,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, int theme,
     wnoutrefresh(stdscr); doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(void)
@@ -475,9 +329,7 @@ static void screen_init(void)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 static void on_signal(int s)

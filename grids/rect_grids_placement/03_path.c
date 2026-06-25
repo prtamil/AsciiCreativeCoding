@@ -1,153 +1,15 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 03_path.c — two-point path drawing on all 14 grid types
+ * 03_path.c — draw a path between two points on any of 14 grid styles.
  *
- * DEMO: Press ENTER to set a start point, move the cursor, press ENTER again
- *       to set the end point.  Then press L=line, P=L-path, O=ring to draw
- *       a path between the two points.  Works on all 14 grid backgrounds.
+ * Pick a start point with 'p', move the cursor, press 'p' again for the end
+ * point, then choose a path shape: straight line, L-bend, rectangle outline,
+ * or a 45-degree staircase. Switch the background grid with a/e.
  *
- * Study alongside: 02_patterns.c (single-point patterns), 01_direct.c
- *
- * Section map:
- *   §1 config   — per-mode geometry
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 6 pairs
- *   §4 gridctx  — GridCtx, per-mode geom (ctx_geom_*) + bg drawers
- *                 (bg_draw_*), ctx_to_screen, ctx_draw_bg
- *   §5 pool     — Pool
- *   §6 paths    — Bresenham line, L-path, ring, staircase
- *   §7 cursor   — Cursor + selection state machine
- *   §8 scene    — hud_draw + scene_draw
- *   §9 screen   — ncurses init/cleanup
- *   §10 app     — signals, main loop
- *
- * Keys:  arrows:move  p:set-point  l:line  j:L-path  o:ring  x:diagonal
- *        C:clear  r:reset  q/ESC:quit
- *        a:prev-grid  e:next-grid
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/rect_grids_placement/03_path.c \
- *       -o 03_path -lncurses
+ * Sister files: 01_direct.c, 02_patterns.c (single-point placement).
+ * The straight-line shape is Bresenham's line (Bresenham 1965, IBM Systems
+ * Journal 4(1):25-30).
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Two-point path generation on a discrete grid.
- *
- *   Bresenham line (L key):
- *     Iterates from (r0,c0) to (r1,c1) placing cells along the
- *     closest integer approximation of the straight line.  Uses the
- *     classic error-accumulation technique: advance the major axis
- *     every step; advance the minor axis when accumulated error ≥ 0.5.
- *     References: Bresenham 1965 (IBM Systems Journal 4(1):25-30).
- *
- *   L-path (P key):
- *     A rectilinear path: move all the way in one axis first, then
- *     in the other.  Two variants exist (horizontal-first vs vertical-
- *     first); the shorter total Manhattan distance variant is chosen.
- *     L-paths are used in PCB routing and maze solvers.
- *
- *   Ring (O key):
- *     The hollow square (axis-aligned rectangle border) with corners
- *     at (r0,c0) and (r1,c1).  Four sides: top, bottom, left, right.
- *     Same as PAT_HOLLOW from 02_patterns.c but with user-defined corners.
- *
- *   Diagonal staircase (D key):
- *     Alternates row and column steps to produce a 45° diagonal.
- *     Each step moves by (sign(dr), sign(dc)) until the target is reached.
- *
- * Data-structure : Same ObjectPool as 01_direct.c.  All path generators
- *                  call pool_place() for each cell in the path.
- *
- * References     :
- *   Bresenham's line algorithm — en.wikipedia.org/wiki/Bresenham%27s_line_algorithm
- *   Rectilinear routing — en.wikipedia.org/wiki/Rectilinear_polygon
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA — TWO-PHASE INTERACTION
- * ──────────────────────────────────
- * The user interaction has a THREE-STATE machine:
- *
- *   IDLE:       No points selected.  Press ENTER to set point A.
- *   ONE_POINT:  Point A is set.  Move cursor to point B, press ENTER.
- *   TWO_POINTS: Both points set.  Press L/P/O/D to draw a path between them.
- *               After drawing, state resets to IDLE.
- *
- * The selected points are shown with distinct markers ('A' and 'B').
- * The cursor shows '@' at all times.
- *
- * BRESENHAM'S ALGORITHM (the core of this file)
- * ──────────────────────────────────────────────
- * To draw a line from (r0,c0) to (r1,c1):
- *   1. Compute deltas: dr=|r1-r0|, dc=|c1-c0|.
- *   2. The axis with the LARGER delta is the "major" axis — it steps every
- *      iteration.  The axis with the smaller delta is "minor" — it steps
- *      only when an accumulated error term reaches a threshold.
- *   3. Error starts at 2*minor_delta - major_delta.  Each major step adds
- *      2*minor_delta.  When error > 0, take a minor step and subtract
- *      2*major_delta.
- *
- * This produces exactly one pixel per major-axis step — no gaps, no doubles.
- * The result is the closest approximation of a straight line on a grid.
- *
- * RING (RECTANGLE BORDER)
- * ────────────────────────
- * Given corners A=(r0,c0) and B=(r1,c1), the ring consists of:
- *   Top and bottom rows: c from min_c to max_c at r0 and r1.
- *   Left and right cols: r from min_r to max_r at c0 and c1.
- * No interior cells are placed (unlike PAT_FILL).
- *
- * KEY FORMULAS
- * ────────────
- * path_line — Bresenham's error accumulation:
- *   dr = |r1−r0|,  dc = |c1−c0|,  sr = sign(r1−r0),  sc = sign(c1−c0)
- *   Column-major (dc >= dr):
- *     err = 2×dr − dc
- *     for i in [0, dc]: place(r,c); c+=sc
- *       if err > 0: r+=sr; err −= 2×dc
- *       err += 2×dr
- *   Row-major (dr > dc): symmetric with dr/dc swapped.
- *   Invariant: err tracks 2×(minor_steps×major_delta − major_steps×minor_delta).
- *   When err > 0 the path overshoots; step minor axis and subtract 2×major.
- *
- * path_lpath — L-shaped rectilinear path:
- *   Leg 1 (horizontal): c from c0 to c1, r fixed at r0
- *   Leg 2 (vertical):   r from r0 to r1, c fixed at c1
- *   Total unique cells = |dc|+1 + |dr|+1 − 1 = |dc|+|dr|+1
- *   (minus 1 avoids double-counting the corner at (r0, c1))
- *
- * path_ring — hollow rectangle:
- *   rmin=min(r0,r1), rmax=max(r0,r1), cmin=min(c0,c1), cmax=max(c0,c1)
- *   Top row:    r=rmin, c ∈ [cmin, cmax]
- *   Bottom row: r=rmax, c ∈ [cmin, cmax]
- *   Left col:   c=cmin, r ∈ [rmin+1, rmax−1]
- *   Right col:  c=cmax, r ∈ [rmin+1, rmax−1]
- *   Total cells = 2×(|c1−c0|+1) + 2×(|r1−r0|−1) = 2×|dc| + 2×|dr|
- *
- * HOW TO VERIFY
- * ─────────────
- * Uniform grid (U_CW=8, U_CH=4), terminal 80×24.
- *
- * path_line from A=(1,1) to B=(3,5):
- *   dr=2, dc=4 → column-major; err_init=2×2−4=0; sc=+1, sr=+1
- *   i=0: place(1,1); err=0 (not>0); c=2, err=0+4=4
- *   i=1: err=4>0: r=2, err=4−8=−4; c=3, err=−4+4=0
- *   i=2: err=0 (not>0); c=4, err=0+4=4
- *   i=3: err=4>0: r=3, err=4−8=−4; c=5, err=0
- *   Placed: (1,1),(1,2),(2,3),(2,4),(3,5) — 5 cells  ✓
- *
- * path_ring from A=(1,1) to B=(3,4):
- *   rmin=1,rmax=3,cmin=1,cmax=4
- *   Top (r=1): c=1,2,3,4 — 4 cells
- *   Bottom (r=3): c=1,2,3,4 — 4 cells
- *   Left (c=1): r=2 — 1 cell
- *   Right (c=4): r=2 — 1 cell
- *   Total = 10 = 2×3 + 2×2 ✓
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
@@ -159,14 +21,12 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS  30
 #define MAX_OBJ    512
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How quickly the on-screen fps number settles. Smaller = steadier reading. */
 #define FPS_EWMA_ALPHA  0.05
 
 #define U_CW  8
@@ -205,9 +65,7 @@
 #define PAIR_HUD     5   /* status bar (yellow)  */
 #define PAIR_HINT    6   /* key-hint footer (cyan) */
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -222,9 +80,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static void color_init(void)
 {
@@ -237,10 +93,10 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx                                                             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx ── */
 
+/* The 14 background grid styles you can cycle through with a/e. GM_COUNT is
+ * the tally, used for the array sizes and for wrapping around when cycling. */
 typedef enum {
     GM_UNIFORM=0, GM_SQUARE, GM_FINE, GM_COARSE,
     GM_HIER, GM_BRICK_H, GM_BRICK_V, GM_DIAMOND,
@@ -248,19 +104,29 @@ typedef enum {
     GM_DOT, GM_ORIGIN, GM_COUNT
 } GridMode;
 
+/* Human-readable label per style, shown in the HUD. Indexed by GridMode. */
 static const char *const gm_name[GM_COUNT] = {
     "01 uniform","02 square","03 fine","04 coarse",
     "05 hier","06 brick-h","07 brick-v","08 diamond",
     "09 iso","10 cross","11 check","12 ruled","13 dot","14 origin"
 };
 
+/* Everything we need to know about the current grid: which style it is, how
+ * big a cell is, where the center sits, and which grid coordinates are legal.
+ *   mode             which of the 14 styles
+ *   rows, cols       terminal size in characters
+ *   cw, ch           one cell's width and height in characters
+ *   ox, oy           screen center, used by the rotated (diamond/iso) styles
+ *   range            half-size of the rotated styles (they run -range..+range)
+ *   min/max_r/c      the box of valid grid coordinates the cursor stays inside
+ */
 typedef struct {
     GridMode mode;
     int rows, cols, cw, ch, ox, oy, range;
     int min_r, max_r, min_c, max_c;
 } GridCtx;
 
-/* Per-mode geometry setters — one tiny function per GridMode. */
+/* One tiny setter per style, each just stamping in that style's cell size. */
 
 static void ctx_geom_uniform (GridCtx *g) { g->cw = U_CW;    g->ch = U_CH;  }
 static void ctx_geom_square  (GridCtx *g) { g->cw = SQ_CS*2; g->ch = SQ_CS; }
@@ -269,18 +135,19 @@ static void ctx_geom_coarse  (GridCtx *g) { g->cw = CO_CW;   g->ch = CO_CH; }
 static void ctx_geom_hier    (GridCtx *g) { g->cw = HI_CW;   g->ch = HI_CH; }
 static void ctx_geom_brick_h (GridCtx *g) { g->cw = BH_CW;   g->ch = BH_CH; }
 static void ctx_geom_brick_v (GridCtx *g) { g->cw = BV_CW;   g->ch = BV_CH; }
-/* rotated grids carry an extra `range` for the centred ±range bounds */
+/* the rotated styles also need range, since they run from -range to +range */
 static void ctx_geom_diamond (GridCtx *g) { g->cw = DM_IW; g->ch = DM_IH; g->range = DM_RNG; }
 static void ctx_geom_iso     (GridCtx *g) { g->cw = IS_IW; g->ch = IS_IH; g->range = IS_RNG; }
 static void ctx_geom_cross   (GridCtx *g) { g->cw = CR_CW;   g->ch = CR_CH; }
 static void ctx_geom_check   (GridCtx *g) { g->cw = CK_CW;   g->ch = CK_CH; }
-/* ruled has only horizontal lines — no column step */
+/* ruled is just horizontal lines, so it never sets a column width */
 static void ctx_geom_ruled   (GridCtx *g) { g->ch = RL_LS; }
 static void ctx_geom_dot     (GridCtx *g) { g->cw = DT_CW;   g->ch = DT_CH; }
 static void ctx_geom_origin  (GridCtx *g) { g->cw = OR_CW;   g->ch = OR_CH; }
 
-/* Bounds depend on coordinate system: rotated grids use ±range; ruled
- * grids count whole lines; rect grids count whole cells. */
+/* Works out how far the cursor may roam, which differs by style: rotated
+ * grids run -range..+range, ruled grids count whole lines, the rest count
+ * whole cells that fit on screen. */
 static void ctx_set_bounds(GridCtx *g, GridMode m, int rows, int cols)
 {
     if (m==GM_DIAMOND||m==GM_ISO) {
@@ -295,8 +162,7 @@ static void ctx_set_bounds(GridCtx *g, GridMode m, int rows, int cols)
     }
 }
 
-/* Dispatcher: routes all 14 GridMode values to their per-mode geometry
- * setter, then computes coordinate bounds once. */
+/* Sets up a fresh grid: pick the style's cell size, then its valid bounds. */
 static void ctx_init(GridCtx *g, GridMode m, int rows, int cols)
 {
     memset(g,0,sizeof *g);
@@ -335,14 +201,13 @@ static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
     }
 }
 
+/* Like %, but the answer is never negative — handy for the rotated styles
+ * where coordinates go negative and plain % would give a negative remainder. */
 static int safe_mod(int a, int b) { return ((a%b)+b)%b; }
 
-/* ── per-mode background drawers ───────────────────────────────────────── *
- * One function per grid style.  Pulled out of ctx_draw_bg so a reader
- * can study one style at a time.
- * ─────────────────────────────────────────────────────────────────────── */
+/* Background drawers: one per grid style, so each can be read on its own. */
 
-/* Plain rect lattice; GM_ORIGIN overlays a highlighted central cross. */
+/* Plain grid of lines; the origin style also paints a bold central cross. */
 static void bg_draw_rect_family(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch, ox=g->ox, oy=g->oy;
@@ -355,7 +220,7 @@ static void bg_draw_rect_family(const GridCtx *g)
     }
 }
 
-/* Three-tier lattice (major / semi / minor); glyph encodes the tier. */
+/* Grid with three thicknesses of line; the character tells you which tier. */
 static void bg_draw_hier(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch;
@@ -370,7 +235,7 @@ static void bg_draw_hier(const GridCtx *g)
     }
 }
 
-/* Brick courses offset every other row by half a brick width. */
+/* Brick wall: every other row of bricks is shifted half a brick sideways. */
 static void bg_draw_brick_h(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch;
@@ -385,7 +250,7 @@ static void bg_draw_brick_h(const GridCtx *g)
     }
 }
 
-/* Vertical brick courses — bricks staggered by half-height per column. */
+/* Brick wall turned on its side: every other column is shifted half a brick. */
 static void bg_draw_brick_v(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch;
@@ -397,7 +262,7 @@ static void bg_draw_brick_v(const GridCtx *g)
     }
 }
 
-/* Two diagonal line families intersect on a 45°-rotated lattice. */
+/* Diamond grid: two sets of slanted lines crossing like a rotated checkerboard. */
 static void bg_draw_diamond(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, ox=g->ox, oy=g->oy;
@@ -410,7 +275,8 @@ static void bg_draw_diamond(const GridCtx *g)
     }
 }
 
-/* Same diagonal scheme as diamond but with a wider (2:1) cell aspect. */
+/* Same idea as the diamond grid, but the cells are stretched wide (2:1) to
+ * give that flattened, video-game isometric look. */
 static void bg_draw_iso(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, ox=g->ox, oy=g->oy;
@@ -423,7 +289,7 @@ static void bg_draw_iso(const GridCtx *g)
     }
 }
 
-/* Rect lattice with two extra diagonal families overlaid (axes + X). */
+/* Plain grid with two extra sets of diagonals laid on top, forming little Xs. */
 static void bg_draw_cross(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch;
@@ -437,7 +303,7 @@ static void bg_draw_cross(const GridCtx *g)
     }
 }
 
-/* Lines plus filled "black" squares on alternating cells (chessboard). */
+/* Grid lines plus filled-in squares on alternating cells, like a chessboard. */
 static void bg_draw_check(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch;
@@ -448,7 +314,7 @@ static void bg_draw_check(const GridCtx *g)
     }
 }
 
-/* Horizontal rules only — no column structure (row-based grid). */
+/* Just horizontal lines, like ruled notebook paper — no columns at all. */
 static void bg_draw_ruled(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, ch=g->ch;
@@ -458,7 +324,7 @@ static void bg_draw_ruled(const GridCtx *g)
     }
 }
 
-/* Sparse marker at every grid intersection — no connecting lines. */
+/* Just a dot at each crossing point — the grid implied, not drawn out. */
 static void bg_draw_dot(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch;
@@ -468,10 +334,8 @@ static void bg_draw_dot(const GridCtx *g)
     }
 }
 
-/*
- * ctx_draw_bg — dispatcher.  Routes all 14 GridMode values to a per-mode
- * bg_draw_*() helper.  The five rect-family modes share one drawer.
- */
+/* Paints the background for whatever style is active. The five plain-grid
+ * styles all look the same, so they share one drawer. */
 static void ctx_draw_bg(const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_GRID));
@@ -492,11 +356,18 @@ static void ctx_draw_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_GRID));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool ── */
 
+/* One placed cell: where it sits and what character shows there.
+ *   r, c     its grid coordinates
+ *   glyph    the character drawn for it
+ *   alive    false once removed; kept in the array so indices stay stable */
 typedef struct { int r, c; char glyph; bool alive; } Obj;
+
+/* A fixed-size bag of placed cells. No growing or freeing — we allocate the
+ * whole array up front and just track how many slots are used.
+ *   items    storage for up to MAX_OBJ cells
+ *   count    how many slots are in use (0..MAX_OBJ) */
 typedef struct { Obj items[MAX_OBJ]; int count; } Pool;
 
 static int pool_find(const Pool *p, int r, int c)
@@ -526,18 +397,15 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_OBJ)|A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  paths                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 paths ── */
 
 static int iabs(int x) { return x<0?-x:x; }
 static int isign(int x) { return x>0?1:x<0?-1:0; }
 
-/*
- * path_line — Bresenham's line from (r0,c0) to (r1,c1).
- * The major axis advances every step; the minor axis advances when the
- * accumulated error crosses zero.
- */
+/* Draws the straightest grid line between two points (Bresenham's line).
+ * The trick: step along the longer direction every cell, and only step
+ * sideways when a running tally says we've drifted too far off the true line.
+ * That keeps it gapless with no fractions or floating point. */
 static void path_line(Pool *p, const GridCtx *g,
                       int r0, int c0, int r1, int c1, char glyph)
 {
@@ -545,7 +413,7 @@ static void path_line(Pool *p, const GridCtx *g,
     int sr=isign(r1-r0), sc_=isign(c1-c0);
     int r=r0, c=c0;
 
-    if (dc >= dr) {                      /* column-major */
+    if (dc >= dr) {                      /* mostly sideways: step columns */
         int err = 2*dr - dc;
         for (int i=0; i<=dc; i++) {
             if (r>=g->min_r&&r<=g->max_r&&c>=g->min_c&&c<=g->max_c)
@@ -553,7 +421,7 @@ static void path_line(Pool *p, const GridCtx *g,
             if (err > 0) { r+=sr; err-=2*dc; }
             err += 2*dr; c+=sc_;
         }
-    } else {                             /* row-major */
+    } else {                             /* mostly up/down: step rows */
         int err = 2*dc - dr;
         for (int i=0; i<=dr; i++) {
             if (r>=g->min_r&&r<=g->max_r&&c>=g->min_c&&c<=g->max_c)
@@ -564,47 +432,42 @@ static void path_line(Pool *p, const GridCtx *g,
     }
 }
 
-/*
- * path_lpath — L-shaped rectilinear path.
- * Moves horizontally to (r0,c1), then vertically to (r1,c1).
- */
+/* Draws an L-bend: go all the way across first, then all the way up/down,
+ * so the path turns exactly one corner. */
 static void path_lpath(Pool *p, const GridCtx *g,
                        int r0, int c0, int r1, int c1, char glyph)
 {
-    /* horizontal leg */
+    /* across */
     int cs=isign(c1-c0);
     for (int c=c0; c!=c1+cs; c+=cs)
         if (r0>=g->min_r&&r0<=g->max_r&&c>=g->min_c&&c<=g->max_c)
             pool_place(p,r0,c,glyph);
-    /* vertical leg */
+    /* up/down */
     int rs=isign(r1-r0);
     for (int r=r0; r!=r1+rs; r+=rs)
         if (r>=g->min_r&&r<=g->max_r&&c1>=g->min_c&&c1<=g->max_c)
             pool_place(p,r,c1,glyph);
 }
 
-/*
- * path_ring — hollow rectangle border with corners at (r0,c0) and (r1,c1).
- */
+/* Draws the outline of a rectangle whose opposite corners are the two points
+ * — just the border, nothing filled in. */
 static void path_ring(Pool *p, const GridCtx *g,
                       int r0, int c0, int r1, int c1, char glyph)
 {
     int rmin=r0<r1?r0:r1, rmax=r0>r1?r0:r1;
     int cmin=c0<c1?c0:c1, cmax=c0>c1?c0:c1;
-    for (int c=cmin; c<=cmax; c++) {      /* top and bottom rows */
+    for (int c=cmin; c<=cmax; c++) {      /* top and bottom edges */
         if (rmin>=g->min_r&&c>=g->min_c&&c<=g->max_c) pool_place(p,rmin,c,glyph);
         if (rmax<=g->max_r&&c>=g->min_c&&c<=g->max_c) pool_place(p,rmax,c,glyph);
     }
-    for (int r=rmin+1; r<rmax; r++) {     /* left and right cols (avoid corners) */
+    for (int r=rmin+1; r<rmax; r++) {     /* left and right edges; corners already done */
         if (r>=g->min_r&&r<=g->max_r&&cmin>=g->min_c) pool_place(p,r,cmin,glyph);
         if (r>=g->min_r&&r<=g->max_r&&cmax<=g->max_c) pool_place(p,r,cmax,glyph);
     }
 }
 
-/*
- * path_diagonal — staircase diagonal: each step moves (sign_r, sign_c).
- * Produces a 45° staircase of cells.
- */
+/* Draws a 45-degree staircase: each step nudges one row and one column toward
+ * the target, until it can't move in a direction anymore. */
 static void path_diagonal(Pool *p, const GridCtx *g,
                            int r0, int c0, int r1, int c1, char glyph)
 {
@@ -620,16 +483,21 @@ static void path_diagonal(Pool *p, const GridCtx *g,
         pool_place(p,r,c,glyph);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 cursor ── */
 
+/* How far along picking the two endpoints we are: none yet, one picked, both
+ * picked. Each press of 'p' moves to the next stage. */
 typedef enum { SEL_IDLE=0, SEL_ONE, SEL_TWO } SelState;
 
+/* The moving cursor plus the two endpoints the user has locked in.
+ *   r, c       where the cursor is right now (grid coordinates)
+ *   ar, ac     point A, the first endpoint picked
+ *   br, bc     point B, the second endpoint picked
+ *   state      which picking stage we're in (see SelState) */
 typedef struct {
-    int r, c;          /* current cursor position */
-    int ar, ac;        /* point A (first ENTER) */
-    int br, bc;        /* point B (second ENTER) */
+    int r, c;
+    int ar, ac;
+    int br, bc;
     SelState state;
 } Cursor;
 
@@ -654,7 +522,7 @@ static void mark_at(const GridCtx *g, int r, int c, chtype ch)
     if (sr>=0&&sr<g->rows-1&&sc>=0&&sc<g->cols) mvaddch(sr,sc,ch);
 }
 
-/* Draw '@' cursor, 'A' and 'B' markers when selected */
+/* Draws the '@' cursor, plus 'A' and 'B' once those endpoints are picked. */
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     if (cur->state>=SEL_ONE) {
@@ -672,10 +540,9 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_CURSOR)|A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 scene ── */
 
+/* The little prompt in the HUD telling the user what to do next. */
 static const char *sel_hint(SelState s)
 {
     if (s==SEL_IDLE) return "p:set-A";
@@ -683,7 +550,8 @@ static const char *sel_hint(SelState s)
     return              "A+B set — l/j/o/x:draw  p:cancel";
 }
 
-/* Bright bold yellow fps readout (top-right) + bold cyan key hints (bottom). */
+/* Top-right status line (fps, grid, what's next) and the key-list along the
+ * bottom. Both bold and bright so they stay readable over the grid. */
 static void hud_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
                      double fps)
 {
@@ -713,9 +581,7 @@ static void scene_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
     wnoutrefresh(stdscr); doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(void)
@@ -726,9 +592,7 @@ static void screen_init(void)
     color_init(); atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §10 app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §10 app ── */
 
 static volatile sig_atomic_t g_running=1, g_need_resize=0;
 static void on_signal(int s)
@@ -737,7 +601,8 @@ static void on_signal(int s)
     if (s==SIGWINCH)           g_need_resize=1;
 }
 
-/* Cycle to a sibling grid mode and re-seat the cursor in its bounds. */
+/* Switches to the next or previous grid style and recenters the cursor, since
+ * the new style may have different bounds. */
 static void switch_grid(GridCtx *ctx, Cursor *cur, int rows, int cols, int delta)
 {
     GridMode m = (GridMode)((ctx->mode + delta + GM_COUNT) % GM_COUNT);
@@ -745,7 +610,8 @@ static void switch_grid(GridCtx *ctx, Cursor *cur, int rows, int cols, int delta
     cursor_reset(cur, ctx);
 }
 
-/* 'p' advances the IDLE → ONE → TWO state machine; from TWO it cancels. */
+/* Handles one press of 'p': lock in point A, then point B, then (if both are
+ * already set) start over. */
 static void cycle_selection(Cursor *cur)
 {
     if (cur->state == SEL_IDLE) {
@@ -757,8 +623,9 @@ static void cycle_selection(Cursor *cur)
     }
 }
 
-/* Path-draw key dispatch: l/j/o/x are no-ops until both points are picked.
- * After drawing, state resets to IDLE so the next 'p' starts a fresh pair. */
+/* Draws the chosen path shape, but only once both endpoints are set; the
+ * draw keys do nothing before that. Afterwards it clears the selection so the
+ * next 'p' begins a fresh pair. PathFn is just "any of the path_* drawers". */
 typedef void (*PathFn)(Pool *, const GridCtx *, int, int, int, int, char);
 static void try_draw_path(Pool *pool, const GridCtx *ctx, Cursor *cur, PathFn fn)
 {

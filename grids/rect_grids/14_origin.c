@@ -1,169 +1,15 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 14_origin.c — coordinate-system grid with labelled axes and quadrants
+ * 14_origin.c — a grid with math-style (x,y) axes drawn through the centre.
  *
- * DEMO: A rectangular grid with mathematical (x,y) axes drawn at the
- *       screen centre. The X axis goes right (positive) and left (negative);
- *       the Y axis goes UP (positive, inverted from screen) and down (negative).
- *       The cursor '@' shows its position in mathematical coordinates,
- *       updating as it moves. Quadrant labels (I–IV) are shown.
+ * Move the '@' cursor with the arrows; the HUD shows where it sits in math
+ * coordinates and which quadrant it's in. Unlike the terminal, +Y points UP
+ * here, like graph paper. Sister file: 01_uniform_rect.c (plain grid, no axes).
  *
- * Study alongside: 01_uniform_rect.c (base grid), 04_coarse_sparse.c
- *
- * Section map:
- *   §1 config   — UNIT_W, UNIT_H (one coordinate unit in screen chars), EWMA
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 7 pairs (grid, x-axis, y-axis, cursor, quadrants, HUD, HINT)
- *   §4 formula  — GridCtx + ctx_init / ctx_to_screen (math↔screen) /
- *                 ctx_grid_char / ctx_draw_bg + axes_draw + labels_draw
- *   §5 cursor   — Cursor (mx, my) in MATH space, with Y flip
- *   §6 scene    — hud_draw + scene_draw
- *   §7 screen   — ncurses init / cleanup
- *   §8 app      — signals, main loop
- *
- * Keys:  arrows move @   r reset   q/ESC quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/rect_grids/14_origin.c \
- *       -o 14_origin -lncurses
+ * The one trick: on a terminal, row 0 is the top and rows grow downward, but
+ * in math, y grows upward. So when we turn a math point into a screen row we
+ * subtract instead of add — that single minus sign flips the Y axis upright.
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Rectangular grid centred at the terminal midpoint.
- *                  The mathematical Y axis is inverted: +Y is UP on screen
- *                  (decreasing screen row), matching standard maths convention.
- *
- * Forward formula (math → screen):
- *
- *   screen_col = ox + mx * UNIT_W
- *   screen_row = oy - my * UNIT_H      ← MINUS because screen Y flips
- *
- *   where ox = COLS/2 (origin column), oy = (LINES-1)/2 (origin row).
- *
- * Inverse formula (screen → math):
- *
- *   mx = (screen_col - ox) / UNIT_W
- *   my = (oy - screen_row) / UNIT_H    ← note the flip
- *
- * Axis detection:
- *   X axis (my=0): screen_row == oy   → sr == oy
- *   Y axis (mx=0): screen_col == ox   → sc == ox
- *
- * Grid lines:
- *   horizontal: (sr - oy) % UNIT_H == 0
- *   vertical:   (sc - ox) % UNIT_W == 0
- *
- * Quadrant: determined by sign of (mx, my).
- *   I:   mx>0, my>0   (right & above origin)
- *   II:  mx<0, my>0   (left  & above origin)
- *   III: mx<0, my<0   (left  & below origin)
- *   IV:  mx>0, my<0   (right & below origin)
- *
- * References     :
- *   Cartesian coordinates — en.wikipedia.org/wiki/Cartesian_coordinate_system
- *   Quadrants — en.wikipedia.org/wiki/Quadrant_(plane_geometry)
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * This is a rectangular grid with a COORDINATE SYSTEM overlaid.  The grid
- * lines are the same as 01_uniform_rect but the origin (0,0) is at the
- * screen centre, not the top-left.  The critical formula change is one
- * MINUS SIGN in the row formula: `screen_row = oy - my * UNIT_H`.  This
- * single sign flip makes the mathematical Y axis point upward on screen,
- * matching the convention used in mathematics and most scientific plots.
- *
- * HOW TO THINK ABOUT IT — TWO Y DIRECTIONS
- * ──────────────────────────────────────────
- * There are TWO Y conventions in computing:
- *
- *   Screen convention:  row 0 is at TOP; row increases DOWNWARD.
- *   Math convention:    y=0 is at centre; y increases UPWARD.
- *
- * The terminal uses screen convention.  A math coordinate system requires
- * a FLIP of the Y axis.  The formula encodes this flip:
- *
- *   screen_row = oy - my * UNIT_H
- *
- * When my INCREASES (moving up in math): screen_row DECREASES (moving up
- * on screen).  The minus sign is the entire flip — nothing else changes.
- *
- * Analogy: think of a standard graph paper taped to a wall.  The paper's
- * origin is at the centre.  Moving UP on the paper means decreasing screen
- * row.  The paper's y axis points AGAINST the screen's row axis.
- *
- * DRAWING METHOD
- * ──────────────
- *  Step 1: Determine origin position:
- *    ox = COLS / 2        (centre column)
- *    oy = (LINES-1) / 2   (centre row, excluding HUD row)
- *
- *  Step 2: Grid line conditions (using offset from origin):
- *    on_h = ((sr - oy) % UNIT_H == 0)   <- rows that are multiples of UNIT_H from origin
- *    on_v = ((sc - ox) % UNIT_W == 0)   <- cols that are multiples of UNIT_W from origin
- *
- *  Step 3: Axis detection (special case of grid lines):
- *    is_x_axis = (sr == oy)    <- my=0 -> screen_row = oy - 0*UNIT_H = oy
- *    is_y_axis = (sc == ox)    <- mx=0 -> screen_col = ox + 0*UNIT_W = ox
- *    is_origin = is_x_axis AND is_y_axis
- *
- *  Step 4: Draw with priority: origin > axis > grid line.
- *    origin  -> 'O'  (or '+') in bright color
- *    x-axis  -> '='  in red/x-color
- *    y-axis  -> '|'  in green/y-color
- *    grid    -> '+'/'-'/':' in dim color
- *
- * KEY FORMULAS
- * ────────────
- *  Forward (math -> screen):
- *    screen_col = ox + mx * UNIT_W
- *    screen_row = oy - my * UNIT_H      <- MINUS for Y flip
- *
- *  Inverse (screen -> math):
- *    mx = (sc - ox) / UNIT_W
- *    my = (oy - sr) / UNIT_H            <- oy MINUS sr to flip back
- *
- *  Grid line test (relative to origin):
- *    on_h = (safe_mod(sr - oy, UNIT_H) == 0)
- *    on_v = (safe_mod(sc - ox, UNIT_W) == 0)
- *
- *  Quadrant of cursor position (mx, my):
- *    I   (mx>0, my>0):  right and above origin
- *    II  (mx<0, my>0):  left  and above origin
- *    III (mx<0, my<0):  left  and below origin
- *    IV  (mx>0, my<0):  right and below origin
- *    Axis (mx=0 OR my=0): on an axis, not in any quadrant
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • UP arrow increases my (math) but DECREASES screen row:
- *    cursor_move with dmy=+1 moves '@' visually UP on screen.
- *    This is intentional — it matches math convention.
- *
- *  • Origin NOT at screen centre: if COLS or LINES is even, ox or oy
- *    may be off by half a unit.  Integer division gives the closest row/col.
- *
- *  • The axis highlight must override the grid line:
- *    at (sr=oy, sc=anything), it should draw '=' (x-axis), not '-' (grid).
- *    Test axis conditions BEFORE regular grid line conditions.
- *
- *  • Coordinate label axis ticks: to add "2, 4, 6" labels on the x-axis,
- *    draw text at screen col = ox + k*UNIT_W for integer k, at row oy+1.
- *
- * HOW TO VERIFY
- * ─────────────
- *  At screen (ox, oy): should show 'O' (origin).
- *  At (oy-UNIT_H, ox): should show '|' on y-axis, 1 unit ABOVE origin.
- *    -> my = (oy - (oy-UNIT_H)) / UNIT_H = 1. ✓  (positive)
- *  At (oy+UNIT_H, ox): my = (oy - (oy+UNIT_H)) / UNIT_H = -1. ✓  (negative, below)
- *  Cursor at (mx=+1, my=+1): quadrant I.  Move UP -> my=+2, still quadrant I.
- *  Move LEFT from quadrant I -> mx=0, on y-axis, no quadrant.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
@@ -175,33 +21,29 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS  30
 
 /*
- * UNIT_W, UNIT_H — one unit of mathematical coordinate in screen chars.
- * With UNIT_W=8 and UNIT_H=4, each unit step looks square in pixels.
+ * How big one math unit is on screen. Cells are taller than they are wide,
+ * so we use more columns than rows per unit to keep each step looking square.
  */
 #define UNIT_W   8    /* screen cols per 1 math unit */
 #define UNIT_H   4    /* screen rows per 1 math unit */
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How sharply the FPS readout reacts to each frame: small = smooth, slow. */
 #define FPS_EWMA_ALPHA  0.05
 
-#define PAIR_GRID   1   /* regular grid lines (dim)     */
-#define PAIR_XAXIS  2   /* X axis (bright horizontal)   */
-#define PAIR_YAXIS  3   /* Y axis (bright vertical)     */
+#define PAIR_GRID   1   /* faint background grid lines */
+#define PAIR_XAXIS  2   /* the horizontal axis         */
+#define PAIR_YAXIS  3   /* the vertical axis           */
 #define PAIR_CURSOR 4
-#define PAIR_QUAD   5   /* quadrant labels              */
+#define PAIR_QUAD   5   /* the I/II/III/IV labels      */
 #define PAIR_HUD    6
 #define PAIR_HINT   7
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -216,9 +58,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static void color_init(void)
 {
@@ -232,22 +72,26 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx and the math ↔ screen mapping                    */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula — turning math points into screen positions ── */
 
 /*
- * GridCtx — terminal extent + units + origin + cursor range (math space).
+ * Everything the drawing code needs to know about the current grid layout:
+ * how big the terminal is, how many cells make one math unit, where the
+ * centre (the origin) sits on screen, and how far the cursor may roam.
  *
- * cw/ch carry UNIT_W/UNIT_H; ox/oy are the math origin in screen coords.
- * range bounds the cursor to ±range in both math axes.
+ *   rows, cols    terminal size, in characters
+ *   cw, ch        one math unit's width and height, in screen chars
+ *   ox, oy        where math (0,0) lands on screen — its column and row
+ *   range         cursor stays within [-range, +range] on both axes, so it
+ *                 never wanders off the visible grid
+ *   max_r, max_c  copies of range, kept only to match the shared grid template
  */
 typedef struct {
     int rows, cols;
-    int cw, ch;          /* UNIT_W, UNIT_H */
-    int ox, oy;          /* math origin in screen coords */
-    int range;           /* cursor lives in [-range, +range] in math space */
-    int max_r, max_c;    /* mirror of range for parity with template */
+    int cw, ch;
+    int ox, oy;
+    int range;
+    int max_r, max_c;
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols)
@@ -262,13 +106,9 @@ static void ctx_init(GridCtx *g, int rows, int cols)
 }
 
 /*
- * ctx_to_screen — COORDINATE SYSTEM FORMULA (math -> screen):
- *
- *   screen_col = ox + mx * UNIT_W
- *   screen_row = oy - my * UNIT_H    ← MINUS flips Y axis
- *
- * Naming note: the (r, c) of the standard ctx_to_screen here are (my, mx) —
- * the math coordinates.  Y is inverted: positive my goes UP on screen.
+ * Where does a math point (mx, my) land on screen? Step right from the centre
+ * for x, and step up for y — and "up" on a terminal means a smaller row, which
+ * is why y is subtracted, not added. That minus is the whole Y flip.
  */
 static void ctx_to_screen(const GridCtx *g, int my, int mx, int *sr, int *sc)
 {
@@ -276,11 +116,7 @@ static void ctx_to_screen(const GridCtx *g, int my, int mx, int *sr, int *sc)
     *sr = g->oy - my * g->ch;
 }
 
-/*
- * screen_to_math — INVERSE FORMULA:
- *   mx = (sc - ox) / UNIT_W
- *   my = (oy - sr) / UNIT_H   ← oy - sr to flip Y back
- */
+/* The reverse trip: given a screen cell, which math point is it? */
 static void screen_to_math(const GridCtx *g, int sr, int sc, int *mx, int *my)
 {
     *mx = (sc - g->ox) / g->cw;
@@ -288,8 +124,15 @@ static void screen_to_math(const GridCtx *g, int sr, int sc, int *mx, int *my)
 }
 
 /*
- * grid char classification:
- *   axis detection takes priority over modular grid lines.
+ * What kind of mark belongs at a given screen cell, listed from most to least
+ * important. The origin wins over the axes, and the axes win over plain grid
+ * lines, so a cell that's both an axis and a grid line shows the axis.
+ *
+ *   GC_NONE     blank space, nothing to draw
+ *   GC_GRID     a faint background grid line or crossing
+ *   GC_XAXIS    the horizontal axis through the centre
+ *   GC_YAXIS    the vertical axis through the centre
+ *   GC_ORIGIN   the single centre point where both axes meet
  */
 typedef enum { GC_NONE, GC_GRID, GC_XAXIS, GC_YAXIS, GC_ORIGIN } GridCharType;
 
@@ -311,18 +154,14 @@ static GridCharType ctx_grid_char_type(const GridCtx *g, int sr, int sc, char *o
     return GC_NONE;
 }
 
-/*
- * ctx_grid_char — standard char-only API (delegates to type-classifier).
- */
+/* Same question as above, but when you only want the character, not its kind. */
 static char ctx_grid_char(const GridCtx *g, int sr, int sc)
 {
     char ch; ctx_grid_char_type(g, sr, sc, &ch);
     return ch;
 }
 
-/*
- * ctx_draw_bg — paint grid + axes with priority colouring.
- */
+/* Paints the whole grid and axes, giving each cell the colour its kind earns. */
 static void ctx_draw_bg(const GridCtx *g)
 {
     for (int sr = 0; sr < g->rows - 1; sr++) {
@@ -350,32 +189,31 @@ static void ctx_draw_bg(const GridCtx *g)
     }
 }
 
-/*
- * labels_draw — place I/II/III/IV in the middle of each quadrant.
- * Positions are derived from ctx_to_screen with fractional unit offsets.
- */
+/* Drops a Roman-numeral label into the middle of each of the four corners. */
 static void labels_draw(const GridCtx *g)
 {
     int r, c;
     attron(COLOR_PAIR(PAIR_QUAD) | A_DIM);
-    /* Quadrant I: +x, +y → right of Y axis, above X axis */
+    /* I: right and above the centre */
     ctx_to_screen(g, 2,  2, &r, &c);  mvprintw(r, c, "I");
-    /* Quadrant II: -x, +y */
+    /* II: left and above */
     ctx_to_screen(g, 2, -3, &r, &c);  mvprintw(r, c, "II");
-    /* Quadrant III: -x, -y */
+    /* III: left and below */
     ctx_to_screen(g, -2, -3, &r, &c); mvprintw(r, c, "III");
-    /* Quadrant IV: +x, -y */
+    /* IV: right and below */
     ctx_to_screen(g, -2,  2, &r, &c); mvprintw(r, c, "IV");
     attroff(COLOR_PAIR(PAIR_QUAD) | A_DIM);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 cursor ── */
 
 /*
- * Cursor — position in MATHEMATICAL coordinates (mx, my).
- * Y is the math Y (positive = up); range bound lives in GridCtx.range.
+ * The '@' the user steers, stored in math coordinates rather than screen ones.
+ *
+ *   mx   horizontal position; positive is right of centre
+ *   my   vertical position; positive is ABOVE centre, math-style
+ *
+ * How far it can travel is decided by GridCtx.range, not stored here.
  */
 typedef struct { int mx, my; } Cursor;
 
@@ -386,14 +224,8 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
 }
 
 /*
- * cursor_move — delta in math space.
- *   RIGHT → mx += 1   (move right on X axis)
- *   LEFT  → mx -= 1
- *   UP    → my += 1   (move UP in math = screen row decreases)
- *   DOWN  → my -= 1
- *
- * Note: UP key increases my (math), which DECREASES screen_row.
- * This is the correct mathematical convention.
+ * Nudges the cursor by one step, but only if it would stay inside the grid;
+ * a step off the edge is simply ignored so the '@' can't escape.
  */
 static void cursor_move(Cursor *cur, const GridCtx *g, int dmx, int dmy)
 {
@@ -405,7 +237,7 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dmx, int dmy)
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc; ctx_to_screen(g, cur->my, cur->mx, &sr, &sc);
-    /* Verify inverse: screen_to_math should return (mx, my) unchanged */
+    /* Round-trip back to math coords as a sanity check; result is unused. */
     int vx, vy; screen_to_math(g, sr, sc, &vx, &vy);
     (void)vx; (void)vy;
     attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
@@ -413,9 +245,7 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
 static const char *quadrant_name(int mx, int my)
 {
@@ -452,12 +282,11 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
     wnoutrefresh(stdscr); doupdate();
 }
 
-/* Reference for the standard ctx_grid_char API; quiets -Wunused-function. */
+/* ctx_grid_char isn't called anywhere; this touches it so the compiler
+ * doesn't warn about an unused function. */
 static void ctx_grid_char_ref(void) { (void)ctx_grid_char; }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(void)
@@ -468,9 +297,7 @@ static void screen_init(void)
     color_init(); atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 static void on_signal(int s)
@@ -486,7 +313,7 @@ int main(void)
     screen_init();
     GridCtx g;     ctx_init(&g, LINES, COLS);
     Cursor  cur;   cursor_reset(&cur, &g);
-    ctx_grid_char_ref();   /* keep the standard API symbol live */
+    ctx_grid_char_ref();   /* keeps the unused helper from being flagged */
 
     const int64_t FRAME_NS = 1000000000LL / TARGET_FPS;
     double fps = TARGET_FPS;
@@ -501,8 +328,7 @@ int main(void)
         switch (ch) {
             case 'q': case 27: g_running = 0;              break;
             case 'r':          cursor_reset(&cur, &g);     break;
-            /* UP   → my+1 (math Y up)    DOWN → my-1   */
-            /* RIGHT → mx+1               LEFT → mx-1   */
+            /* Arrows move one math unit; UP raises my, so '@' rises on screen. */
             case KEY_UP:    cursor_move(&cur, &g,  0, +1); break;
             case KEY_DOWN:  cursor_move(&cur, &g,  0, -1); break;
             case KEY_LEFT:  cursor_move(&cur, &g, -1,  0); break;

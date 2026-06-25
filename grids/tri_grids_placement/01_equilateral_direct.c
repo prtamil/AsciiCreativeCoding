@@ -1,132 +1,17 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 01_equilateral_direct.c — direct object placement on the equilateral grid
+ * 01_equilateral_direct.c — drop markers onto a triangle grid
  *
- * DEMO: An equilateral triangular grid fills the screen. Move '@' between
- *       triangles with arrow keys. Press SPACE to toggle a '*' object at
- *       the cursor triangle. Objects are stored by lattice address
- *       (col, row, up) and survive resize — they follow their triangle
- *       when the terminal changes size. 'g' cycles the placed glyph.
+ * A grid of equilateral triangles fills the screen. Move the '@' cursor
+ * between triangles with the arrows, hit SPACE to leave a marker on the
+ * triangle you're standing on. Each marker remembers WHICH triangle it
+ * sits on (a col/row/up address), not where on screen it is — so when you
+ * resize the window or change the triangle size, markers follow their
+ * triangle to its new spot.
  *
- * Study alongside: grids/tri_grids/01_equilateral.c (background rasterizer),
- *                  grids/hex_grids_placement/01_hex_direct.c (same idea on hex).
- *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, TRI_SIZE, MAX_OBJ
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 5 pairs: edge / cursor / object / HUD / hint
- *   §4 gridctx  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg helpers
- *   §5 pool     — Pool: place / remove / toggle / find / clear / draw
- *   §6 cursor   — Cursor + TRI_DIR + cursor_reset / cursor_move / cursor_draw
- *   §7 scene    — hud_draw + scene_draw
- *   §8 screen   — ncurses init / cleanup
- *   §9 app      — signals, main loop
- *
- * Keys:  arrows:move  spc:toggle  g:glyph  C:clear  r:reset
- *        +/-:size  t:theme  q/ESC:quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/01_equilateral_direct.c \
- *       -o 01_equilateral_direct -lncurses -lm
+ * Sister files: grids/tri_grids/01_equilateral.c (just the background),
+ *               grids/hex_grids_placement/01_hex_direct.c (same idea, hexes).
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Direct placement using a movable cursor. The cursor
- *                  holds (col, row, up) in TRIANGLE-lattice space. SPACE
- *                  toggles an object at that address; the object's screen
- *                  position is recomputed each frame from the centroid
- *                  formula in ctx_to_screen.
- *
- * Data-structure : Pool — flat array of Obj{col, row, up, glyph, alive}.
- *                  Removal swaps the dead slot with the last item (O(1)).
- *
- * Rendering      : Three-pass per frame:
- *                    (1) ctx_draw_bg rasterizes the equilateral background
- *                    (2) pool_draw renders each placed object at its centroid
- *                    (3) cursor_draw places '@' at the cursor centroid
- *                  The cursor draws over objects so the user always sees it.
- *
- * References     :
- *   Triangular tiling — https://en.wikipedia.org/wiki/Triangular_tiling
- *   Object pool pattern — gameprogrammingpatterns.com/object-pool.html
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Two address spaces share the screen at once:
- *   1. The GRID — a function of every screen pixel via the equilateral
- *      skew lattice. No data; reformed every frame in ctx_draw_bg().
- *   2. The OBJECTS — a tiny array of (col, row, up, glyph) records in
- *      Pool. The cursor is just one more such address. SPACE toggles
- *      whether the cursor address is in the pool.
- * Drawing is grid first, then objects, then cursor. The cursor draws
- * on top so it is always visible.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine the triangular tiling as an infinite address book — every
- * triangle has a unique 3-tuple (col, row, up). The screen is a window
- * onto that address book, re-centred each frame from
- * (ox=cols/2, oy=(rows-1)/2). Objects are tagged by ADDRESS, not by
- * pixel position; resizing the terminal moves the WINDOW, but the
- * objects keep their addresses and reappear at new pixel positions.
- *
- * DRAWING METHOD  (per frame)
- * ──────────────
- *  1. erase()
- *  2. ctx_draw_bg — raster scan: for every screen cell, pixel_to_tri →
- *     tri_edge_char → mvaddch when min-weight < border_w.
- *  3. pool_draw — for each object, ctx_to_screen → mvaddch the glyph
- *     at that screen cell.
- *  4. cursor_draw — same path as pool_draw but '@' on top.
- *  5. hud_draw; wnoutrefresh + doupdate.
- *
- * KEY FORMULAS
- * ────────────
- *  Cursor step (4-direction lookup, see TRI_DIR in §6):
- *    (cur->col, cur->row, cur->up) ← TRI_DIR[dir][cur->up]
- *
- *  Centroid lattice → pixel  (h = size · √3 / 2):
- *    ▽ centroid  a = col + 1/3,   b = row + 1/3
- *    △ centroid  a = col + 2/3,   b = row + 2/3
- *    px = (a + 0.5·b) · size,   py = b · h
- *
- *  Centroid pixel → screen cell:
- *    scol = ox + (int)(px / CELL_W)
- *    srow = oy + (int)(py / CELL_H)
- *
- *  Pool toggle (O(1) remove via swap-with-last):
- *    if (i = pool_find(col,row,up)) >= 0:
- *      pool->items[i] = pool->items[--pool->count]
- *    else:
- *      pool->items[pool->count++] = (Obj){col,row,up,glyph,true}
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • MAX_OBJ cap: silently dropped when the pool is full. 'C' clears
- *    the pool. Bumping MAX_OBJ has no other cost — the pool is one
- *    flat array, no allocation churn.
- *  • Resize: cursor and objects keep their lattice addresses, but the
- *    pixel positions shift because ox/oy are recomputed each frame.
- *    An object can fall off-screen if the new terminal is small — its
- *    address is still valid; the cursor can walk back to it.
- *  • Glyph cycle: changing the glyph affects only the NEXT placement.
- *    Already-placed objects keep the glyph they were stored with.
- *  • Centroid rounding: ctx_to_screen uses int truncation, which
- *    keeps '@' inside the interior so it never lands on a border char.
- *
- * HOW TO VERIFY
- * ─────────────
- *  Place a '*' at the origin triangle, press +/- to change tri_size,
- *  then watch the glyph follow the same triangle to its new pixel
- *  position. The (col, row, up) address is preserved across resize and
- *  size change.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -143,9 +28,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 
@@ -172,9 +55,7 @@
 
 static const char GLYPHS[N_GLYPHS] = { '*', 'o', '+', '#', 'X', '%' };
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -191,9 +72,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static const short THEME_FG[N_THEMES][2] = {
     /* edge,  object */
@@ -222,33 +101,40 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx — GridCtx + the equilateral skew lattice formula            */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx — the math that turns a triangle's address into a screen spot ── */
 
 /*
- * GridCtx — geometry of the active equilateral grid plus tunable state.
+ * GridCtx — everything we need to know to draw the grid and to figure out
+ * where any triangle lands on screen. It's one bundle holding the window
+ * size, how big the triangles are right now, where the grid's centre sits,
+ * and the few knobs the user can twiddle (size, theme, current glyph).
  *
- * Carrying tri_size/border_w/theme as fields (not just defines or globals)
- * lets ctx_to_screen() work for any GridCtx — the shared abstraction with
- * the rect / hex / polar placement files (see ../README.md).
+ * Why keep the size/border/theme in here instead of as plain globals: it
+ * means the placement math takes a GridCtx and works the same way for the
+ * sibling rect / hex / polar files (see ../README.md). One bundle, one rule.
  */
 typedef struct {
-    /* terminal extent */
+    /* how big the terminal is, in character cells */
     int    rows, cols;
 
-    /* lattice geometry */
-    double tri_size;        /* equilateral side length in pixel sub-units */
-    int    cell_w, cell_h;  /* sub-pixels per terminal column / row       */
+    /* triangle size and how many sub-pixels fit in one character cell.
+     * We measure positions in tiny sub-pixels first, then divide down to
+     * character cells, so triangles can be sized more smoothly than the
+     * chunky terminal grid would otherwise allow. */
+    double tri_size;        /* triangle side length, in sub-pixels */
+    int    cell_w, cell_h;  /* sub-pixels per character column / row */
 
-    /* screen origin (screen position of lattice (0,0) corner) */
+    /* where the grid's (0,0) corner sits on screen — we re-centre this on
+     * the middle of the window every frame, which is what lets markers stay
+     * put on their triangle when the window resizes */
     int    ox, oy;
 
-    /* mode state */
-    double border_w;        /* barycentric edge threshold                 */
-    int    theme;
-    int    paused;
-    int    glyph_idx;
+    /* user-twiddled knobs */
+    double border_w;        /* how thick the drawn triangle edges look (0..1ish);
+                             * a cell is part of an edge if it's within this of one */
+    int    theme;           /* which colour scheme, 0..N_THEMES-1 */
+    int    paused;          /* 1 while paused (the 'p' key) */
+    int    glyph_idx;       /* which marker character SPACE will drop next */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols)
@@ -266,7 +152,8 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->glyph_idx = 0;
 }
 
-/* Recompute the per-resize fields without disturbing tunables. */
+/* on a resize, redo only the size-dependent fields and leave the user's
+ * knobs (triangle size, theme, glyph) exactly as they were */
 static void ctx_resize(GridCtx *g, int rows, int cols)
 {
     g->rows = rows;
@@ -276,14 +163,15 @@ static void ctx_resize(GridCtx *g, int rows, int cols)
 }
 
 /*
- * pixel_to_tri — solve the skew-lattice inverse and pick the triangle.
+ * Given a point on screen, work out which triangle it falls in. We undo the
+ * slanted grid to get whole-number col/row (which diamond-shaped cell), plus
+ * the leftover fractions fa/fb saying how far into that cell we are. Each
+ * diamond is two triangles; if the fractions add past 1 we're in the upper
+ * (△) half, otherwise the lower (▽) half. The math is the inverse of the
+ * forward formula below; the formulas are kept alongside for reference.
  *
- *   h = size · √3 / 2
- *   b = py / h
- *   a = px/size − 0.5·b
- *   col = ⌊a⌋,  row = ⌊b⌋
- *   fa  = a − col,  fb = b − row
- *   up  = (fa + fb ≥ 1)                     ← which half of the rhombus
+ *   h = size · √3 / 2;  b = py/h;  a = px/size − 0.5·b
+ *   col = ⌊a⌋, row = ⌊b⌋;  fa = a−col, fb = b−row;  up = (fa+fb ≥ 1)
  */
 static void pixel_to_tri(double px, double py, double size,
                          int *col, int *row, int *up,
@@ -301,9 +189,11 @@ static void pixel_to_tri(double px, double py, double size,
 }
 
 /*
- * tri_centroid_pixel — forward lattice→pixel for the triangle centroid.
- *   ▽ centroid lattice = (col + 1/3, row + 1/3)
- *   △ centroid lattice = (col + 2/3, row + 2/3)
+ * Find the pixel at the dead centre of a given triangle. A triangle's centre
+ * sits one-third of the way in from its corners, so we nudge the address by
+ * 1/3 (▽) or 2/3 (△) and run it through the slanted-grid formula. This is the
+ * spot where we'll draw the cursor or a marker so it lands cleanly inside.
+ *   ▽ centre at (col+1/3, row+1/3);  △ centre at (col+2/3, row+2/3)
  *   px = (a + 0.5·b)·size,  py = b·h
  */
 static void tri_centroid_pixel(int col, int row, int up, double size,
@@ -317,8 +207,9 @@ static void tri_centroid_pixel(int col, int row, int up, double size,
 }
 
 /*
- * ctx_to_screen — map (col, row, up) to the terminal cell at the centroid.
- * Truncation (not round) keeps '@' inside the triangle interior.
+ * Turn a triangle's address into the exact character cell to draw on. We
+ * chop the fraction off (truncate, not round) on purpose — rounding can
+ * nudge the mark onto a triangle edge, and we want it sitting inside.
  */
 static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
                           int *scol, int *srow)
@@ -330,12 +221,12 @@ static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
 }
 
 /*
- * tri_edge_char — barycentric weights → edge proximity → ASCII character.
- *   ▽:  l₁ = 1−fa−fb,  l₂ = fa,        l₃ = fb
- *   △:  l₁ = 1−fb,     l₂ = fa+fb−1,   l₃ = 1−fa
- * Smallest weight names the edge OPPOSITE that vertex.
- *   ▽: l₁→'/'  l₂→'\\'  l₃→'_'
- *   △: l₁→'_'  l₂→'/'   l₃→'\\'
+ * Decide which slash to draw for a cell near a triangle edge, and report how
+ * close to an edge it is. We measure how near the point is to each of the
+ * three sides (three numbers, one per side; small means close). Whichever
+ * side is nearest picks the character: '/' '\' or '_' to trace that edge.
+ * The caller only draws when the smallest number is below border_w — i.e.
+ * the cell is actually sitting on an edge rather than out in open space.
  */
 static char tri_edge_char(int up, double fa, double fb, double *out_min)
 {
@@ -359,8 +250,10 @@ static char tri_edge_char(int up, double fa, double fb, double *out_min)
 }
 
 /*
- * ctx_draw_bg — raster scan: pixel→triangle→edge character at every cell.
- * The whole grid is recomputed each frame with no stored data.
+ * Paint the whole triangle grid. We walk every character cell, ask which
+ * triangle and edge it belongs to, and drop a slash only on the edge cells.
+ * Nothing is stored between frames — the grid is just redrawn from scratch,
+ * which is why it can follow any window size for free.
  */
 static void ctx_draw_bg(const GridCtx *g)
 {
@@ -380,11 +273,19 @@ static void ctx_draw_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_BORDER));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool — the bag of placed markers ── */
 
+/* One placed marker. It's pinned to a triangle by address, not to a screen
+ * spot, so it stays put when the view changes.
+ *   col, row, up — which triangle (up: 0 = ▽ lower, 1 = △ upper)
+ *   glyph        — the character to draw for this marker
+ *   alive        — true if this slot holds a real marker (vs. an empty slot) */
 typedef struct { int col, row, up; char glyph; bool alive; } Obj;
+
+/* The whole collection of markers: a plain fixed-size array plus a count of
+ * how many are in use. No growing, no allocation — full at MAX_OBJ. We keep
+ * the live ones packed at the front (slots 0..count-1), so a removal just
+ * moves the last one into the gap. */
 typedef struct { Obj items[MAX_OBJ]; int count; } Pool;
 
 static int pool_find(const Pool *p, int col, int row, int up)
@@ -434,17 +335,20 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_OBJECT) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 cursor — the '@' you steer ── */
 
+/* Where the '@' currently is: the address of one triangle. Same three
+ * numbers a marker uses (col, row, and up = which half of the diamond). */
 typedef struct { int col, row, up; } Cursor;
 
 /*
- * TRI_DIR — arrow-key transition table indexed by [direction][current_up].
- * Each entry is (Δcol, Δrow, target_up).
- *   direction:  0=LEFT  1=RIGHT  2=UP  3=DOWN
- *   up index :  0=▽    1=△
+ * Moving by one arrow press isn't a simple ±1 on a triangle grid: stepping
+ * "right" from a downward triangle just flips you to its upward neighbour in
+ * the same cell, while stepping "right" from an upward one moves a column
+ * over. This table spells out every case so cursor_move doesn't have to.
+ * Look it up by [which arrow][which half you're on] to get the change to
+ * apply: how much col and row shift, and which half you end up on.
+ *   arrows: 0=LEFT 1=RIGHT 2=UP 3=DOWN     half: 0=▽ (lower)  1=△ (upper)
  */
 static const int TRI_DIR[4][2][3] = {
     /* LEFT  */ { { -1,  0,  1 }, {  0,  0,  0 } },
@@ -460,8 +364,9 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
 }
 
 /*
- * cursor_move — apply (dcol, drow, dup) deltas. The triangular lattice has
- * no global cursor bounds, so no clamp; addresses extend infinitely.
+ * Nudge the cursor by the change looked up in TRI_DIR. There's no edge to
+ * bump into — the grid of addresses goes on forever, so we never clamp; the
+ * cursor can simply wander off the visible window and back.
  */
 static void cursor_move(Cursor *cur, const GridCtx *g, int dcol, int drow, int dup)
 {
@@ -482,9 +387,7 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 scene ── */
 
 /* Bright bold yellow fps readout (top-right) + bold cyan key hints (bottom). */
 static void hud_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
@@ -518,9 +421,7 @@ static void scene_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -535,9 +436,7 @@ static void screen_init(int theme)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 app — signals and the main loop ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;

@@ -1,155 +1,36 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 02_hex_pattern.c — stamp hex patterns (disc, ring, row, col) on a flat-top grid
+ * 02_hex_pattern.c — stamp shapes (disc, ring, row, col) onto a hex grid.
  *
- * DEMO: A flat-top hex grid fills the screen. Navigate '@' with arrow keys.
- *       Press 1–4 to select a pattern, +/- to grow/shrink it, then SPACE to
- *       stamp the highlighted pattern into the pool. Four pattern modes:
- *       disc (all hexes within radius N), ring (exactly radius N), row
- *       (same r, |dq|≤N), col (same q, |dr|≤N).
+ * Move the '@' cursor with the arrows, pick a shape with 1-4, grow or shrink
+ * it with +/-, then press SPACE to "stamp" that shape onto the grid. A live
+ * preview shows the shape before you commit it.
  *
- * Study alongside: grids/hex_grids_placement/01_hex_direct.c (direct toggle),
- *                  grids/rect_grids_placement/02_patterns.c (same idea on rect)
- *
- * Section map:
- *   §1  config   — all tunable constants
- *   §2  clock    — monotonic timer + sleep
- *   §3  color    — color pairs: grid, cursor, object, preview, HUD, hint
- *   §4  gridctx  — GridCtx + cube_round, ctx_to_screen, hex_dist, ctx_draw_bg
- *   §5  pool     — Pool: place, clear, draw
- *   §6  cursor   — Cursor + axial movement, cursor_draw
- *   §7  patterns — PatMode, pat_test, pat_overlay, pat_stamp
- *   §8  scene    — hud_draw + scene_draw
- *   §9  screen   — ncurses init / cleanup
- *   §10 app      — signals, main loop
- *
- * Keys:  arrows:move  1-4:pattern  +/-:radius  spc:stamp  p:preview
- *        C:clear  r:reset  q/ESC:quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/hex_grids_placement/02_hex_pattern.c \
- *       -o 02_hex_pattern -lncurses -lm
+ * Sister files: 01_hex_direct.c (toggle single hexes; full geometry write-up),
+ *               grids/rect_grids_placement/02_patterns.c (same idea on squares).
+ * Hex math reference: https://www.redblobgames.com/grids/hexagons/
  */
 
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
+/*
+ * THE IDEA
  *
- * Algorithm      : Pattern-fill placement via predicate filtering.  For a
- *                  cursor at (cur.q, cur.r) and radius N, iterate the bounding
- *                  box dq ∈ [−N, N], dr ∈ [−N, N] and call pat_test(mode,
- *                  dq, dr, N).  Cells that pass the predicate are added to
- *                  Pool.  The predicate uses hex_dist (axial distance) as the
- *                  key metric.
+ * Each shape is just a yes/no test on a cell's offset (dq, dr) from the cursor.
+ * The key measurement is "how many hex steps away is this cell?" — hex_dist.
+ * Given that one number, the four shapes are simple rules:
  *
- * Data-structure : Pool — flat array of Obj{q, r, glyph}.  pool_place adds
- *                  or overwrites a cell (no duplicates).  Clear is O(1).
+ *   disc  — every hex within N steps          (distance <= N)
+ *   ring  — only the hexes exactly N steps out (distance == N)
+ *   row   — the straight line through the cursor along one axis
+ *   col   — the straight line through the cursor along the other axis
  *
- * GridContext    : GridCtx carries the hex-specific geometry (hex_size,
- *                  border_w, screen origin ox/oy, terminal extent rows/cols).
+ * To stamp, we walk the small square of offsets from -N to +N in both
+ * directions, ask each one "are you in the shape?", and keep the ones that
+ * pass. The square has some waste (a disc leaves the corners empty) but it's
+ * tiny — at most (2N+1)² cells, 289 for the biggest N — so we don't optimize.
  *
- * Rendering      : Four-pass: grid background → preview overlay → placed
- *                  objects → cursor '@'.  Preview shows the current pattern
- *                  shape before committing, so the user can preview before
- *                  stamping.
- *
- * Performance    : pat_overlay and pat_stamp iterate (2N+1)² cells max.  For
- *                  N=8 that is 289 calls — negligible inside the 60 fps budget.
- *
- * References     :
- *   Red Blob Games hex grid algorithms — https://www.redblobgames.com/grids/hexagons/
- *   Hex disc / ring / line             — https://www.redblobgames.com/grids/hexagons/#range
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Every pattern is a PREDICATE on the axial displacement (dq, dr) from the
- * cursor.  If pat_test(mode, dq, dr, N) is true, the cell at (cur.q+dq,
- * cur.r+dr) belongs to the pattern.  All four modes use hex_dist — the single
- * number that captures "how many hex steps away" — as their primary selector:
- *
- *   DISC:  d ≤ N         — all hexes inside a circular region
- *   RING:  d == N        — the perimeter ring at exactly radius N
- *   ROW:   dr==0 && |dq| ≤ N — same axial row (r constant)
- *   COL:   dq==0 && |dr| ≤ N — same axial column (q constant)
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine holding a rubber stamp shaped like the pattern.  Pressing SPACE
- * "stamps" it: every hex whose offset from the cursor satisfies the predicate
- * gets an object glyph written to Pool.  The preview ('p' key) shows the stamp
- * outline in real time as you move, so you can see the shape before committing.
- *
- * The bounding box [-N, N]² in dq and dr is the worst-case search space.
- * For ROW and COL the bounding box is rectangular but the predicate filters it
- * down to a line.  For DISC the box contains ~22% extra cells outside the disc.
- * We always iterate the full box and let the predicate filter — simple and fast.
- *
- * DRAWING METHOD  (pattern preview and stamp)
- * ──────────────────────────────────────────
- *  Preview (each frame, if show_preview is on):
- *  1. For dr in [-N, N] and dq in [-N, N]:
- *  2.   if pat_test(mode, dq, dr, N) is false → skip
- *  3.   ctx_to_screen(cur.q+dq, cur.r+dr) → (col, row)
- *  4.   draw '.' at (row, col) in PAIR_PREVIEW
- *
- *  Stamp (on SPACE key):
- *  1. Same loop as preview
- *  2.   pool_place(&pool, cur.q+dq, cur.r+dr, glyph[mode])
- *  Objects persist across cursor moves and resize events.
- *
- * KEY FORMULAS
- * ────────────
- *  hex_dist (axial distance):
- *    d = (|dq| + |dr| + |dq + dr|) / 2
- *
- *  Pattern predicates (all use d = hex_dist(0,0,dq,dr)):
- *    DISC   d ≤ N         cell count = 3N² + 3N + 1
- *    RING   d == N        cell count = 6N  (1 for N=0)
- *    ROW    dr==0 && |dq| ≤ N  cell count = 2N + 1
- *    COL    dq==0 && |dr| ≤ N  cell count = 2N + 1
- *
- *  Bounding box iteration:
- *    dq ∈ [-N, N],  dr ∈ [-N, N]
- *    Total candidates = (2N+1)²,  e.g. N=3 → 49 candidates
- *
- *  Glyph per mode (so stamped regions remain visually distinct):
- *    DISC='*'  RING='o'  ROW='='  COL=':'
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • N=0: DISC and RING both yield {(0,0)} — one cell at the cursor.
- *    ROW and COL also yield one cell.  Stamping N=0 always places one object.
- *
- *  • RING at N=0: hex_dist(0,0,0,0)=0 == 0 = N → one cell.  6×0=0 formula
- *    fails, but the predicate (d==N) is still correct.
- *
- *  • MAX_OBJ cap: pool_place silently drops objects when pool is full.
- *    For N=8 disc: 3×64+3×8+1=217 cells — just fits in MAX_OBJ=256.
- *    For N≥9 disc: may overflow.  The cap prevents buffer overrun.
- *
- *  • Preview draws OVER pool objects each frame. This is intentional: the
- *    user needs to see the stamp shape at the current cursor, not the old data.
- *
- * HOW TO VERIFY  (N=2, cursor at (cur.q=0, cur.r=0), 80×24 terminal, size=14)
- * ─────────────
- *  DISC N=2: cells where d ≤ 2 → 3×4+6+1 = 19 cells.
- *    Bounding box [-2,2]²: 25 candidates.  6 fail (corners): e.g.
- *    (dq=+2, dr=-2): ds=−(+2)−(−2)=0, d=(2+2+0)/2=2 ≤ 2 → PASSES. ✓
- *    (dq=+2, dr=+1): d=(2+1+3)/2=3 > 2 → fails. ✓
- *
- *  RING N=2: cells where d == 2 → 12 cells.
- *    (dq=+2, dr=0): d=(2+0+2)/2=2 → PASSES.
- *    (dq=+1, dr=+1): d=(1+1+2)/2=2 → PASSES.
- *    (dq=0,  dr=+2): d=(0+2+2)/2=2 → PASSES.
- *    (dq=-1, dr=+2): d=(1+2+1)/2=2 → PASSES.
- *
- *  ROW N=2: dr=0, |dq| ≤ 2 → 5 cells: dq ∈ {-2,-1,0,+1,+2}.
- *
- *  COL N=2: dq=0, |dr| ≤ 2 → 5 cells: dr ∈ {-2,-1,0,+1,+2}.
- *
- * ─────────────────────────────────────────────────────────────────────── */
+ * Stamped hexes live in a Pool and stay put as you move around or resize the
+ * terminal. The preview redraws every frame so it always tracks the cursor.
+ */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -164,9 +45,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1  config ── */
 
 #define CELL_W              2
 #define CELL_H              4
@@ -180,7 +59,7 @@
 #define BORDER_W_MIN        0.03
 #define BORDER_W_MAX        0.35
 
-/* Pattern radius range. N=8 disc = 217 cells; must fit in MAX_OBJ. */
+/* How big a shape can get. The biggest disc is 217 cells, so it fits MAX_OBJ. */
 #define PAT_N_DEFAULT       3
 #define PAT_N_MIN           0
 #define PAT_N_MAX           8
@@ -188,12 +67,10 @@
 #define MAX_OBJ            256
 #define FRAME_NS    16666667LL
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How fast the fps number reacts to change — small means smooth and steady. */
 #define FPS_EWMA_ALPHA      0.05
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2  clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -209,16 +86,14 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&ts, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3  color ── */
 
 #define PAIR_GRID      1
 #define PAIR_CURSOR    2
 #define PAIR_OBJ       3
-#define PAIR_PREVIEW   4   /* preview overlay (stamp shape before committing) */
-#define PAIR_HUD       5   /* status bar (yellow)  */
-#define PAIR_HINT      6   /* key-hint footer (cyan) */
+#define PAIR_PREVIEW   4   /* the shape outline you see before stamping */
+#define PAIR_HUD       5   /* status bar, yellow */
+#define PAIR_HINT      6   /* key hints, cyan */
 
 static void color_init(void)
 {
@@ -232,15 +107,20 @@ static void color_init(void)
     init_pair(PAIR_HINT,    COLORS >= 256 ?  51 : COLOR_CYAN,    -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx — GridCtx + cube_round, ctx_to_screen, hex_dist, ctx_draw_bg */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4  gridctx ── */
 
+/*
+ * GridCtx — everything we need to know to draw the hex grid right now.
+ *
+ * It bundles the terminal's current size with the two knobs that control how
+ * the hexes look, plus where the (0,0) hex lands on screen. Bundling it means
+ * a redraw or a resize just rebuilds this one struct.
+ */
 typedef struct {
-    int    rows, cols;
-    double hex_size;
-    double border_w;
-    int    ox, oy;
+    int    rows, cols;   /* terminal size in characters, refreshed on resize */
+    double hex_size;     /* radius of a hex in sub-pixels; bigger = fewer, larger hexes */
+    double border_w;     /* hex border thickness, 0..0.5 of the hex (0.10 = thin) */
+    int    ox, oy;       /* screen column/row where hex (0,0) sits — the grid's anchor */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols,
@@ -254,11 +134,10 @@ static void ctx_init(GridCtx *g, int rows, int cols,
 }
 
 /*
- * cube_round — nearest integer hex to fractional cube position.
- *
- * THE FORMULA:
- *   Round all three; fix the component with the LARGEST rounding error to
- *   restore q+r+s=0. See 01_hex_direct.c §4 for the full derivation.
+ * Snaps a fractional hex position to the nearest real hex cell.
+ * Rounding each coordinate on its own can drift off the grid, so we round all
+ * three and nudge back the one that moved the most. Full write-up in
+ * 01_hex_direct.c §4.
  */
 static void cube_round(double fq, double fr, double fs, int *q, int *r)
 {
@@ -272,11 +151,9 @@ static void cube_round(double fq, double fr, double fs, int *q, int *r)
 }
 
 /*
- * ctx_to_screen — flat-top forward matrix + aspect correction.
- *
- * THE FORMULA:
- *   cx = size × 3/2 × q,   cy = size × (√3/2 × q  +  √3 × r)
- *   col = ox + round(cx / CELL_W),   row = oy + round(cy / CELL_H)
+ * Turns a hex (q, r) into the screen cell where its center lands.
+ * Terminal cells are taller than they are wide, so we squash by CELL_W/CELL_H
+ * to keep the hexes looking round rather than stretched.
  */
 static void ctx_to_screen(const GridCtx *g, int q, int r, int *col, int *row)
 {
@@ -288,14 +165,9 @@ static void ctx_to_screen(const GridCtx *g, int q, int r, int *col, int *row)
 }
 
 /*
- * hex_dist — axial distance between two hexes.
- *
- * THE FORMULA:
- *   dq = q2-q1,  dr = r2-r1
- *   d  = (|dq| + |dr| + |dq + dr|) / 2
- *
- * This equals the cube distance max(|dq|,|dr|,|ds|) where ds = -dq-dr.
- * The average-of-three form avoids the max and works in axial directly.
+ * How many hex steps apart two hexes are — the heart of every shape rule.
+ * Think of it as walking from one hex to the other, one neighbor at a time;
+ * this counts the fewest steps. (Formula: (|dq|+|dr|+|dq+dr|)/2.)
  */
 static int hex_dist(int q1, int r1, int q2, int r2)
 {
@@ -304,9 +176,9 @@ static int hex_dist(int q1, int r1, int q2, int r2)
 }
 
 /*
- * angle_char — radial angle → tangent ASCII line character.
- * Input: atan2(py-cy, px-cx) + π/2   (radial rotated to tangent direction).
- * Folded into [0,π): '-' '\\' '|' '/' '-'
+ * Picks the ASCII character that best traces a hex edge at a given angle.
+ * Each border pixel knows which way the edge runs there, and we pick the
+ * line glyph (- \ | /) closest to that direction so the outline looks smooth.
  */
 static char angle_char(double theta)
 {
@@ -320,8 +192,10 @@ static char angle_char(double theta)
 }
 
 /*
- * ctx_draw_bg — per-pixel pipeline: inverse matrix → cube_round → border test.
- * See 01_hex_direct.c §4 for the full pipeline comment.
+ * Draws the whole hex grid by asking, for each screen cell, "which hex am I in,
+ * and am I on its border?" Only border cells get a line glyph, which leaves the
+ * hex interiors empty. The hex under the cursor is highlighted. Full pipeline
+ * write-up in 01_hex_direct.c §4.
  */
 static void ctx_draw_bg(const GridCtx *g, int curq, int curr)
 {
@@ -361,19 +235,26 @@ static void ctx_draw_bg(const GridCtx *g, int curq, int curr)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5  pool ── */
 
+/* One stamped hex: where it is (q, r) and which character marks it. */
 typedef struct { int q, r; char glyph; } Obj;
-typedef struct { Obj items[MAX_OBJ]; int count; } Pool;
 
 /*
- * pool_place — add or overwrite an object at (q, r); no duplicates.
+ * Pool — the bag of hexes the user has stamped so far.
  *
- * If (q, r) already exists in pool, update its glyph (stamp over old).
- * This means re-stamping a different pattern mode on the same cell updates
- * the glyph, showing the most recent stamp.
+ * Just a fixed array plus how many slots are used. A plain array is plenty:
+ * at most a few hundred hexes and we only ever scan or append. It never grows
+ * past MAX_OBJ, so there's no allocation and nothing to free.
+ */
+typedef struct {
+    Obj items[MAX_OBJ];  /* stamped hexes, slots 0..count-1 are live */
+    int count;           /* how many slots are in use, 0..MAX_OBJ */
+} Pool;
+
+/*
+ * Records a stamped hex, or refreshes one already there so we never store the
+ * same cell twice. Stamping a new shape over an old one just changes its mark.
  */
 static void pool_place(Pool *p, int q, int r, char glyph)
 {
@@ -401,12 +282,9 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_OBJ) | A_BOLD);
 }
 
-/* ── end §5 — to understand cursor placement, read §6 ─────────────────── */
+/* ── §6  cursor ── */
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  cursor — axial cursor and movement                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
+/* Cursor — which hex the '@' is sitting on, in hex (q, r) coordinates. */
 typedef struct { int q, r; } Cursor;
 
 static void cursor_reset(Cursor *cur) { cur->q = 0; cur->r = 0; }
@@ -435,31 +313,24 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  patterns — predicate, preview, stamp                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7  patterns ── */
 
+/*
+ * The four shapes you can stamp. N_PAT is just the count, handy for sizing
+ * the glyph and name tables below and for cycling through modes.
+ */
 typedef enum { PAT_DISC=0, PAT_RING=1, PAT_ROW=2, PAT_COL=3, N_PAT=4 } PatMode;
 
-/* One glyph per mode so stamped regions stay visually distinct.
- * Avoid '-' and '|' — they look identical to hex border characters. */
+/* The mark each shape leaves, one per mode. We skip '-' and '|' on purpose:
+ * they'd blend into the hex border characters and you couldn't tell them apart. */
 static const char PAT_GLYPH[N_PAT] = { '*', 'o', '=', ':' };
 static const char *PAT_NAME[N_PAT] = { "disc", "ring", "row", "col" };
 
 /*
- * pat_test — return 1 if displacement (dq, dr) is in the pattern.
- *
- * THE FORMULA (predicate per mode):
- *   d = hex_dist(0, 0, dq, dr)    ← distance from cursor to candidate
- *   DISC:  d ≤ N
- *   RING:  d == N
- *   ROW:   dr == 0  &&  |dq| ≤ N
- *   COL:   dq == 0  &&  |dr| ≤ N
- *
- * WHY bounding-box iteration + predicate instead of enumeration:
- *   Enumeration (e.g. walking the ring step-by-step) is faster but complex
- *   to implement and hard to extend.  The bounding-box approach is O((2N+1)²)
- *   — at most 289 cells for N=8 — which is negligible and easy to read.
+ * The yes/no test at the core of every shape: is this offset part of the shape?
+ * Each mode is a one-line rule on the hex distance, so adding a new shape later
+ * is just adding a case. We test every offset in the box rather than cleverly
+ * tracing each shape — slower in theory, but trivially small and easy to read.
  */
 static int pat_test(PatMode mode, int dq, int dr, int N)
 {
@@ -474,19 +345,10 @@ static int pat_test(PatMode mode, int dq, int dr, int N)
 }
 
 /*
- * pat_overlay — draw the full hex border for every pattern cell in PAIR_PREVIEW.
- *
- * THE FORMULA:
- *   Same per-pixel inverse-matrix loop as ctx_draw_bg, but filtered:
- *     if pat_test(mode, q-cur.q, r-cur.r, N) is false → skip this pixel
- *     if pixel is interior (dist < limit) → skip
- *     otherwise → draw border character in PAIR_PREVIEW | A_BOLD (bright green)
- *
- * WHY draw full borders rather than a single dot per hex:
- *   A single dot at the hex centre falls on an interior pixel and is drawn
- *   over by nothing — but it's tiny and dim.  Drawing the entire border ring
- *   of each pattern hex in bright green makes the pattern shape unmistakable:
- *   you see complete coloured outlines for every hex in the pattern.
+ * Draws the live preview: outlines every hex the current shape would cover, in
+ * bright green, without touching the pool. It reuses the grid-drawing loop but
+ * skips any cell that isn't part of the shape. We outline whole hexes rather
+ * than dotting their centers so the shape reads clearly at a glance.
  */
 static void pat_overlay(const GridCtx *g, PatMode mode, int N,
                          int curq, int curr)
@@ -525,13 +387,9 @@ static void pat_overlay(const GridCtx *g, PatMode mode, int N,
 }
 
 /*
- * pat_stamp — commit all pattern cells to the pool.
- *
- * THE FORMULA:
- *   Same iteration as pat_overlay.
- *   pool_place(cur.q+dq, cur.r+dr, PAT_GLYPH[mode]) for each passing cell.
- *   Glyphs: disc='*' ring='o' row='=' col=':'  (never '-'/'|' which look like grid lines).
- *   pool_place deduplicates — re-stamping the same cell updates its glyph.
+ * Commits the shape: walks every offset in the box and adds each hex that
+ * passes the test to the pool. This is the one that actually changes state;
+ * the preview only looks.
  */
 static void pat_stamp(Pool *pool, PatMode mode, int N, int curq, int curr)
 {
@@ -544,19 +402,20 @@ static void pat_stamp(Pool *pool, PatMode mode, int N, int curq, int curr)
     }
 }
 
-/* ── end §7 — to understand how paths use hex_dist, read 03_hex_path.c §7 */
+/* ── §8  scene ── */
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
+/*
+ * SceneCfg — the user's current choices: which shape, how big, preview on/off.
+ * Keeping these together lets the draw and key-handling code pass one struct
+ * around instead of three loose variables.
+ */
 typedef struct {
-    PatMode pat_mode;
-    int     pat_n;
-    int     show_preview;
+    PatMode pat_mode;     /* which shape is selected (disc/ring/row/col) */
+    int     pat_n;        /* its size, PAT_N_MIN..PAT_N_MAX */
+    int     show_preview; /* 1 = show the live outline, 0 = hide it */
 } SceneCfg;
 
-/* Bright bold yellow fps readout (top-right) + bold cyan key hints (bottom). */
+/* Status bar (top-right) and the key hints (bottom row). */
 static void hud_draw(const GridCtx *g, const Pool *p, const SceneCfg *cfg,
                       double fps)
 {
@@ -589,9 +448,7 @@ static void scene_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9  screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -604,10 +461,9 @@ static void screen_init(void)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §10 app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §10  app ── */
 
+/* Set from signal handlers, so they must be the safe-to-touch-async type. */
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 
 static void on_signal(int sig)

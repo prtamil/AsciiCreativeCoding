@@ -1,150 +1,43 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 03_double_diagonal.c — tetrakis square tiling (4 triangles per cell)
+ * 03_double_diagonal.c — squares cut into 4 triangles, one per direction.
  *
- * DEMO: Each square is split by BOTH diagonals into 4 right-isosceles
- *       triangles meeting at the centre. Triangles are labelled by the
- *       direction their apex points: N, E, S, W. Arrow keys move the
- *       cursor toward that compass direction — within the current square
- *       if possible, jumping to the next square otherwise.
+ * Each square gets both diagonals drawn in, splitting it into 4 triangles
+ * that meet at the centre. Each triangle points one way — N, E, S, or W —
+ * and the arrow keys walk the @ cursor between them.
  *
- * Study alongside: 02_right_isosceles.c — 2 triangles per square.
- *                  04_30_60_90.c — kisrhombille of equilaterals (analogous
- *                  6-triangle decomposition for the triangular grid).
- *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, CELL_SIZE, BORDER_W, FPS_EWMA_ALPHA
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 4 pairs: border / cursor / HUD / HINT
- *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_pixel_to_tri /
- *                 ctx_draw_bg + tri_centroid_pixel + tri_edge_char
- *   §5 cursor   — Cursor + cursor_reset / cursor_move / cursor_draw, TETRA_DIR
- *   §6 scene    — hud_draw + scene_draw
- *   §7 screen   — ncurses init / cleanup
- *   §8 app      — signals, main loop
- *
- * Keys:  arrows move @   r reset   t theme   p pause
- *        +/- size        [/] border thickness   q/ESC quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids/03_double_diagonal.c \
- *       -o 03_double_diagonal -lncurses -lm
+ * Sister files: 02_right_isosceles.c (one diagonal, 2 triangles per square),
+ *               04_30_60_90.c (the same idea for a triangular grid).
+ * Background: "tetrakis square tiling" on Wikipedia; Conway, Burgiel &
+ *             Goodman-Strauss, "The Symmetries of Things" (2008) §22.
  */
 
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
+/*
+ * THE BIG PICTURE
  *
- * Algorithm      : Tetrakis square tiling — every square split into 4
- *                  right-isosceles triangles by both diagonals (vertex
- *                  config 8.8.8.8: eight triangles meet at every original
- *                  square corner). Pixel→lattice axis-aligned, then a
- *                  WEDGE classifier picks one of {N, E, S, W} based on
- *                  which axis-distance from the centre dominates.
+ * There is no grid stored in memory. Instead, for every character cell on
+ * screen we ask: which square is this, and which of its 4 triangles does it
+ * fall in? Both answers come straight from the pixel's position, recomputed
+ * fresh each frame.
  *
- * Data-structure : Two structs — GridCtx (terminal extent, cell_size,
- *                  CELL_W/CELL_H, screen origin ox/oy, border_w) and
- *                  Cursor (col, row, wedge). No grid array — every pixel
- *                  resolves its (col, row, wedge) per frame.
+ * To find the triangle, stand at the centre of a square. The two diagonals
+ * cut it into 4 wedges, like slicing a sandwich corner to corner both ways:
+ *   N is the top wedge, E the right, S the bottom, W the left.
+ * Which wedge a point lands in just depends on whether it's further from the
+ * centre horizontally or vertically: more horizontal -> E or W (left/right
+ * tells which), more vertical -> N or S.
  *
- * Formula        : Wedge classifier:
- *                    dx = fa − ½, dy = fb − ½
- *                    |dx| > |dy|, dx > 0  →  E
- *                    |dx| > |dy|, dx < 0  →  W
- *                    |dy| ≥ |dx|, dy > 0  →  S
- *                    |dy| ≥ |dx|, dy < 0  →  N
+ * To draw, we only paint the thin outlines, not the solid interiors. For each
+ * pixel we measure how close it is to the triangle's three edges; if it's
+ * hugging an edge we draw a slash, backslash, underscore or bar, otherwise we
+ * leave it blank. Edge distances use barycentric weights — a standard way to
+ * say "how close am I to each side of a triangle" (see the Barycentric
+ * coordinates article on Wikipedia).
  *
- * Edge chars     : Each triangle has one straight edge + two half-diagonal
- *                  edges sharing the square centre. Barycentric weights
- *                  pick which is closest:
- *                    N → '/' '\\' '_'   E → '\\' '/' '|'
- *                    S → '\\' '/' '_'   W → '\\' '/' '|'
- *
- * Movement       : (col, row, wedge) walked by lookup table TETRA_DIR[4][4].
- *                  Each arrow key moves the cursor toward that compass
- *                  direction within the current square; if already at the
- *                  matching apex direction, jumps to the next square.
- *
- * References     :
- *   Tetrakis square tiling — https://en.wikipedia.org/wiki/Tetrakis_square_tiling
- *   Conway, Burgiel, Goodman-Strauss, "The Symmetries of Things" (2008) §22
- *   Barycentric coords    — https://en.wikipedia.org/wiki/Barycentric_coordinate_system
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Take 02's half-rect grid and add the SECOND diagonal. The square is now
- * split into 4 wedges meeting at the centre, like cutting a slice of pie
- * along both diagonals. Each wedge is a right-isosceles triangle whose
- * apex points to one cardinal direction (North, East, South, West). The
- * "which wedge owns this pixel?" question reduces to a single comparison
- * of |Δx| versus |Δy| from the cell centre.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Stand at the centre of a square. The two diagonals (running through
- * you) divide the square into 4 wedges:
- *   N — top wedge, apex points up at the centre
- *   E — right wedge, apex points right
- *   S — bottom wedge, apex points down
- *   W — left wedge, apex points left
- * For any point inside the square, the wedge it lies in is determined by
- * the GREATER of "horizontal distance from centre" and "vertical distance
- * from centre". |dx| wins → it's E or W (sign of dx tells which); |dy|
- * wins → it's N or S.
- *
- * DRAWING METHOD  (raster scan, the approach used here)
- * ──────────────
- *  1. Pick CELL_SIZE — square side length in pixels.
- *  2. Loop every screen cell; convert to centred pixel.
- *  3. Lattice inverse: a = px/size, b = py/size.
- *  4. Floor + frac: tC=⌊a⌋, tR=⌊b⌋, fa=a−tC, fb=b−tR.
- *  5. Wedge classifier:  dx = fa−½,  dy = fb−½.  Pick N/E/S/W from
- *     |dx| vs |dy| and the signs.
- *  6. Compute the wedge's barycentric weights (closed form per direction).
- *  7. m = min(l1, l2, l3). If m ≥ BORDER_W → interior, skip.
- *     Otherwise pick the matching edge character.
- *  8. Draw in cursor or border color.
- *
- * KEY FORMULAS
- * ────────────
- *  Wedge classifier:
- *    adx = |fa − ½|,  ady = |fb − ½|
- *    if adx > ady:  E if fa > ½ else W
- *    else:          S if fb > ½ else N
- *
- *  Barycentric weights (apex at C = (½, ½) in every wedge):
- *    N (A=(0,0), B=(1,0), C=(½,½)):
- *      l_A = 1−fa−fb,  l_B = fa−fb,  l_C = 2·fb
- *    E (A=(1,0), B=(1,1), C=(½,½)):
- *      l_A = fa−fb,    l_B = fa+fb−1, l_C = 2·(1−fa)
- *    S (A=(0,1), B=(1,1), C=(½,½)):
- *      l_A = fb−fa,    l_B = fa+fb−1, l_C = 2·(1−fb)
- *    W (A=(0,0), B=(0,1), C=(½,½)):
- *      l_A = 1−fa−fb,  l_B = fb−fa,  l_C = 2·fa
- *
- *  Centroids in lattice units (relative to square's upper-left corner):
- *    N: (½, 1/6)    E: (5/6, ½)    S: (½, 5/6)    W: (1/6, ½)
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • At the diagonals (|dx| = |dy|), the wedge classifier ties; we resolve
- *    arbitrarily by giving |dy| precedence in the second branch.
- *  • At the centre (fa = fb = ½), all four wedges meet. The classifier
- *    picks N by tie-breaking; the centre pixel renders as a border
- *    character regardless.
- *  • CELL_SIZE = 8 minimum: smaller and the centre wedges collapse to
- *    fewer than 1 pixel, making the diagonals invisible.
- *
- * HOW TO VERIFY
- * ─────────────
- *  At cursor (col, row, wedge) = (0, 0, N):
- *    centroid lattice = (½, 1/6) → pixel (size/2, size/6).
- *    For CELL_SIZE = 18: centroid ≈ (9, 3) px →
- *      col ≈ 9/CELL_W = 4, row ≈ 3/CELL_H = 0.
- *
- * ─────────────────────────────────────────────────────────────────────── */
+ * Good to know:
+ *  - Right on a diagonal the two wedges tie; we just pick one, it's invisible.
+ *  - Make squares too small (below size 8) and the inner triangles vanish.
+ */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -157,9 +50,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 
@@ -184,7 +75,7 @@
 
 #define N_THEMES 4
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How fast the on-screen FPS number reacts; low = smooth and steady. */
 #define FPS_EWMA_ALPHA 0.05
 
 #define PAIR_BORDER 1
@@ -192,9 +83,7 @@
 #define PAIR_HUD    3
 #define PAIR_HINT   4
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -211,9 +100,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static const short THEME_FG[N_THEMES]   = {  82, 207, 214,  15 };
 static const short THEME_FG_8[N_THEMES] = {
@@ -231,29 +118,29 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx, wedge classifier and edge characters             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula — which square, which triangle, which edge ── */
 
 /*
- * GridCtx — geometry of the active tetrakis square grid.
+ * GridCtx — everything we need to draw the grid this frame.
  *
- * Same centring scheme as 02; cell_size and border_w tunable per frame.
+ * There's no stored grid; this just holds the current size and placement so
+ * any pixel can be turned into a square + triangle. cell_size and border_w
+ * are live-tunable, so the picture redraws when the user zooms or thickens
+ * the outlines. Centring matches its sister file 02.
  */
 typedef struct {
-    /* terminal extent */
+    /* size of the terminal, in character cells */
     int rows, cols;
 
-    /* square geometry */
-    double cell_size;      /* side length in pixels                          */
-    double border_w;       /* barycentric threshold for edge proximity       */
-    int    cw, ch;         /* sub-pixel scaling — CELL_W, CELL_H             */
+    double cell_size;      /* one square's side length, in pixels            */
+    double border_w;       /* how close to an edge counts as "on the line";
+                              bigger = thicker outlines                      */
+    int    cw, ch;         /* pixels packed into one character cell (a cell
+                              is taller than it is wide), = CELL_W, CELL_H   */
 
-    /* screen origin = pixel (0,0) */
-    int    ox, oy;
+    int    ox, oy;         /* screen cell that sits at pixel (0,0)           */
 
-    /* advisory cursor bounds in lattice space */
-    int    max_col, max_row;
+    int    max_col, max_row;  /* rough how-far-the-grid-reaches hint         */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols)
@@ -271,17 +158,11 @@ static void ctx_init(GridCtx *g, int rows, int cols)
 }
 
 /*
- * ctx_pixel_to_tri — square cell + wedge classifier.
- *
- * THE FORMULA (axis-aligned lattice + 4-wedge split):
- *
- *   a = px / size,   b = py / size
- *   col = ⌊a⌋, row = ⌊b⌋, fa = a−col, fb = b−row
- *   dx = fa − ½, dy = fb − ½
- *   |dx| > |dy|, dx > 0  →  E
- *   |dx| > |dy|, dx < 0  →  W
- *   |dy| ≥ |dx|, dy > 0  →  S
- *   |dy| ≥ |dx|, dy < 0  →  N
+ * Given a pixel, work out which square it's in and which of the 4 triangles.
+ * The square comes from dividing by the square size; the triangle comes from
+ * asking whether the pixel sits further from the square's centre sideways or
+ * up/down. Also hands back where inside the square it landed (fa, fb, each
+ * 0..1) so the caller can measure edge distances.
  */
 static void ctx_pixel_to_tri(const GridCtx *g, double px, double py,
                              int *col, int *row, int *wedge,
@@ -303,9 +184,10 @@ static void ctx_pixel_to_tri(const GridCtx *g, double px, double py,
 }
 
 /*
- * tri_centroid_pixel — pure forward map for cursor mark.
- *
- *   N: (½, 1/6)    E: (5/6, ½)    S: (½, 5/6)    W: (1/6, ½)
+ * The opposite trip: given a triangle, find the pixel at its middle. Used to
+ * place the @ marker on the triangle the cursor is sitting on. Each triangle's
+ * middle sits a fixed fraction into its square (the N triangle's middle is
+ * near its top edge, and so on).
  */
 static void tri_centroid_pixel(int col, int row, int wedge, double size,
                                double *cx_pix, double *cy_pix)
@@ -331,21 +213,11 @@ static void ctx_to_screen(const GridCtx *g, int col, int row, int wedge,
 }
 
 /*
- * tri_edge_char — barycentric weights → edge character per wedge.
- *
- * Weights derivation (each wedge has C=(½,½) as apex):
- *   N (A=(0,0), B=(1,0), C=(½,½)):
- *     l_A = 1−fa−fb,    l_B = fa−fb,        l_C = 2·fb
- *     l_A → '/'   l_B → '\\'  l_C → '_'
- *   E (A=(1,0), B=(1,1), C=(½,½)):
- *     l_A = fa−fb,      l_B = fa+fb−1,      l_C = 2·(1−fa)
- *     l_A → '\\'  l_B → '/'   l_C → '|'
- *   S (A=(0,1), B=(1,1), C=(½,½)):
- *     l_A = fb−fa,      l_B = fa+fb−1,      l_C = 2·(1−fb)
- *     l_A → '\\'  l_B → '/'   l_C → '_'
- *   W (A=(0,0), B=(0,1), C=(½,½)):
- *     l_A = 1−fa−fb,    l_B = fb−fa,        l_C = 2·fa
- *     l_A → '\\'  l_B → '/'   l_C → '|'
+ * Pick the outline character for a pixel, and report how close it is to the
+ * nearest edge. Each triangle has three edges, each drawn with its own glyph:
+ * a slash, a backslash, and a flat one (underscore or bar). We measure the
+ * distance to all three (smaller = closer), keep the nearest, and return its
+ * glyph. The caller draws it only when that distance is small enough.
  */
 static char tri_edge_char(int wedge, double fa, double fb, double *out_min)
 {
@@ -404,30 +276,28 @@ static void ctx_draw_bg(const GridCtx *g, int cC, int cR, int cWedge)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 cursor ── */
 
 /*
- * Cursor — (col, row, wedge) in lattice triangle space.
+ * Cursor — where the @ marker currently sits.
  *
- * wedge ∈ {0=N, 1=E, 2=S, 3=W}. Each wedge points its apex toward that
- * compass direction inside the square (col, row).
+ * col, row say which square; wedge says which of its 4 triangles
+ * (0=N, 1=E, 2=S, 3=W — the direction that triangle points).
  */
 typedef struct { int col, row, wedge; } Cursor;
 
 /*
- * TETRA_DIR — arrow-key transitions (Δcol, Δrow, target_wedge).
- *   index 0:LEFT  1:RIGHT  2:UP  3:DOWN
- *   row   0:N     1:E      2:S   3:W
+ * TETRA_DIR — the movement rules, baked into a lookup table.
  *
- * Arrow press moves the cursor "toward" the compass direction. If the
- * current triangle's apex already points that way and its base edge is
- * the boundary, jump to the matching triangle in the adjacent square
- * (apex flipped). Otherwise toggle to the matching triangle in the same
- * square.
- *   W + LEFT  → E in (col-1, row)        N + LEFT → W in same square
- *   N + UP    → S in (col, row-1)        E + UP   → N in same square
+ * Read it as TETRA_DIR[which arrow][current triangle] -> {shift in column,
+ * shift in row, new triangle}. Arrows are 0:LEFT 1:RIGHT 2:UP 3:DOWN;
+ * triangles are 0:N 1:E 2:S 3:W.
+ *
+ * The idea: an arrow nudges the cursor that way. Usually it just hops to the
+ * neighbouring triangle inside the same square. But if you're already against
+ * the square's outer edge in that direction, it steps into the next square and
+ * lands on the triangle facing back the way you came. Example: in the W
+ * triangle pressing LEFT crosses into the previous square's E triangle.
  */
 static const int TETRA_DIR[4][4][3] = {
     /* LEFT  */ { {  0,  0, WEDGE_W }, {  0,  0, WEDGE_W }, {  0,  0, WEDGE_W }, { -1,  0, WEDGE_E } },
@@ -464,9 +334,7 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
 static const char *WEDGE_NAME[4] = { "N", "E", "S", "W" };
 
@@ -500,9 +368,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, int theme,
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -516,9 +382,7 @@ static void screen_init(void)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;

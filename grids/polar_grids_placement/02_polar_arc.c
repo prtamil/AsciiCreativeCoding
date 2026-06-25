@@ -1,149 +1,15 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 02_polar_arc.c — two-anchor arc and spoke drawing on a polar grid
+ * 02_polar_arc.c — draw arcs and spokes on a polar (rings-and-rays) grid.
  *
- * DEMO: Press 'p' to set anchor A, move, press 'p' again to set anchor B.
- *       Then press 'a' to draw an arc along the ring at r_A from θ_A to θ_B;
- *       's' to draw a radial spoke at θ_A from r_A to r_B; 'o' to stamp a
- *       full ring at r_A; 'x' for a full radial line at θ_A.  The HUD shows
- *       the anchor coordinates in (r, θ) so you can see the polar geometry.
+ * You pick two points with 'p', then stamp the four shapes that bound a
+ * polar cell: an arc (part of a ring), a spoke (part of a ray), a whole
+ * ring, or a whole ray.  The HUD shows each point as (r, angle) so you can
+ * watch the polar geometry while you draw.
  *
- * Study alongside: 01_polar_direct.c (cursor model),
- *                  grids/rect_grids_placement/03_path.c (analogous rect version)
- *
- * Section map:
- *   §1 config   — pool size, arc/spoke step, background names
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 5 pairs: grid, active, anchor, HUD (yellow), hint (cyan)
- *   §4 gridctx  — GridCtx (mode, origin), cell_to_polar, polar_to_screen
- *   §5 pool     — Pool: place, clear, draw
- *   §6 cursor   — Cursor (r, theta, row, col, seed_idx) + grid-snap arrow move
- *   §7 mode     — draw_polar_bg: 7 inline polar background types in one switch
- *   §8 anchor   — AnchorCtx, 3-state FSM, arc/spoke/ring/radial draw
- *   §9 scene    — hud_draw + scene_draw
- *   §10 screen  — ncurses init / cleanup
- *   §11 app     — signals, resize, main loop
- *
- * Keys:  q/ESC quit   P pause   t theme   a/e prev/next background
- *        p  advance state (IDLE→ONE→TWO→IDLE)
- *        In ONE or TWO: o full-ring   x full-spoke
- *        In TWO only:   a arc   s spoke
- *        C clear all   r reset anchors
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/polar_grids_placement/02_polar_arc.c \
- *       -o 02_polar_arc -lncurses -lm
+ * Sister files: 01_polar_direct.c (same cursor model, simpler),
+ *               grids/rect_grids_placement/03_path.c (the square-grid version).
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Polar path rasterisation.  Given two polar anchors
- *                  A = (r_A, θ_A) and B = (r_B, θ_B) the four operations
- *                  are:
- *
- *                  Arc   — iterate θ from θ_A to θ_B at constant r = r_A,
- *                           placing one object per terminal cell:
- *                           step = CELL_W / r_A radians (≈ 1 cell per step).
- *
- *                  Spoke — iterate r from r_A to r_B at constant θ = θ_A,
- *                           step = 1.0 pixel (finer than CELL_W/CELL_H).
- *
- *                  Ring  — full arc at r_A over [0, 2π).
- *
- *                  Radial — spoke at θ_A from r=4 to max visible radius.
- *
- *                  All operations convert each (r, θ) sample to a terminal
- *                  cell via polar_to_screen() and append to the object pool.
- *
- * Data-structure : Pool with pool_place (no-duplicate check for draw ops;
- *                  duplicates are harmless since the pool is capped).
- *                  State machine: IDLE → ONE → TWO, advanced by 'p'.
- *
- * Math           : Arc length in terminal columns ≈ r × Δθ / CELL_W.
- *                  Step size CELL_W/r ensures ≤ 1 object per column at
- *                  any radius.  Spoke length in cells ≈ Δr / CELL_H.
- *
- * References     :
- *   Polar coordinate system — en.wikipedia.org/wiki/Polar_coordinate_system
- *   Rectangular analogue — grids/rect_grids_placement/03_path.c
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ──────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * A polar "cell" is bounded by two arcs (at r_A and r_B) and two spokes
- * (at θ_A and θ_B).  This file lets you draw those four boundary types
- * individually using a two-anchor state machine.  Each operation converts
- * a parametric polar curve into a sequence of object-pool entries.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Anchor A = (r_A, θ_A) defines a specific ring and a specific ray.
- * Anchor B = (r_B, θ_B) defines a second ring and second ray.
- *
- *   Arc:    portion of ring r_A between rays θ_A and θ_B.
- *   Spoke:  segment of ray θ_A between rings r_A and r_B.
- *   Ring:   full ring at r_A (θ from 0 to 2π).
- *   Radial: full ray at θ_A from origin to screen edge.
- *
- * The state machine (IDLE→ONE→TWO) ensures both anchors are set before
- * drawing arc or spoke.  Ring and radial only need anchor ONE.
- *
- * DRAWING METHOD
- * ──────────────
- * 1. Move cursor, press 'p' → sets anchor A (state: IDLE→ONE).
- * 2. Move cursor, press 'p' → sets anchor B (state: ONE→TWO).
- * 3. Press 'a'=arc, 's'=spoke, 'o'=ring, 'x'=radial to draw.
- *    Each operation calls pool_place() for every sampled (r, θ).
- * 4. Press 'p' again → resets to IDLE.
- *
- * KEY FORMULAS
- * ────────────
- * arc_draw — angular step for one terminal column:
- *   step = CELL_W / (r_A + 1)          [radians per column at radius r_A]
- *   clamped to ARC_STEP_MIN=0.005 rad (prevents infinite loop at large r)
- *   Direction: always forward — if t1 < t0 add 2π (counterclockwise wrap)
- *   Arc cells ≈ Δθ × r_A / CELL_W
- *   Example: Δθ=π/2, r_A=20 → ≈ 20×1.571/2 ≈ 15 objects
- *
- * spoke_draw — pixel-step radial segment:
- *   step = SPOKE_PX_STEP = 1.0 px (finer than CELL_H=4; no gaps)
- *   r from min(r_A, r_B) to max(r_A, r_B) at constant θ = θ_A
- *   Spoke cells ≈ |r_B − r_A| / CELL_H
- *
- * ring_draw — full circle at r_A:
- *   Same step as arc_draw; t from 0 to 2π
- *   Objects ≈ 2π × r_A / CELL_W  (= π × r_A for CELL_W=2)
- *
- * radial_draw — full spoke from R_OPS_MIN to screen corner:
- *   r_max = sqrt((ox × CELL_W)² + (oy × CELL_H)²)   [screen diagonal in px]
- *   r from R_OPS_MIN to r_max by SPOKE_PX_STEP
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- * - Arc always goes counterclockwise (t1 += 2π when t1 < t0).  If θ_A and
- *   θ_B are close and θ_A > θ_B you get the long arc (> π), not the short.
- * - ARC_STEP_MIN=0.005: without this the step rounds to 0 for r_A > ~400,
- *   causing an infinite loop in arc_draw.
- * - MAX_OBJ=4096.  A full ring at r=200 needs ≈628 objects; at r=1300 the
- *   ring would overflow the pool.  pool_place silently caps at MAX_OBJ.
- *
- * HOW TO VERIFY
- * ─────────────
- * Terminal 80×24 → ox=40, oy=12.
- *
- * arc_draw (A at col=50,row=12 → r_A=20, θ_A=0; B at col=40,row=7):
- *   θ_B = atan2((7−12)×4, 0) = atan2(−20, 0) = −π/2
- *   t0=0, t1=fmod(−π/2+2π,2π)=3π/2≈4.712
- *   step=2/(20+1)≈0.095 rad → ≈50 objects covering 270°.
- *
- * ring_draw at r_A=20:
- *   step≈0.095; loop: 2π/0.095≈66 objects.
- *   At θ=0: col=50, row=12 ✓.  At θ=π/2: col=40, row=17 ✓.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
@@ -160,25 +26,26 @@
 #  define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS    30
 #define CELL_W         2
 #define CELL_H         4
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* Smooths the FPS number so it doesn't jitter every frame. */
 #define FPS_EWMA_ALPHA  0.05
 
-/* Spoke rasterisation step in pixels (finer than cell size, no gaps) */
+/* How far apart to drop dots when drawing a spoke. Smaller than a cell so
+ * the line has no gaps. */
 #define SPOKE_PX_STEP   1.0
-/* Minimum arc angular step — prevents infinite loops at very large r */
+/* Smallest angle step for an arc. Without a floor, a huge ring's step would
+ * round to zero and the loop would never end. */
 #define ARC_STEP_MIN    0.005   /* radians */
-/* Minimum radius for radial/ring operations */
+/* Rings and rays start a little out from the centre to dodge the origin. */
 #define R_OPS_MIN       4.0
 
-/* Object pool — larger than 01 because arc/ring can produce many objects */
+/* How many dots we can hold. Bigger than file 01's pool because one ring or
+ * arc can stamp hundreds at once. */
 #define MAX_OBJ       4096
 #define OBJ_GLYPH     '*'
 
@@ -186,14 +53,14 @@
 #define GOLDEN_ANGLE  (2.0 * M_PI / (PHI * PHI))
 #define N_BG_SEEDS    600
 
-/* Minimum cursor radius — avoids origin singularity */
+/* Don't let the cursor sit right on the centre, where angle is undefined. */
 #define R_POLAR_MIN     4.0
 
 /*
- * BG_* constants — per-mode step sizes for cursor_move (mirror 01_polar_direct).
- * Arrows snap the cursor to the natural intersections of each background grid,
- * so 'p'-anchor + 'o'-ring / 'x'-radial land on visible ring/spoke lines
- * instead of arbitrary screen positions.
+ * How far each arrow press moves the cursor, one set per background style
+ * (same values as 01_polar_direct). The point: arrows step from one grid
+ * line to the next, so a captured anchor lands on a visible ring or spoke
+ * instead of somewhere in between.
  */
 #define BG_RING_SP      20.0           /* rings+spokes: ring spacing (px)    */
 #define BG_SPOKE_ANG    (M_PI / 6.0)   /* rings/log/sector/elliptic: 30°     */
@@ -212,7 +79,7 @@
 /* Color pairs */
 #define PAIR_GRID    1
 #define PAIR_ACTIVE  2
-#define PAIR_ANCHOR  3   /* anchor A and B markers */
+#define PAIR_ANCHOR  3   /* the A and B point markers */
 #define PAIR_HUD     4   /* status bar (yellow)  */
 #define PAIR_HINT    5   /* key-hint footer (cyan) */
 
@@ -231,9 +98,7 @@ static const short THEME_FG[][2] = {
 };
 #define N_THEMES  5
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -248,9 +113,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static void color_init(int theme)
 {
@@ -263,14 +126,20 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx                                                             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx ── */
 
 /*
- * GridCtx — minimal polar context: terminal extent, cell aspect, origin,
- * which background mode is active, and informational max_ring/max_spoke
- * caps used by the HUD.
+ * GridCtx — everything the polar math needs to know about the screen.
+ * It holds the terminal size, the centre point that polar (0,0) maps to,
+ * the shape of one character cell, and which background style is showing.
+ *
+ *   mode              which background grid is active (0..6, see BG_NAMES)
+ *   rows, cols        terminal size in characters
+ *   cw, ch            one cell's width/height in pixels (a cell is taller
+ *                     than wide, so circles need this to not look squashed)
+ *   ox, oy            the centre cell — where radius 0 lives
+ *   max_ring,         rough counts of how many rings/spokes fit on screen,
+ *   max_spoke         shown in the HUD only
  */
 typedef struct {
     int mode;
@@ -317,14 +186,15 @@ static char angle_char(double theta)
     return '/';
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool ── */
 
+/* One stamped dot: where it sits and what character it shows. */
 typedef struct { int row, col; char glyph; bool alive; } Obj;
+/* The whole collection of dots drawn so far. Fixed size — no growing. */
 typedef struct { Obj items[MAX_OBJ]; int count; } Pool;
 
-/* pool_place — append if in bounds; cap silently at MAX_OBJ */
+/* Adds a dot if it's on screen. If the pool is full, the dot is dropped
+ * (better than overflowing). */
 static void pool_place(Pool *p, int row, int col,
                        int rows, int cols, char glyph)
 {
@@ -346,27 +216,29 @@ static void pool_draw(const Pool *p)
 
 static void pool_clear(Pool *p) { p->count = 0; }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 cursor ── */
 
 /*
- * Cursor — POLAR-space cursor with cached screen coordinates.
+ * Cursor — where you're pointing, kept in polar terms.
  *
- * (r, theta) is the address; (row, col) is computed from it via cursor_sync().
- * Arrow keys snap to grid intersections via cursor_move's per-mode dispatch,
- * so when 'p' captures an anchor and 'o'/'x' draw a ring/radial at that
- * radius/angle, the result lines up with the visible polar grid.
+ * The real position is (r, theta): how far from the centre and at what
+ * angle. The (row, col) cell is just that converted to a screen spot, so
+ * we don't recompute it every time we draw. Arrow keys move the cursor
+ * along whatever grid is showing, so a captured point lands on a real
+ * grid line. Same layout as 01_polar_direct.c.
  *
- * Same shape as 01_polar_direct.c.
+ *   r, theta    distance (pixels) and angle (radians) from centre
+ *   row, col    the screen cell that (r, theta) maps to
+ *   seed_idx    which sunflower seed we're on — only the sunflower
+ *               background uses this
  */
 typedef struct {
-    double r, theta;  /* polar position: pixels and radians        */
-    int    row, col;  /* terminal cell derived from (r, theta)     */
-    int    seed_idx;  /* Vogel seed index (sunflower bg only)      */
+    double r, theta;
+    int    row, col;
+    int    seed_idx;
 } Cursor;
 
-/* Recompute (row,col) after polar coords change; clamp to screen. */
+/* After r or theta changes, refresh the screen cell and keep it on screen. */
 static void cursor_sync(Cursor *c, const GridCtx *g)
 {
     polar_to_screen(c->r, c->theta, g->ox, g->oy, &c->col, &c->row);
@@ -377,8 +249,9 @@ static void cursor_sync(Cursor *c, const GridCtx *g)
 }
 
 /*
- * cursor_apply_seed — update (r, θ, row, col) from seed_idx for sunflower bg.
- * Vogel model: r = sqrt(i) × spacing, θ = i × GOLDEN_ANGLE.
+ * Places the cursor on sunflower seed number seed_idx. Each seed sits a
+ * little farther out and turned by the golden angle from the last — the
+ * pattern real sunflowers use to pack seeds evenly (Vogel's model).
  */
 static void cursor_apply_seed(Cursor *c, const GridCtx *g)
 {
@@ -397,9 +270,9 @@ static void cursor_reset(Cursor *c, const GridCtx *g)
     else              cursor_sync(c, g);
 }
 
-/* Wrap θ into [0, 2π) and clamp r to R_POLAR_MIN — shared tail of every
- * (r, θ)-mutating cursor mode (modes 0, 1, 2, 3, 5).  Mode 4 (sunflower)
- * and mode 6 (elliptic) use bespoke clamps that touch (row, col) directly. */
+/* Tidy up after a move: fold the angle back into one full turn and stop r
+ * from going below the minimum, then refresh the screen cell. Most modes
+ * end with this; sunflower and elliptic do their own clamping instead. */
 static void cursor_normalise_polar(Cursor *c, const GridCtx *g)
 {
     const double two_pi = 2.0 * M_PI;
@@ -408,7 +281,7 @@ static void cursor_normalise_polar(Cursor *c, const GridCtx *g)
     cursor_sync(c, g);
 }
 
-/* Mode 0 — rings+spokes: UP/DOWN snap to next ring, LEFT/RIGHT to next spoke. */
+/* Rings+spokes: up/down hop to the next ring, left/right to the next spoke. */
 static void cursor_move_rings_spokes(Cursor *c, const GridCtx *g, int key)
 {
     switch (key) {
@@ -421,7 +294,8 @@ static void cursor_move_rings_spokes(Cursor *c, const GridCtx *g, int key)
     cursor_normalise_polar(c, g);
 }
 
-/* Mode 1 — log-polar: UP/DOWN multiply r by RATIO=e^0.25, LR snaps to spokes. */
+/* Log-polar: up/down scale the radius by a fixed factor (rings grow as you
+ * go out), left/right hop to the next spoke. */
 static void cursor_move_log_polar(Cursor *c, const GridCtx *g, int key)
 {
     switch (key) {
@@ -434,7 +308,8 @@ static void cursor_move_log_polar(Cursor *c, const GridCtx *g, int key)
     cursor_normalise_polar(c, g);
 }
 
-/* Mode 2 — archimedean: LR walks ALONG the curve (Δr = a×Δθ); UD jumps one turn. */
+/* Archimedean spiral: left/right walk along the spiral itself, up/down jump
+ * out or in by one full turn. */
 static void cursor_move_archimedean(Cursor *c, const GridCtx *g, int key)
 {
     double a = BG_ARCH_PITCH / (2.0 * M_PI);
@@ -454,7 +329,8 @@ static void cursor_move_archimedean(Cursor *c, const GridCtx *g, int key)
     cursor_normalise_polar(c, g);
 }
 
-/* Mode 3 — log-spiral: LR walks the curve, UD flips between the two golden arms. */
+/* Log-spiral: left/right walk along the curve, up/down flip to the other
+ * arm (there are two, half a turn apart). */
 static void cursor_move_log_spiral(Cursor *c, const GridCtx *g, int key)
 {
     double scale = exp(2.0 * log(PHI) / M_PI * BG_LOG_ANG);
@@ -467,14 +343,15 @@ static void cursor_move_log_spiral(Cursor *c, const GridCtx *g, int key)
         c->theta += BG_LOG_ANG;
         c->r     *= scale;
         break;
-    case KEY_UP:   c->theta -= M_PI; break;  /* 2-arm: arms are π apart */
+    case KEY_UP:   c->theta -= M_PI; break;  /* the two arms sit half a turn apart */
     case KEY_DOWN: c->theta += M_PI; break;
     default: return;
     }
     cursor_normalise_polar(c, g);
 }
 
-/* Mode 4 — sunflower: step seed index; cursor_apply_seed snaps to the exact seed. */
+/* Sunflower: arrows step through seed numbers (left/right by one, up/down by
+ * a bigger jump); the cursor snaps to that exact seed. */
 static void cursor_move_sunflower(Cursor *c, const GridCtx *g, int key)
 {
     switch (key) {
@@ -487,7 +364,8 @@ static void cursor_move_sunflower(Cursor *c, const GridCtx *g, int key)
     cursor_apply_seed(c, g);
 }
 
-/* Mode 5 — equal-area: UP/DOWN snap to sqrt(k)×R_UNIT rings, LR = spokes. */
+/* Equal-area: up/down hop between rings spaced so each band holds the same
+ * area (they bunch up as you go out), left/right hop between spokes. */
 static void cursor_move_equal_area(Cursor *c, const GridCtx *g, int key)
 {
     double kf = (c->r / BG_RUNIT) * (c->r / BG_RUNIT);
@@ -510,7 +388,9 @@ static void cursor_move_equal_area(Cursor *c, const GridCtx *g, int key)
     cursor_normalise_polar(c, g);
 }
 
-/* Mode 6 — elliptic: move in the (e_r, ell_θ) frame, then convert back to (col,row). */
+/* Elliptic: the rings are stretched ovals, so we first read the cursor in
+ * the oval's own coordinates, hop to the next oval ring or spoke, then
+ * convert that back to a screen cell. */
 static void cursor_move_elliptic(Cursor *c, const GridCtx *g, int key)
 {
     double dx   = (double)(c->col - g->ox) * CELL_W;
@@ -547,9 +427,8 @@ static void cursor_move_elliptic(Cursor *c, const GridCtx *g, int key)
 }
 
 /*
- * cursor_move — grid-aware movement: dispatches per mode so arrows
- * always follow the natural geometry of the active background.
- * Routes to one of seven cursor_move_* helpers (one per BG_NAMES entry).
+ * Hands the arrow key to whichever mover matches the current background, so
+ * arrows always follow the shape of the grid you're looking at.
  */
 static void cursor_move(Cursor *c, const GridCtx *g, int key)
 {
@@ -573,11 +452,12 @@ static void cursor_draw(const Cursor *c, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_ACTIVE) | A_REVERSE | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  mode  (polar background dispatcher)                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 mode ── */
 
-/* Mode 0 — rings + spokes (defaults from polar_grids/01_rings_spokes.c). */
+/* These seven functions just paint the faint background grid you draw on.
+ * Each matches one full demo elsewhere; the file name says which. */
+
+/* Rings + spokes — see polar_grids/01_rings_spokes.c. */
 static void bg_rings_spokes_draw(const GridCtx *g)
 {
     const double two_pi = 2.0 * M_PI;
@@ -599,7 +479,7 @@ static void bg_rings_spokes_draw(const GridCtx *g)
     }
 }
 
-/* Mode 1 — log-polar grid (defaults from polar_grids/02_log_polar.c). */
+/* Log-polar grid — see polar_grids/02_log_polar.c. */
 static void bg_log_polar_draw(const GridCtx *g)
 {
     const double two_pi = 2.0 * M_PI;
@@ -625,7 +505,7 @@ static void bg_log_polar_draw(const GridCtx *g)
     }
 }
 
-/* Mode 2 — archimedean 2-arm spiral (polar_grids/03_archimedean_spiral.c). */
+/* Archimedean two-arm spiral — see polar_grids/03_archimedean_spiral.c. */
 static void bg_archimedean_draw(const GridCtx *g)
 {
     const double two_pi = 2.0 * M_PI;
@@ -646,7 +526,7 @@ static void bg_archimedean_draw(const GridCtx *g)
     }
 }
 
-/* Mode 3 — golden log-spiral, 2 arms (polar_grids/04_log_spiral.c). */
+/* Golden log-spiral, two arms — see polar_grids/04_log_spiral.c. */
 static void bg_log_spiral_draw(const GridCtx *g)
 {
     const double two_pi = 2.0 * M_PI;
@@ -668,7 +548,7 @@ static void bg_log_spiral_draw(const GridCtx *g)
     }
 }
 
-/* Mode 4 — Vogel sunflower phyllotaxis (polar_grids/05_sunflower.c). */
+/* Sunflower seed pattern — see polar_grids/05_sunflower.c. */
 static void bg_sunflower_draw(const GridCtx *g)
 {
     const double sp = 3.5;
@@ -688,7 +568,7 @@ static void bg_sunflower_draw(const GridCtx *g)
     free(vis);
 }
 
-/* Mode 5 — equal-area sector grid (polar_grids/06_sector.c). */
+/* Equal-area sector grid — see polar_grids/06_sector.c. */
 static void bg_equal_area_draw(const GridCtx *g)
 {
     const double two_pi = 2.0 * M_PI;
@@ -712,7 +592,7 @@ static void bg_equal_area_draw(const GridCtx *g)
     }
 }
 
-/* Mode 6 — elliptic ring grid (polar_grids/07_elliptic.c). */
+/* Elliptic (oval) ring grid — see polar_grids/07_elliptic.c. */
 static void bg_elliptic_draw(const GridCtx *g)
 {
     const double A = 1.6, B = 1.0, sp = 20.0, rwu = 0.07;
@@ -731,11 +611,7 @@ static void bg_elliptic_draw(const GridCtx *g)
     }
 }
 
-/*
- * draw_polar_bg — dispatch on g->mode and draw the matching polar grid.
- * Routes to one of seven bg_*_draw helpers (rings_spokes, log_polar,
- * archimedean, log_spiral, sunflower, equal_area, elliptic).  No mutation.
- */
+/* Draws whichever background grid the current mode selects. */
 static void draw_polar_bg(const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_GRID));
@@ -751,33 +627,44 @@ static void draw_polar_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_GRID));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  anchor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 anchor ── */
 
+/* How many points we've picked so far: none, one (A), or two (A and B). */
 typedef enum { IDLE = 0, ONE = 1, TWO = 2 } AnchorState;
 
+/*
+ * AnchorCtx — the two points you select and remember between them.
+ * Press 'p' to capture the cursor as point A, then again for point B; the
+ * four shapes are drawn from these. We keep each point both in polar form
+ * (r, angle) for the math and in screen form (row, col) for drawing markers.
+ *
+ *   state             how far through picking we are (none / A / A and B)
+ *   r_a, theta_a      point A in polar form
+ *   row_a, col_a      point A as a screen cell
+ *   r_b, theta_b      point B in polar form
+ *   row_b, col_b      point B as a screen cell
+ */
 typedef struct {
     AnchorState state;
-    double r_a, theta_a;   /* anchor A */
+    double r_a, theta_a;
     int    row_a, col_a;
-    double r_b, theta_b;   /* anchor B */
+    double r_b, theta_b;
     int    row_b, col_b;
 } AnchorCtx;
 
 /*
- * arc_draw — rasterise arc of ring r_a from theta_a to theta_b.
- *
- * THE FORMULA:
- *   step = CELL_W / (r_a + 1)   [rad/col: ≈1 object per terminal column]
- *   step clamped to ARC_STEP_MIN=0.005 (prevents infinite loop at large r)
- *   Always counterclockwise: if t1 < t0 add 2π before iterating
+ * Draws an arc: the slice of point A's ring that runs from A's angle to B's.
+ * It walks the angle in small steps, dropping one dot per step. The step is
+ * sized so big rings (more cells around) get more dots and the line stays
+ * solid; a floor on the step stops a giant ring from looping forever. The
+ * walk always goes the same direction, so picking A past B gives the long
+ * way round, not the short.
  */
 static void arc_draw(Pool *pool, const AnchorCtx *ac, const GridCtx *g)
 {
     double t0 = fmod(ac->theta_a + 2.0*M_PI, 2.0*M_PI);
     double t1 = fmod(ac->theta_b + 2.0*M_PI, 2.0*M_PI);
-    if (t1 < t0) t1 += 2.0*M_PI;                     /* always go forward */
+    if (t1 < t0) t1 += 2.0*M_PI;                     /* keep sweeping one direction */
     double step = CELL_W / (ac->r_a + 1.0);
     if (step < ARC_STEP_MIN) step = ARC_STEP_MIN;
     for (double t = t0; t <= t1 + step*0.5; t += step) {
@@ -788,11 +675,9 @@ static void arc_draw(Pool *pool, const AnchorCtx *ac, const GridCtx *g)
 }
 
 /*
- * spoke_draw — rasterise radial segment at theta_a from r_a to r_b.
- *
- * THE FORMULA:
- *   step = SPOKE_PX_STEP = 1.0 px (finer than CELL_H=4 to avoid gaps)
- *   r from min(r_a, r_b) to max(r_a, r_b) at constant θ = theta_a
+ * Draws a spoke: a straight line out from the centre at point A's angle,
+ * running between the two points' distances. It steps the distance outward
+ * in small pixel steps so the line has no gaps.
  */
 static void spoke_draw(Pool *pool, const AnchorCtx *ac, const GridCtx *g)
 {
@@ -805,7 +690,8 @@ static void spoke_draw(Pool *pool, const AnchorCtx *ac, const GridCtx *g)
     }
 }
 
-/* ring_draw — full 2π arc at r_a (same step formula as arc_draw) */
+/* Draws a full ring at point A's distance — an arc that goes all the way
+ * around. Same stepping idea as arc_draw. */
 static void ring_draw(Pool *pool, const AnchorCtx *ac, const GridCtx *g)
 {
     const double two_pi = 2.0 * M_PI;
@@ -819,11 +705,9 @@ static void ring_draw(Pool *pool, const AnchorCtx *ac, const GridCtx *g)
 }
 
 /*
- * radial_draw — full spoke at theta_a from R_OPS_MIN to screen corner.
- *
- * THE FORMULA:
- *   r_max = sqrt((ox×CELL_W)² + (oy×CELL_H)²)   [screen diagonal in px]
- *   r from R_OPS_MIN to r_max by SPOKE_PX_STEP=1.0 px
+ * Draws a full ray at point A's angle, from near the centre out past the
+ * far corner of the screen, so it always reaches the edge. The far corner
+ * is just the longest distance any visible cell can be.
  */
 static void radial_draw(Pool *pool, const AnchorCtx *ac, const GridCtx *g)
 {
@@ -838,9 +722,8 @@ static void radial_draw(Pool *pool, const AnchorCtx *ac, const GridCtx *g)
 }
 
 /*
- * anchor_advance — drive the IDLE → ONE → TWO → IDLE state machine.
- * IDLE: capture cursor as anchor A.  ONE: capture cursor as anchor B.
- * TWO: clear back to IDLE so the user can restart the two-anchor selection.
+ * One press of 'p' steps the picker forward: first press grabs point A,
+ * second grabs point B, third clears back to the start so you can pick again.
  */
 static void anchor_advance(AnchorCtx *ac, const Cursor *cur)
 {
@@ -861,7 +744,7 @@ static void anchor_advance(AnchorCtx *ac, const Cursor *cur)
     }
 }
 
-/* Draw anchor markers on screen */
+/* Marks the picked points: '@' for A, '#' for B. */
 static void anchors_draw(const AnchorCtx *ac)
 {
     attron(COLOR_PAIR(PAIR_ANCHOR) | A_BOLD);
@@ -872,13 +755,12 @@ static void anchors_draw(const AnchorCtx *ac)
     attroff(COLOR_PAIR(PAIR_ANCHOR) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 scene ── */
 
 static const char *const STATE_NAMES[] = {"IDLE", "A-set", "B-set"};
 
-/* Bright bold yellow status (top-right) + bold cyan key hints (bottom). */
+/* Top-right status line, plus the key hints along the bottom. The hint line
+ * changes with the picker state so it only offers keys that do something. */
 static void hud_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
                      const AnchorCtx *ac, int theme, double fps, bool paused)
 {
@@ -914,9 +796,7 @@ static void scene_draw(const GridCtx *g, const Pool *pool, const Cursor *cur,
     wnoutrefresh(stdscr); doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §10  screen                                                             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §10 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(int theme)
@@ -927,9 +807,7 @@ static void screen_init(int theme)
     color_init(theme); atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §11  app                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §11 app ── */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 static void on_signal(int s)
@@ -967,7 +845,7 @@ int main(void)
         int ch = getch();
         switch (ch) {
         case 'q': case 27: g_running = 0; break;
-        case 'P': paused = !paused; break;   /* capital P = pause to avoid clash */
+        case 'P': paused = !paused; break;   /* capital P so it won't clash with the 'p' picker */
         case 't': theme = (theme+1) % N_THEMES; color_init(theme); break;
         case 'a':
             if (ac.state == TWO) {
@@ -975,7 +853,7 @@ int main(void)
             } else {
                 ctx_init(&ctx, (ctx.mode - 1 + N_BG_TYPES) % N_BG_TYPES,
                          rows, cols);
-                /* entering sunflower: snap seed_idx to nearest seed at current r */
+                /* switching to sunflower: jump to the seed nearest the current radius */
                 if (ctx.mode == 4) {
                     cur.seed_idx = (int)round((cur.r / BG_SEED_SP) *
                                               (cur.r / BG_SEED_SP));

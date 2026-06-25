@@ -1,159 +1,17 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 04_log_spiral.c — logarithmic (equiangular) spiral grid
+ * 04_log_spiral.c — a spiral grid whose coils spread wider the farther out
+ * they go.  This is the shape you see in nautilus shells, galaxy arms, and
+ * sunflower seed heads.  Press 'g' for the "golden spiral" preset that nature
+ * tends to land on; the '@' cursor walks along one arm so you can probe it.
  *
- * DEMO: Spiral arms wind outward with a gap that grows with radius — the
- *       defining property of logarithmic spirals found in nautilus shells,
- *       galaxies, and sunflower seed arrangements.  A 'g' key switches to the
- *       golden spiral preset (a ≈ 0.3065), which matches Fibonacci phyllotaxis.
- *       An '@' cursor sits at one (turn, spoke) cell — arrows step it across
- *       the grid.  +/- adjusts the growth rate; [/] changes arm count.
+ * Sister files: 03_archimedean_spiral.c is the cousin whose coils stay evenly
+ * spaced; 05_sunflower.c shows the dot-pattern version of the same idea.
  *
- * Study alongside: 03_archimedean_spiral.c (constant-pitch spiral),
- *                  05_sunflower.c (phyllotaxis dot pattern),
- *                  ../rect_grids/01_uniform_rect.c (the GridCtx template)
- *
- * Section map:
- *   §1 config   — growth rate, arm count, golden preset, themes, EWMA
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — theme-switchable PAIR_GRID + HUD/HINT/CURSOR
- *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg + angle_char
- *   §5 cursor   — Cursor (turn, spoke) + cursor_reset / cursor_move / cursor_draw
- *   §6 scene    — hud_draw + scene_draw
- *   §7 screen   — ncurses init / cleanup
- *   §8 app      — signals, resize, main loop
- *
- * Keys:  q/ESC quit   p pause   t theme   r reset   g golden-spiral preset
- *        arrows move @   +/- growth rate   [/] arm count
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/polar_grids/04_log_spiral.c \
- *       -o 04_log_spiral -lncurses -lm
+ * References: en.wikipedia.org/wiki/Logarithmic_spiral and
+ * /wiki/Golden_spiral; Prusinkiewicz & Lindenmayer, "The Algorithmic Beauty
+ * of Plants" (1990), ch. 4, on why plants pick this spiral.
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Logarithmic spiral arm detection via the N-arm phase test.
- *
- *                  A logarithmic spiral satisfies r = b × e^(a×θ).
- *                  Rearranging: θ = ln(r/b) / a.  For N arms equally spaced
- *                  by 2π/N, the N-arm phase test is:
- *
- *                    phase = fmod(N × (θ − ln(r/b)/a) + N×2π, 2π)
- *                    on_spiral : phase < W || phase > 2π − W
- *
- *                  Why it works: on arm k, θ = ln(r/b)/a + k×2π/N, so
- *                  N×(θ − ln(r/b)/a) = k×2π.  fmod(k×2π, 2π) = 0. ✓
- *
- * Data-structure : Two structs — GridCtx (terminal extent, growth a, R_MIN
- *                  anchor, n_arms, ox/oy) and Cursor (turn index, spoke index
- *                  within the angular fineness).  ctx_to_screen samples arm 0
- *                  at angle (turn × 2π + (spoke + 0.5) × 2π/CURSOR_SPOKES)
- *                  using the log-spiral law r = R_MIN × e^(a × θ).
- *
- * Math           : The growth parameter a determines how quickly the spiral
- *                  expands.  After one full turn (Δθ = 2π), the radius
- *                  multiplies by e^(a×2π).  For the golden spiral:
- *
- *                    a = 2 × ln(φ) / π  ≈  0.3065  where φ = (1+√5)/2
- *
- *                  This gives a radial ratio of exactly φ² per half-turn —
- *                  the same ratio found in sunflower and pinecone phyllotaxis.
- *
- *                  Key difference from Archimedean (03): Archimedean gaps are
- *                  constant in pixels; log-spiral gaps grow proportionally to
- *                  the current radius (equal in log space).
- *
- * Rendering      : angle_char(theta) gives the tangent direction at each
- *                  point, producing a smooth curved-line appearance.  The
- *                  inner region is excluded (r < R_MIN) to avoid a smear.
- *
- * Performance    : O(rows × cols) per frame.  One log() per cell — slightly
- *                  more expensive than 03 but still imperceptible at terminal
- *                  resolution.
- *
- * References     :
- *   Logarithmic spiral — en.wikipedia.org/wiki/Logarithmic_spiral
- *   Golden spiral — en.wikipedia.org/wiki/Golden_spiral
- *   Phyllotaxis and φ — Prusinkiewicz & Lindenmayer "The Algorithmic Beauty
- *     of Plants" (1990), Chapter 4
- *   Spirals in nature — Livio 2002, "The Golden Ratio", chapter 5
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ──────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- *   A log-spiral winds outward with a gap that grows proportionally with
- *   radius.  At any point it crosses any radial line at the same angle
- *   α = arctan(1/a) — this "equiangular" property is found in nautilus
- *   shells, galaxies, and Fibonacci phyllotaxis.  Same N-arm phase test
- *   as 03, but with θ_predicted = log(r/R_MIN)/growth instead of r/a.
- *   Cursor (turn t, spoke s) names a sample on arm 0 at angle
- *   (t × 2π + (s + 0.5) × 2π/CURSOR_SPOKES).
- *
- * HOW TO THINK ABOUT IT
- *   Archimedean spiral (03): each coil adds PITCH pixels — constant additive gap.
- *   Log-spiral (04): each coil multiplies radius by e^(a×2π) — constant ratio gap.
- *   Zooming out reveals self-similarity: the spiral looks the same at every scale.
- *
- *   Detection: at radius r the spiral passes through angle
- *     θ_predicted = ln(r / R_MIN) / growth
- *   The actual angle's deviation from θ_predicted (×N for N arms) is the phase.
- *
- * DRAWING METHOD
- *   1. dx = (col−ox)×CELL_W,  dy = (row−oy)×CELL_H
- *   2. r = √(dx²+dy²),  θ = atan2(dy,dx)
- *   3. If r < R_MIN: skip
- *   4. θ_norm = fmod(θ + 2π, 2π)
- *   5. θ_predicted = log(r / R_MIN) / growth     ← spiral angle at this r
- *   6. raw = N × (θ_norm − θ_predicted)
- *   7. phase = fmod(raw + N×2π, 2π)
- *   8. on_spiral = phase < SPIRAL_W  ||  phase > 2π − SPIRAL_W
- *   9. Draw angle_char(θ) if on_spiral.
- *
- * KEY FORMULAS
- *   Log-spiral equation: r = b × e^(a × θ),  b = R_MIN
- *     Rearranged: θ = ln(r/b) / a = θ_predicted.
- *
- *   Equiangular property:
- *     dr/dθ = a × r  →  tan(crossing angle) = r / (dr/dθ) = 1/a
- *     α = arctan(1/a).  At a=0.18: α≈80°.  At a=0.3065 (golden): α≈73°.
- *
- *   Golden spiral preset:
- *     a = 2 × ln(φ) / π ≈ 0.3065,  φ = (1+√5)/2 ≈ 1.618
- *     Each half-turn scales radius by φ², matching Fibonacci phyllotaxis ratios.
- *
- *   Cursor → screen (turn t, spoke s):
- *     theta_sample = (t + (s + 0.5) / CURSOR_SPOKES) × 2π
- *     r_sample     = R_MIN × e^(growth × theta_sample)
- *
- *   Comparison with Archimedean (03):
- *     03: θ_predicted = r / a          (linear in r)
- *     04: θ_predicted = ln(r/b) / a    (logarithmic in r)
- *     Same N-arm test; only θ_predicted differs.
- *
- * EDGE CASES TO WATCH
- *   • r < R_MIN: log undefined or negative.  Hard guard (continue).
- *   • growth → 0: θ_predicted → ±∞; spiral wound infinitely tight.
- *     Constrained to [GROWTH_MIN, GROWTH_MAX].
- *   • Same N×2π normalisation needed as 03 to keep phase in [0, 2π).
- *   • Cursor max_turn re-derived in ctx_init from current growth.
- *
- * HOW TO VERIFY
- *   growth=0.18, N=1, R_MIN=4, ox=40, oy=12.
- *
- *   Point on arm 0 at θ=0 after k full turns:
- *     r = R_MIN × e^(0.18 × 2πk)
- *     k=1: r = 4 × e^1.131 ≈ 4 × 3.099 ≈ 12.4 px  →  col=40+round(12.4/2)=46
- *   Check cell (col=46, row=12):
- *     dx=(46−40)×2=12, dy=0  →  r=12, θ=0  →  θ_norm=0
- *     θ_predicted = log(12/4)/0.18 = ln(3)/0.18 = 1.099/0.18 = 6.105
- *     raw = 1×(0 − 6.105) = −6.105  ≈ −2π + 0.178
- *     phase = fmod(−6.105 + 2π, 2π) = fmod(0.178, 2π) = 0.178
- *     0.178 < SPIRAL_W(0.22)  →  on_spiral = true  ✓
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
@@ -170,40 +28,38 @@
 #  define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS      30
 #define CELL_W          2
 #define CELL_H          4
 
-/* Growth rate a: radial multiplier per radian.  r doubles every 2π/a rad.
- * Range [0.05, 0.80].  Golden spiral: a = 2*ln(φ)/π ≈ 0.3065.          */
+/* How fast the spiral fans out: bigger = coils race apart, smaller = tight
+ * wind.  The golden-spiral value below is the one nature favours. */
 #define GROWTH_DEFAULT  0.18
 #define GROWTH_MIN      0.05
 #define GROWTH_MAX      0.80
 #define GROWTH_STEP     0.02
 
-/* Golden ratio constant and the golden-spiral growth rate */
+/* The golden ratio, and the growth rate that makes the golden spiral. */
 #define PHI             1.61803398874989484820
 #define GROWTH_GOLDEN   (2.0 * log(PHI) / M_PI)   /* ≈ 0.3065 */
 
-/* Inner anchor radius b (pixels).  Arm is undefined for r < R_MIN. */
+/* We don't draw the very centre — the coils pile up too tightly to read. */
 #define R_MIN           4.0
 
-/* Angular half-width of the spiral line (radians in N×phase space) */
+/* How thick to draw each arm.  Wider = fatter spiral lines. */
 #define SPIRAL_W        0.22
 
-/* Number of spiral arms */
+/* How many spiral arms to draw. */
 #define N_ARMS_DEFAULT   2
 #define N_ARMS_MIN       1
 #define N_ARMS_MAX       8
 
-/* Cursor angular fineness within one turn (samples per 2π) */
+/* How many stops the cursor can make as it walks around one coil. */
 #define CURSOR_SPOKES    12
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* Smooths the FPS number so it doesn't jitter every frame. */
 #define FPS_EWMA_ALPHA   0.05
 
 #define PAIR_GRID    1
@@ -220,9 +76,7 @@ static const short THEME_FG[][2] = {
 };
 #define N_THEMES 5
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -237,9 +91,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static void color_init(int theme)
 {
@@ -251,34 +103,31 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,  -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx and the log-spiral ↔ screen mapping              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula — where the spiral lives on screen ── */
 
 /*
- * GridCtx — geometry of the log-spiral grid plus cursor bounds.
- *
- * a = growth (used in the spiral law r = R_MIN × e^(a × θ)).
- * max_turn solves R_MIN × e^(a × (t + 0.5) × 2π) ≤ r_visible.
+ * GridCtx — everything we need to know to draw the spiral and to keep the
+ * cursor inside it.  Built once from the terminal size, rebuilt on resize or
+ * when the growth rate changes.
  */
 typedef struct {
-    int rows, cols;
+    int rows, cols;        /* terminal size, in character cells             */
 
-    double a;              /* growth — per-radian radial multiplier (log) */
-    double r_min;          /* inner anchor radius                          */
-    int    n_arms;
-    int    cell_w, cell_h;
+    double a;              /* growth rate: how fast coils fan out           */
+    double r_min;          /* radius of the blank centre we don't draw      */
+    int    n_arms;         /* how many spiral arms                          */
+    int    cell_w, cell_h; /* width/height of one cell, in our pixel units  */
 
-    int    ox, oy;
+    int    ox, oy;         /* screen cell the spiral centre sits on         */
 
-    int    max_turn, max_spoke;
+    int    max_turn;       /* furthest coil the cursor can reach before     */
+                           /*   it would fall off the visible area          */
+    int    max_spoke;      /* last stop around one coil (CURSOR_SPOKES − 1) */
 } GridCtx;
 
-/*
- * ctx_init — derive geometry from terminal size.
- *
- * max_turn ← floor( ln(r_visible / R_MIN) / (a × 2π) − 0.5 )
- */
+/* Recompute the centre and how far out the cursor may roam for the current
+ * terminal size and growth rate.  Call it on startup, on resize, and any time
+ * the growth changes. */
 static void ctx_init(GridCtx *g, int rows, int cols)
 {
     g->rows   = rows;
@@ -304,17 +153,9 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->max_spoke = CURSOR_SPOKES - 1;
 }
 
-/*
- * ctx_to_screen — sample the log-spiral on arm 0 at (turn t, spoke s).
- *
- * THE FORMULA:
- *   theta_sample = (t + (s + 0.5) / CURSOR_SPOKES) × 2π
- *   r_sample     = R_MIN × e^(a × theta_sample)        (the log-spiral law)
- *   cx = r_sample × cos theta_sample
- *   cy = r_sample × sin theta_sample
- *   sc = ox + (int)round(cx / CELL_W)
- *   sr = oy + (int)round(cy / CELL_H)
- */
+/* Given a (turn, spoke) spot on the first arm, find which screen cell it lands
+ * on.  Turn says which coil, spoke says how far around that coil; from those we
+ * get an angle, the spiral law gives the radius, and we round to a cell. */
 static void ctx_to_screen(const GridCtx *g, int turn, int spoke,
                           int *sr, int *sc)
 {
@@ -328,14 +169,8 @@ static void ctx_to_screen(const GridCtx *g, int turn, int spoke,
     *sr = g->oy + (int)round(cy / (double)g->cell_h);
 }
 
-/*
- * angle_char — pick the ASCII line character that best matches orientation theta.
- *
- * THE FORMULA:
- *   a = fmod(theta + 2π, π)  ← fold into [0, π) (orientation, not direction)
- *   a ∈ [0, π/8) or [7π/8, π) → '-';  a ∈ [π/8, 3π/8) → '\'
- *   a ∈ [3π/8, 5π/8) → '|';          a ∈ [5π/8, 7π/8) → '/'
- */
+/* Pick the slash, pipe, or dash that best matches the direction the spiral is
+ * heading at this point, so the curve reads as a smooth line instead of dots. */
 static char angle_char(double theta)
 {
     double a = fmod(theta + 2.0*M_PI, M_PI);
@@ -345,21 +180,10 @@ static char angle_char(double theta)
     return '/';
 }
 
-/*
- * ctx_draw_bg — sweep every cell, apply N-arm log-spiral phase test, draw.
- *
- * THE PIPELINE:
- *   for each cell:
- *     dx = (col−ox)×CELL_W,  dy = (row−oy)×CELL_H
- *     r  = √(dx²+dy²);  if r < R_MIN: skip
- *     θ_norm     = fmod(θ + 2π, 2π)
- *     θ_predicted = log(r / R_MIN) / a         spiral angle at this r
- *     raw        = N × (θ_norm − θ_predicted)  N-arm phase (unbounded)
- *     phase      = fmod(raw + N×2π, 2π)        normalised to [0, 2π)
- *     on_spiral  = phase < SPIRAL_W  ||  phase > 2π − SPIRAL_W
- *
- * Difference from Archimedean (03): θ_predicted uses log(r) not r directly.
- */
+/* Draw the spiral by asking every cell one question: "are you sitting on an
+ * arm?"  For each cell we work out its distance and angle from the centre,
+ * then check how far its angle is from where an arm should be at that distance.
+ * Close enough, and we draw it. */
 static void ctx_draw_bg(const GridCtx *g)
 {
     double two_pi = 2.0 * M_PI;
@@ -375,12 +199,9 @@ static void ctx_draw_bg(const GridCtx *g)
             double theta = atan2(dy, dx);
             double theta_norm = fmod(theta + two_pi, two_pi);
 
-            /*
-             * Log-spiral N-arm phase test:
-             *   θ_predicted = ln(r/b) / a   (b = R_MIN)
-             *   phase = N × (θ − θ_predicted)  mod 2π
-             * On arm k: phase = N×k×2π/N = k×2π ≡ 0.  ✓
-             */
+            /* Where should an arm be, angle-wise, at this distance?  "phase" is
+             * how far this cell's angle strays from that; near zero means it's
+             * right on an arm.  The wrap keeps the answer in a clean range. */
             double theta_pred = log(r_px / g->r_min) / g->a;
             double raw   = (double)g->n_arms * (theta_norm - theta_pred);
             double phase = fmod(raw + (double)g->n_arms * two_pi, two_pi);
@@ -394,13 +215,13 @@ static void ctx_draw_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_GRID));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 cursor ── */
 
 /*
- * Cursor — (turn, spoke) on arm 0.  Same shape as the Archimedean cursor;
- * only ctx_to_screen's radial law differs (exponential, not linear).
+ * Cursor — where the '@' probe sits on the first arm.
+ *   turn  — which coil, counting outward from the centre.
+ *   spoke — how far around that coil, in CURSOR_SPOKES even steps.
+ * The arrow keys nudge these two numbers; ctx_to_screen turns them into a cell.
  */
 typedef struct { int turn, spoke; } Cursor;
 
@@ -434,9 +255,7 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, bool golden,
                      int theme, bool paused, double fps)
@@ -466,9 +285,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, bool golden,
     wnoutrefresh(stdscr); doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(void)
@@ -479,9 +296,7 @@ static void screen_init(void)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 static void on_signal(int s)

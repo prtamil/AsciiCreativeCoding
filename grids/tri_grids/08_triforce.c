@@ -1,142 +1,17 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 08_triforce.c — recursive midpoint (4-way) subdivision
+ * 08_triforce.c — the Triforce split: cut a triangle into four, over and over
  *
- * DEMO: One big equilateral triangle is recursively split into 4 smaller
- *       similar triangles via "midpoint subdivision" (the operation
- *       commonly drawn as the Triforce). Three corner triangles match
- *       the parent's orientation; the fourth — formed by joining the
- *       three edge midpoints — is inverted. Use +/- to change recursion
- *       depth (0..7); leaf count grows as 4^N.
+ * Take one big triangle and split it into four smaller ones by joining the
+ * midpoints of its edges (the shape you've seen as the Triforce). The three
+ * corners point the same way as the parent; the middle one is flipped. Then
+ * do the same to every piece. +/- changes how many times we split, so the
+ * number of small triangles is 4 to the power of the depth.
  *
- * Study alongside: 07_barycentric.c — 6-way split into 30-60-90 children.
- *                  09_sierpinski.c — same 4-way split but the inverted
- *                  centre child is dropped, producing the famous gasket.
- *                  ../README.md — GridCtx primitive (this file builds a
- *                  mesh on demand instead of a per-pixel inverse).
- *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, DEPTH, SIZE_FRAC, EWMA constant
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — depth-keyed palette + HUD / hint
- *   §4 formula  — GridCtx + ctx_init + slope_char + Bresenham line_draw
- *   §5 mesh     — 4-way recursive subdivide
- *                 (no Cursor — depth is the user-controlled parameter,
- *                  arrow keys go unused; +/- adjusts depth instead)
- *   §6 scene    — hud_draw + scene_draw (seed triangle + recursion)
- *   §7 screen   — ncurses init / cleanup
- *   §8 app      — signals, main loop
- *
- * Keys:  +/- depth   [/] size   r reset   t theme   p pause   q/ESC quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids/08_triforce.c \
- *       -o 08_triforce -lncurses -lm
+ * Study alongside: 07_barycentric.c — splits each triangle six ways instead.
+ *                  09_sierpinski.c  — same four-way split, but it throws away
+ *                  the flipped middle piece, leaving the famous gasket.
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Midpoint subdivision (also "1-to-4 split", "Loop
- *                  subdivision base step"). Take triangle (V0, V1, V2),
- *                  compute midpoints Mij = (Vi+Vj)/2, emit four children:
- *                    (V0, M01, M20)  — corner at V0, same orientation
- *                    (M01, V1, M12)  — corner at V1, same orientation
- *                    (M20, M12, V2)  — corner at V2, same orientation
- *                    (M01, M12, M20) — centre, inverted orientation
- *                  All four are similar to the parent (½ scale).
- *
- * Data-structure : GridCtx carries the recursion parameters (depth,
- *                  size_frac) and screen extent. No persistent mesh array
- *                  — the recursion emits each leaf's edges directly into
- *                  the framebuffer. See ../README.md "The two primitives".
- *
- * Formula        : Mij = (Vi + Vj) / 2.
- *                  Four children listed above. Recursion depth controlled
- *                  by +/- keys (0..7).
- *
- * Edge chars     : Same Bresenham + slope_char as 07. Color keyed to depth.
- *
- * Movement       : None — depth is the user-controlled parameter.
- *
- * References     :
- *   Loop subdivision         — https://en.wikipedia.org/wiki/Loop_subdivision_surface
- *   Heckbert 1986, "Filtering by Repeated Integration" (uses 4-way base)
- *   Bresenham line algorithm — https://en.wikipedia.org/wiki/Bresenham%27s_line_algorithm
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Take a triangle. Find the midpoint of each edge — that gives 3 new
- * points. Together with the 3 original vertices you have 6 points, which
- * partition the original into 4 smaller triangles: 3 oriented like the
- * parent (one at each corner) and 1 INVERTED (the centre). All 4 are
- * similar to the parent at half-scale. Recurse on each.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * This is the Triforce subdivision. At every level you see the visual
- * pattern of 3 corner triangles + 1 inverted centre. After several levels
- * the inverted centres at different scales overlap with corner triangles
- * of finer levels, producing a dense self-similar mesh — the "regular
- * triangle subdivision" used as the base step in Loop subdivision and
- * many finite-element refinement schemes.
- *
- * Compared to 07_barycentric (6-way), this 4-way split:
- *   - keeps similarity to the parent (children are scaled copies)
- *   - has 3 "up" + 1 "down" orientation pattern at every step
- *   - grows as 4^N instead of 6^N (slower fan-out, more recursion levels
- *     fit in the screen)
- *
- * DRAWING METHOD  (recursive emit)
- * ──────────────
- *  1. Pick DEPTH and SIZE_FRAC.
- *  2. Build seed triangle.
- *  3. subdivide(t, depth):
- *       if depth == max_depth: draw 3 edges
- *       else:
- *         compute 3 midpoints
- *         build 4 children
- *         recurse on each
- *  4. Bresenham line_draw per leaf edge.
- *
- * KEY FORMULAS
- * ────────────
- *  Edge midpoints:
- *    M01 = (V0 + V1) / 2
- *    M12 = (V1 + V2) / 2
- *    M20 = (V2 + V0) / 2
- *
- *  Four children:
- *    Corner-V0:  (V0, M01, M20)        ← same orientation
- *    Corner-V1:  (M01, V1, M12)        ← same orientation
- *    Corner-V2:  (M20, M12, V2)        ← same orientation
- *    Centre:     (M12, M20, M01)       ← inverted (vertex order reversed)
- *
- *  Leaf count at depth N: 4^N
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • The inverted centre child has its vertices listed in REVERSE order
- *    (M12, M20, M01 instead of M01, M12, M20). Doesn't affect rendering
- *    here (we draw the same 3 edges either way), but matters if a
- *    subsequent step relied on vertex order semantics (e.g. to know which
- *    is the "apex" for an asymmetric triangle).
- *  • Stack depth at N=7 is fine (1024 frames at the deepest leaf path).
- *  • Adjacent leaves share edges; we draw each shared edge twice. The
- *    repaint is harmless.
- *
- * HOW TO VERIFY
- * ─────────────
- *  At depth 0: 1 leaf — original.
- *  At depth 1: 4 leaves — 3 small "up" triangles at corners + 1 "down"
- *    triangle in centre. HUD shows "leaves:4".
- *  At depth 2: 16 leaves — each of the 4 children further split.
- *  Leaf count formula: 4^N.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -153,9 +28,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 
@@ -174,16 +47,15 @@
 #define MAX_DEPTH_LEVELS (DEPTH_MAX + 1)
 #define N_THEMES         3
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How much the on-screen fps number leans toward the latest frame. Small
+ * value = smooth, slow-moving readout instead of a jittery one. */
 #define FPS_EWMA_ALPHA 0.05
 
 #define PAIR_DEPTH_BASE  1
 #define PAIR_HUD        (PAIR_DEPTH_BASE + MAX_DEPTH_LEVELS)
 #define PAIR_HINT       (PAIR_HUD + 1)
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -200,10 +72,11 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
+/* One color per recursion level, so deeper triangles read in a different
+ * shade than their parent. PAL256 for rich terminals, PAL8 for the basic
+ * eight-color fallback. */
 static const short PAL256[N_THEMES][MAX_DEPTH_LEVELS] = {
     /* sunset */ { 15, 226, 196, 207,  21,  39, 82,  15 },
     /* forest */ { 15,  82,  39,  21, 207, 196, 226, 82 },
@@ -230,20 +103,22 @@ static void color_init(int theme)
     init_pair(PAIR_HINT, COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx + slope_char + Bresenham line                     */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula — screen layout + line drawing ── */
 
 /*
- * GridCtx — geometry + recursion parameters for the substitution mesh.
- * See 07_barycentric.c for the canonical version of this struct.
+ * GridCtx — everything we need to place and draw the pattern on screen:
+ * how big the terminal is, how to map our coordinates onto cells, where the
+ * centre of the drawing sits, and the two knobs the user controls (how many
+ * times to split, and how much of the screen to fill).
+ * 07_barycentric.c has the original version of this struct.
  */
 typedef struct {
-    int    rows, cols;
-    int    cw, ch;
-    int    ox, oy;
-    int    depth;
-    double size_frac;
+    int    rows, cols;     /* terminal size, in character cells            */
+    int    cw, ch;         /* sub-cells per character (we draw finer than 1
+                            * char wide); always CELL_W / CELL_H           */
+    int    ox, oy;         /* centre of the drawing, in sub-cell units     */
+    int    depth;          /* how many times to split, 0..DEPTH_MAX        */
+    double size_frac;      /* fraction of the screen the triangle fills    */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols, int depth, double size_frac)
@@ -256,6 +131,7 @@ static void ctx_init(GridCtx *g, int rows, int cols, int depth, double size_frac
     g->size_frac = size_frac;
 }
 
+/* Picks the ASCII character that best matches a line's tilt: -, |, / or \. */
 static char slope_char(double dx, double dy)
 {
     double ax = fabs(dx) * (1.0 / CELL_W);
@@ -266,6 +142,10 @@ static char slope_char(double dx, double dy)
     return ((dx >= 0) == (dy >= 0)) ? '\\' : '/';
 }
 
+/* Draws a straight line between two points, one cell at a time. Uses
+ * Bresenham's classic line algorithm — it walks the line with integer steps
+ * only, so it stays fast and never skips a cell. We clip to the screen and
+ * leave the bottom row free for the hint bar. */
 static void line_draw(const GridCtx *g, double px0, double py0,
                       double px1, double py1, int attr)
 {
@@ -287,14 +167,9 @@ static void line_draw(const GridCtx *g, double px0, double py0,
     attroff(attr);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  mesh — 4-way recursive subdivide                                    */
-/* ═══════════════════════════════════════════════════════════════════════ */
-/*
- * No Cursor struct: as in 07_barycentric, the user navigates by changing
- * DEPTH and SIZE_FRAC, not by stepping through individual leaves.
- */
+/* ── §5 mesh — the four-way split ── */
 
+/* A triangle: just its three corner points (x[0..2], y[0..2]). */
 typedef struct { double x[3], y[3]; } Tri;
 
 static void tri_draw_edges(const GridCtx *g, Tri t, int depth)
@@ -306,6 +181,8 @@ static void tri_draw_edges(const GridCtx *g, Tri t, int depth)
     line_draw(g, t.x[2], t.y[2], t.x[0], t.y[0], attr);
 }
 
+/* The heart of it: split this triangle into four, then split each of those,
+ * until we've gone as deep as the user asked, where we finally draw. */
 static void subdivide(const GridCtx *g, Tri t, int depth, int max_depth)
 {
     if (depth == max_depth) { tri_draw_edges(g, t, depth); return; }
@@ -313,11 +190,13 @@ static void subdivide(const GridCtx *g, Tri t, int depth, int max_depth)
     double m12x = (t.x[1] + t.x[2]) * 0.5, m12y = (t.y[1] + t.y[2]) * 0.5;
     double m20x = (t.x[2] + t.x[0]) * 0.5, m20y = (t.y[2] + t.y[0]) * 0.5;
 
-    /* Three corner children — same orientation */
+    /* Three small triangles, one tucked into each corner, pointing the
+     * same way the parent did. */
     Tri c0 = { {t.x[0], m01x, m20x}, {t.y[0], m01y, m20y} };
     Tri c1 = { {m01x, t.x[1], m12x}, {m01y, t.y[1], m12y} };
     Tri c2 = { {m20x, m12x, t.x[2]}, {m20y, m12y, t.y[2]} };
-    /* Centre — inverted */
+    /* The middle triangle, made from the three midpoints — it points the
+     * opposite way (the upside-down piece of the Triforce). */
     Tri cc = { {m12x, m20x, m01x}, {m12y, m20y, m01y} };
 
     subdivide(g, c0, depth + 1, max_depth);
@@ -326,6 +205,8 @@ static void subdivide(const GridCtx *g, Tri t, int depth, int max_depth)
     subdivide(g, cc, depth + 1, max_depth);
 }
 
+/* Builds the one big triangle we start from: an upward equilateral triangle
+ * centred on screen, sized by size_frac. */
 static Tri scene_seed(const GridCtx *g)
 {
     double pw = (double)g->cols * CELL_W;
@@ -341,15 +222,15 @@ static Tri scene_seed(const GridCtx *g)
     return t;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
+/* The handful of settings the user can change at runtime — the live state of
+ * what's on screen. */
 typedef struct {
-    int    depth;
-    double size_frac;
-    int    theme;
-    int    paused;
+    int    depth;      /* how many times to split, 0..DEPTH_MAX  */
+    double size_frac;  /* fraction of the screen the triangle fills */
+    int    theme;      /* which color palette is active          */
+    int    paused;     /* 1 = frozen (drawing still refreshes)   */
 } Scene;
 
 static void scene_reset(Scene *s)
@@ -388,9 +269,7 @@ static void scene_draw(const GridCtx *g, const Scene *s, double fps)
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -405,9 +284,7 @@ static void screen_init(int theme)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;
@@ -435,6 +312,8 @@ int main(void)
     int64_t t0  = clock_ns();
 
     while (g_running) {
+        /* Terminal was resized: tear ncurses down and bring it back so it
+         * picks up the new width and height. */
         if (g_need_resize) {
             g_need_resize = 0;
             endwin(); refresh();

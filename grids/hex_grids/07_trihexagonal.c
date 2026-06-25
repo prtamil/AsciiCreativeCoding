@@ -1,173 +1,14 @@
 /*
- * 07_trihexagonal.c — trihexagonal tiling: hex grid + triangular grid overlaid
+ * 07_trihexagonal.c — a hex grid and a triangle grid drawn on top of each other.
  *
- * DEMO: Two grids drawn simultaneously — the flat-top hexagonal grid (cyan)
- *       and the equilateral triangular grid whose vertices coincide with the
- *       hex vertices (green). Together they approximate the trihexagonal
- *       Archimedean tiling (vertex config 3.6.3.6). Toggle each grid with h/t.
- *       An '@' cursor moves between hex cells with arrow keys; the cursor hex
- *       is highlighted across both visible layers.
+ * Lay a flat-top hexagon grid (cyan) and a triangle grid (green) so their
+ * corners land on the same spots. Together they make the trihexagonal tiling,
+ * the star-of-David / snowflake pattern. Toggle each grid with h/t and steer an
+ * '@' cursor through the hexes with the arrow keys.
  *
- * Study alongside: ../README.md (the GridCtx + Cursor abstraction),
- *                  hex_grids/01_flat_top.c (hex algorithm)
- *                  hex_grids/05_triangular.c (triangle algorithm)
- *
- * Section map:
- *   §1 config   — CELL_W/CELL_H, hex_size + border_w bounds,
- *                 FPS_EWMA_ALPHA, color pair IDs
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — hex / tri / cursor / HUD / HINT pairs
- *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg
- *                 (calls hex_layer + tri_layer per visibility flags)
- *   §5 cursor   — Cursor (q, r) + cursor_reset / cursor_move / cursor_draw
- *                 + HEX_DIR axial direction table
- *   §6 scene    — hud_draw + scene_draw
- *   §7 screen   — ncurses init / cleanup
- *   §8 app      — signals, resize, main loop
- *
- * Keys:  q/ESC quit  p pause  h:hex  t:tri  r reset  arrows move  +/-:size  [/]:border
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/hex_grids/07_trihexagonal.c \
- *       -o 07_trihexagonal -lncurses -lm
+ * Sister files: hex_grids/01_flat_top.c (the hex drawing), 05_triangular.c
+ * (the triangle drawing). Trihexagonal tiling: en.wikipedia.org/wiki/Trihexagonal_tiling
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : The trihexagonal tiling is Archimedean tiling #3.6.3.6:
- *                  at every vertex, the faces alternate triangle-hex-triangle-hex.
- *                  It can be constructed by superimposing:
- *                    (A) a flat-top hex grid of side s
- *                    (B) a triangular grid whose vertices coincide with the
- *                        hex vertices (triangle side = s, scaled by √3)
- *                  The combination creates the star-of-David / snowflake
- *                  pattern characteristic of the trihexagonal tiling.
- *
- * Data-structure : Two structs — GridCtx (hex_size, border_w, layer toggles,
- *                  cursor bounds in axial space) and Cursor (just (q, r)).
- *                  No grid array; ctx_draw_bg() runs two independent
- *                  rasterizers — hex_layer() and tri_layer() — each
- *                  classifying every screen cell. The toggles show_hex /
- *                  show_tri gate which passes run. See ../README.md "The
- *                  two primitives" for why the GridCtx + Cursor split is
- *                  reused across rect / hex / tri / polar.
- *
- *                  Hex layer: flat-top cube coordinates (01_flat_top algorithm).
- *                  Tri layer: three-family stripe classifier (05_triangular),
- *                             but with tri_size scaled so triangle vertices
- *                             align with hex vertices.
- *
- * Rendering      : Hex borders drawn in PAIR_HEX (cyan). Triangle borders
- *                  drawn in PAIR_TRI (green). Cursor hex drawn in PAIR_CURSOR
- *                  (white-on-blue). Where they share a border cell (at hex-edge
- *                  midpoints), the triangle color wins (drawn last). Toggle
- *                  visibility with 'h' and 't' keys to see each grid
- *                  independently, then combine to observe the interaction.
- *
- * Performance    : Two O(rows×cols) passes per frame. Total ~2× 01_flat_top.
- *                  Still well within 60 fps budget on any modern terminal.
- *
- * References     :
- *   Trihexagonal tiling (Wikipedia)
- *     https://en.wikipedia.org/wiki/Trihexagonal_tiling
- *   Archimedean tilings enumeration
- *     https://en.wikipedia.org/wiki/Archimedean_tiling
- *   Hex–triangle duality
- *     https://www.redblobgames.com/grids/hexagons/#map-storage
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * The trihexagonal tiling is the result of overlaying the hexagonal and
- * triangular tilings so their vertices coincide. At every vertex in the
- * combined tiling, exactly 2 triangles and 2 hexagons meet in alternating
- * order (triangle-hex-triangle-hex) — the vertex configuration 3.6.3.6.
- *
- * This file implements the tiling as TWO INDEPENDENT RASTERIZERS that both
- * scan every screen pixel. The hex rasterizer runs first (PAIR_HEX, cyan),
- * then the triangle rasterizer overwrites some pixels (PAIR_TRI, green).
- * The cursor hex is highlighted during the hex pass (PAIR_CURSOR), then the
- * '@' is drawn last on top of everything.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * The hex and triangular grids are DUALS of each other in a specific sense:
- *   - Each hexagon center is surrounded by 6 triangle vertices
- *   - Each triangle vertex is shared by 6 triangles AND 6 hexagons (in full)
- *   - The "dual" (Voronoi/Delaunay) relationship: if you place a point at
- *     every hex center and connect adjacent ones, you get a triangular lattice.
- *     Vice versa: connecting triangle centers gives a hex lattice.
- *
- * When both grids are drawn together at the SAME SIZE (tri_size = hex_size),
- * their vertices coincide. The shared vertices are where the edges of both
- * grids meet, creating the star-of-David "snowflake" pattern.
- *
- * Use the 'h' and 't' keys to toggle layers:
- *   h only: pure flat-top hex grid   (see 01_flat_top)
- *   t only: pure triangular grid     (see 05_triangular, but same hex size)
- *   both:   the combined trihexagonal tiling
- *
- * DRAWING METHOD  (two-pass rendering)
- * ─────────────────────────────────────
- *  PASS 1 — hex_layer (if show_hex):
- *   Same pipeline as 01_flat_top ctx_draw_bg.
- *   Cursor hex border drawn in PAIR_CURSOR.
- *   Non-cursor borders drawn in PAIR_HEX (cyan).
- *
- *  PASS 2 — tri_layer (if show_tri):
- *   Same pipeline as 05_triangular ctx_draw_bg, but centered with ox/oy.
- *   tri_size = hex_size so triangle vertices align with hex vertices.
- *   Drawn AFTER hex_layer → triangle edges overwrite hex edges at crossings.
- *   Drawn without cursor awareness (cursor is hex-cell-based, not tri-based).
- *
- *  PASS 3 — cursor_draw:
- *   Draw '@' at the flat-top forward matrix position of (cur.q, cur.r).
- *   Always drawn last so '@' is on top of both grid layers.
- *
- * KEY FORMULAS
- * ────────────
- *  WHY tri_size = hex_size for vertex alignment:
- *    A flat-top hex of side s has vertices at angles 0°,60°,...,300°,
- *    each at distance s from the center.
- *    An equilateral triangle of side s has edge length s.
- *    The triangular grid's stripe period h = s × √3/2 = the hex apothem.
- *    When both grids are drawn with the same s, their vertices coincide
- *    because the triangle vertices lie exactly on the hex vertex lattice.
- *
- *  Draw-order conflict at shared edge midpoints:
- *    Hex edges and triangle edges both pass through the midpoints of
- *    hex sides. These pixels are drawn by BOTH passes. The tri_layer
- *    (drawn second) wins → these midpoints show green not cyan.
- *    This is intentional — the combined pattern shows the triangle edges
- *    "cutting through" the hex edges.
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • The cursor uses hex coordinates (q, r). If show_hex is OFF, the cursor
- *    still moves through hex space (invisible hex lattice). The '@' is
- *    always drawn; only hex borders are gated by show_hex.
- *
- *  • When both layers are off (h=OFF, t=OFF), only '@' is visible at the
- *    cursor hex center — the grid is blank.
- *
- *  • Triangular stripe alignment: the tri_layer uses px/py centered the same
- *    way as hex_layer (both subtract ox/oy). This keeps both grids centered on
- *    the same origin hex, ensuring vertex coincidence at origin.
- *
- * HOW TO VERIFY  (HEX_SIZE=14, 80×24 terminal)
- * ─────────────
- *  Origin hex (q=0, r=0): hex center at (ox=40, oy=11). '@' at (11,40). ✓
- *
- *  A hex vertex at math 0° from center is at pixel (14, 0):
- *    col = 40 + 14/2 = 47.  That column should show a triangle-grid line.
- *    Triangular n2 = (√3×14 + 0) / (14×√3/2) = (14√3)/(7√3) = 2.0 → integer!
- *    edge_frac(2.0) = 0 → on a triangle border. ✓ The hex vertex and the
- *    triangle grid line coincide at column 47. Vertex alignment confirmed.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -184,41 +25,40 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
-/* Sub-pixel resolution per terminal cell — math runs in pixel units. */
+/* Each terminal cell is split into this many tiny units so the math has room
+   to work; we draw in those units, not whole characters. */
 #define CELL_W              2
 #define CELL_H              4
 
-/* Hex side length in pixels; triangle side = hex_size (they share vertices) */
+/* How long a hex side is, in those tiny units. The triangles use the same
+   length so the two grids share corners. */
 #define HEX_SIZE_DEFAULT   14.0
 #define HEX_SIZE_MIN        6.0
 #define HEX_SIZE_MAX       40.0
 #define HEX_SIZE_STEP       2.0
 
-/* Border width for both layers */
+/* How thick the grid lines look, for both grids. */
 #define BORDER_W_DEFAULT    0.10
 #define BORDER_W_MIN        0.03
 #define BORDER_W_MAX        0.35
 #define BORDER_W_STEP       0.02
 
-#define TICK_NS            16666667LL    /* ~60 Hz frame budget */
+#define TICK_NS            16666667LL    /* one frame at ~60 frames per second */
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How much each new frame nudges the on-screen fps number; small means the
+   readout glides instead of jumping around. */
 #define FPS_EWMA_ALPHA      0.05
 
-/* Color pair IDs */
-#define PAIR_HEX     1   /* cyan  — hex grid borders */
-#define PAIR_TRI     2   /* green — triangle grid borders */
-#define PAIR_CURSOR  3   /* cursor hex border + '@' character */
+/* Color slots */
+#define PAIR_HEX     1   /* cyan  — hex grid lines */
+#define PAIR_TRI     2   /* green — triangle grid lines */
+#define PAIR_CURSOR  3   /* the cursor hex and the '@' */
 #define PAIR_HUD     4
 #define PAIR_HINT    5
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -235,9 +75,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&ts, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static void color_init(void)
 {
@@ -250,46 +88,40 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx and the dual-layer (hex + tri) classifier         */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula — the hex grid and the triangle grid ── */
 
 /*
- * GridCtx — geometry of the trihexagonal tiling plus cursor bounds.
+ * GridCtx — everything the drawing code needs: the size and placement of the
+ * tiling, and how far the cursor is allowed to wander.
  *
- * Cursor is axial (q, r) — the same coordinate system as 01_flat_top, so
- * max_q / max_r play the same role as max_r / max_c do in rect's GridCtx.
- *
- * The two visibility toggles (show_hex, show_tri) and border_w live in
- * GridCtx because ctx_draw_bg() reads them directly when deciding which
- * passes to run. Same shape as 06_rhombille's spoke knobs.
+ * The cursor lives in hex coordinates (q, r), the same scheme as 01_flat_top:
+ * q steps roughly east, r steps roughly south-east. The two on/off toggles and
+ * the line thickness sit here because the background painter reads them to
+ * decide what to draw.
  */
 typedef struct {
-    /* terminal extent (in cells) */
+    /* size of the terminal, in characters */
     int rows, cols;
 
-    /* hex side length in pixels + sub-pixel cell size */
+    /* hex side length, plus how many tiny units make up one character cell */
     double hex_size;
     int    cell_w, cell_h;
 
-    /* centring origin in cell coordinates */
+    /* the character cell the tiling is centred on */
     int ox, oy;
 
-    /* cursor bounds in axial space (loose — cursor can roam freely) */
+    /* how far the cursor may roam, in hex steps each way from centre (generous —
+       it's just a leash, not a tight box) */
     int max_q, max_r;
 
-    /* render knobs */
-    double border_w;       /* border threshold for BOTH layers */
-    bool   show_hex;
-    bool   show_tri;
+    /* look-and-feel knobs */
+    double border_w;       /* line thickness, shared by both grids */
+    bool   show_hex;       /* is the hex grid switched on? */
+    bool   show_tri;       /* is the triangle grid switched on? */
 } GridCtx;
 
-/*
- * ctx_init — derive geometry from terminal size + hex_size.
- *
- * The grid is centered on screen: ox = cols/2, oy = (rows-1)/2.
- * Axial bounds are loose — cursor can roam over any hex visible on screen.
- */
+/* Work out the placement and cursor leash from the terminal size and hex size.
+   Re-run this on startup and after every resize. */
 static void ctx_init(GridCtx *g, int rows, int cols,
                      double hex_size, double border_w,
                      bool show_hex, bool show_tri)
@@ -303,24 +135,14 @@ static void ctx_init(GridCtx *g, int rows, int cols,
     g->show_hex = show_hex;
     g->show_tri = show_tri;
 
-    /* Loose axial bounds — cover screen extent in both axes. */
+    /* Let the cursor reach any hex that fits on screen, plus a little slack. */
     g->max_q = (int)((cols * CELL_W) / (1.5 * hex_size)) + 2;
     g->max_r = (int)((rows * CELL_H) / (sqrt(3.0) * hex_size)) + 2;
 }
 
-/*
- * ctx_to_screen — center cell of flat-top hex (q, r) in screen coordinates.
- *
- * THE FORMULA (flat-top forward matrix, same as 01_flat_top):
- *   cx_pix = size × 3/2 × q
- *   cy_pix = size × (√3/2 × q  +  √3 × r)
- *   sc = ox + (int)(cx_pix / CELL_W)
- *   sr = oy + (int)(cy_pix / CELL_H)
- *
- * Reading it: q increases east (1.5·s per step), r increases south-east
- * (√3·s per step plus a √3/2·s contribution from q). Integer truncation
- * keeps '@' inside the hex interior rather than on a border character.
- */
+/* Find the character cell at the centre of hex (q, r). Stepping q moves you
+   east, stepping r moves you south-east; the same hex-to-screen math as
+   01_flat_top. Rounding down lands the '@' inside the hex, not on a wall. */
 static void ctx_to_screen(const GridCtx *g, int q, int r, int *sr, int *sc)
 {
     double sq3   = sqrt(3.0);
@@ -331,9 +153,9 @@ static void ctx_to_screen(const GridCtx *g, int q, int r, int *sr, int *sc)
     *sr = g->oy + (int)(cy_pix / g->cell_h);
 }
 
-/*
- * angle_char — same as 01_flat_top. See that file for documentation.
- */
+/* Pick the dash/slash/pipe character that best matches the slope of a line at
+   this angle, so the wall looks like it points the right way. (Same trick as
+   01_flat_top, explained there.) */
 static char angle_char(double theta)
 {
     double t = fmod(theta, M_PI);
@@ -345,10 +167,8 @@ static char angle_char(double theta)
     else                              return '-';
 }
 
-/*
- * edge_frac — same as 05_triangular. See that file for documentation.
- *   0 = on a grid line, 0.5 = farthest from any line.
- */
+/* How close a point is to the nearest triangle grid line: 0 means right on a
+   line, 0.5 means as far from any line as you can get. (Same as 05_triangular.) */
 static double edge_frac(double v)
 {
     double t = fmod(v, 1.0);
@@ -357,17 +177,13 @@ static double edge_frac(double v)
 }
 
 /*
- * hex_layer — draw flat-top hex grid borders (PASS 1 of ctx_draw_bg).
+ * Draw the cyan hexagon walls — the first of the two grids. For each character
+ * cell we ask "which hex are you in, and are you near its edge?" and draw a wall
+ * piece if so. The hex the cursor sits in is drawn in the cursor color instead.
+ * (The hex-finding math is the same as 01_flat_top.)
  *
- * THE FORMULA (per screen cell):
- *   Identical to 01_flat_top ctx_draw_bg.
- *   Cursor hex (cur_q, cur_r) drawn in PAIR_CURSOR instead of PAIR_HEX.
- *
- * DRAW ORDER NOTE:
- *   hex_layer is drawn FIRST. tri_layer (drawn after) will overwrite some
- *   hex border cells where the two grids share edge-midpoint pixels.
- *   The cursor hex borders drawn in PAIR_CURSOR survive only in regions
- *   not overwritten by the triangle grid.
+ * This runs before the triangle grid, so wherever the two grids cross, the
+ * triangle lines painted next will cover these cells.
  */
 static void hex_layer(const GridCtx *g, int cur_q, int cur_r)
 {
@@ -418,25 +234,18 @@ static void hex_layer(const GridCtx *g, int cur_q, int cur_r)
 }
 
 /*
- * tri_layer — draw the triangular grid borders in PAIR_TRI (PASS 2).
+ * Draw the green triangle grid — the second of the two grids. The triangle grid
+ * is just three sets of parallel lines crossing at 60 degrees: one flat, one
+ * tilted one way, one tilted the other. For each cell we measure how close it is
+ * to the nearest line in each set, and if it's close enough to any of them we
+ * draw a wall sloped to match that set. Using the same size as the hexes makes
+ * the corners line up.
  *
- * THE FORMULA (per screen cell):
- *   Same three-family stripe classifier as 05_triangular ctx_draw_bg.
- *   tri_size = hex_size so triangle vertices coincide with hex vertices.
- *
- *   h = hex_size × √3/2
- *   n1 = py / h              → family 1: horizontal lines at py = k·h
- *   n2 = (√3·px + py) / h   → family 2: −60° lines
- *   n3 = (−√3·px + py) / h  → family 3: +60° lines
- *   dmin = min(edge_frac(n1), edge_frac(n2), edge_frac(n3))
- *   if dmin < border_w: draw '-', '/', or '\' in PAIR_TRI
- *
- * DRAWN AFTER hex_layer — triangle edges overwrite hex edges at crossings,
- * making the triangle edges appear "dominant" at shared boundary points.
+ * Painted after the hexes, so at crossings the green triangle lines sit on top.
  */
 static void tri_layer(const GridCtx *g)
 {
-    /* Triangle side = hex_size; stripe period h = hex_size × √3/2 */
+    /* spacing between neighbouring triangle lines */
     double h   = g->hex_size * sqrt(3.0) * 0.5;
     double sq3 = sqrt(3.0);
 
@@ -467,50 +276,28 @@ static void tri_layer(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_TRI) | A_BOLD);
 }
 
-/*
- * ctx_draw_bg — paint the trihexagonal tiling background.
- *
- * Runs hex_layer() then tri_layer() per the visibility flags carried in
- * GridCtx. The cursor hex (cur_q, cur_r) is highlighted only inside
- * hex_layer; tri_layer doesn't know about the cursor (the triangles are a
- * visual overlay, not a navigable lattice).
- *
- * Per the project's grid-folder convention, ctx_draw_bg is the single
- * background-painting entry point — its body just dispatches to the
- * per-pass helpers above.
- */
+/* Paint the whole background: hexes first, then triangles, each only if it's
+   switched on. Only the hex pass cares about the cursor — the triangles are
+   just decoration you can't walk on. */
 static void ctx_draw_bg(const GridCtx *g, int cur_q, int cur_r)
 {
     if (g->show_hex) hex_layer(g, cur_q, cur_r);
     if (g->show_tri) tri_layer(g);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 cursor ── */
 
 /*
- * Cursor — just (q, r) in axial flat-top hex coordinates.
- *
- * The cursor navigates the hex grid (not the triangle grid — the triangles
- * are just a visual overlay). Bounds live in GridCtx (max_q, max_r).
+ * Cursor — which hex the '@' is sitting in, held as a (q, r) hex address.
+ * It only travels the hex grid; the triangles are scenery. How far it can go
+ * is stored over in GridCtx (max_q, max_r).
  */
 typedef struct { int q, r; } Cursor;
 
 /*
- * HEX_DIR — 4-direction movement in axial (q, r) space.
- *
- * Same direction table as 01_flat_top:
- *
- *                 UP: (q=0, r=-1)
- *                       ↑
- *   LEFT: (q=-1, r=0) ← ● → RIGHT: (q=+1, r=0)
- *                       ↓
- *                DOWN: (q=0, r=+1)
- *
- * Effect: the cursor hex is highlighted in PAIR_CURSOR on the hex layer.
- * The triangle layer overwrites most border cells of the cursor hex, but
- * the cursor '@' and some hex border pixels remain visible in blue.
+ * HEX_DIR — what one arrow-key press adds to (q, r), one row per direction:
+ * up, down, left, right. Up/down nudge r; left/right nudge q. (Same table as
+ * 01_flat_top.)
  */
 static const int HEX_DIR[4][2] = {
     { 0, -1 },   /* UP    */
@@ -526,11 +313,7 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->r = 0;
 }
 
-/*
- * cursor_move — apply (dq, dr) and clamp to GridCtx bounds.
- *
- * Arrow-key dispatch reads HEX_DIR[k] and forwards (dq, dr) here.
- */
+/* Move the cursor by one step, but don't let it stray past its leash. */
 static void cursor_move(Cursor *cur, const GridCtx *g, int dq, int dr)
 {
     int nq = cur->q + dq;
@@ -539,14 +322,9 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dq, int dr)
     if (nr >= -g->max_r && nr <= g->max_r) cur->r = nr;
 }
 
-/*
- * cursor_draw — place '@' at the centre cell of hex (q, r).
- *
- * Called after BOTH layers so '@' is always on top and fully visible,
- * regardless of which layers are toggled. The hex center pixel is interior
- * to both grids, so both hex_layer and tri_layer skip it (they only draw
- * borders) — '@' lands on an empty cell.
- */
+/* Stamp the '@' at the centre of the cursor's hex. Drawn last so it's always on
+   top; since both grids only draw walls, the hex centre is empty and the '@'
+   shows cleanly no matter which grids are on. */
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc;
@@ -558,11 +336,9 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
-/* Bright bold yellow status (top-right) + bold cyan key hints (bottom). */
+/* The status readout (top-right) and the key hints (bottom). */
 static void hud_draw(const GridCtx *g, const Cursor *cur,
                      int paused, double fps)
 {
@@ -594,9 +370,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur,
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -610,9 +384,7 @@ static void screen_init(void)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;

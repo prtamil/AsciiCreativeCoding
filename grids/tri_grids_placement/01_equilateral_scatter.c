@@ -1,123 +1,17 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 01_equilateral_scatter.c — random scatter colored by distance to cursor
+ * 01_equilateral_scatter.c
  *
- * DEMO: A random scatter of N triangles fills a square region around the
- *       cursor. Each triangle is colored on a 6-stop gradient by its
- *       cell-distance from the cursor — closer = warm, farther = cool.
- *       Press SPACE to reseed; +/- to change density (N).
+ * Sprinkle a handful of random triangles around the cursor, then colour
+ * each one by how far it sits from the cursor: close ones run warm, far
+ * ones run cool. Move the cursor and the same dots just re-colour;
+ * SPACE re-sprinkles a fresh batch.
  *
- * Study alongside: 01_equilateral_direct.c (manual placement),
- *                  01_equilateral_patterns.c (preset stamps),
- *                  01_equilateral_path.c (line-of-sight path).
- *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, MAX_OBJ, RADIUS, DENSITY
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — gradient palette (6 distance buckets)
- *   §4 gridctx  — GridCtx + pixel/centroid/edge formula
- *   §5 pool     — Pool: store (col, row, up) entries
- *   §6 cursor   — Cursor + TRI_DIR + reset / move / draw
- *   §7 scatter  — random spawn + Manhattan distance bucketing
- *   §8 scene    — hud_draw + scene_draw
- *   §9 screen   — ncurses init / cleanup
- *  §10 app      — signals, main loop
- *
- * Keys:  arrows:move  spc:reseed  +/-:density   r:reset
- *        t:theme  q/ESC:quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/01_equilateral_scatter.c \
- *       -o 01_equilateral_scatter -lncurses -lm
+ * Sister demos worth reading next: 01_equilateral_direct.c (place by hand),
+ * 01_equilateral_patterns.c (preset stamps), 01_equilateral_path.c (paths).
+ * Random numbers use the classic linear-congruential recipe (Numerical
+ * Recipes ch. 7).
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Random scatter. Pick N random (Δcol, Δrow, up) within
- *                  ±RADIUS of the cursor; color by Manhattan-style cell
- *                  distance from cursor, bucketed into 6 gradient slots.
- *
- * Distance metric: |Δcol| + |Δrow| + (Δup ? 1 : 0). Cheap and roughly
- *                  matches actual edge-walk distance on the equilateral
- *                  lattice for short distances.
- *
- * Re-seeding     : SPACE re-randomises with a new seed (xor'd by clock).
- *                  Moving the cursor does NOT re-seed — but recolours
- *                  the existing scatter as the cursor moves.
- *
- * References     :
- *   Linear congruential generator — Numerical Recipes ch. 7
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Two halves: STORAGE (random scatter, generated once per reseed) and
- * COLOURING (a pure function of cursor distance, recomputed every
- * frame). Moving the cursor never re-seeds; it only re-paints the
- * existing scatter through a different distance lens.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine sprinkling salt on a triangular tablecloth — the grains land
- * randomly inside a small square region. Now point a coloured spotlight
- * (the cursor) at the cloth; grains close to the beam glow warm,
- * grains farther away cool. Move the spotlight: same grains, different
- * colours. SPACE re-sprinkles.
- *
- * DRAWING METHOD  (per frame)
- * ──────────────
- *  1. erase()
- *  2. ctx_draw_bg — equilateral edge characters.
- *  3. For each scatter object:
- *       d = |obj.col - cur.col| + |obj.row - cur.row|
- *           + (obj.up != cur.up ? 1 : 0)
- *       bucket = min(d, N_BUCKETS - 1)
- *       attron(COLOR_PAIR(PAIR_BUCKET_0 + bucket))
- *       mvaddch(centroid_screen, '*')
- *  4. cursor_draw — '@' on top.
- *
- *  Reseed (only on SPACE or +/- density):
- *    pool->count = 0
- *    g_seed ^= clock_ns()
- *    for i in 0..density:
- *      dC = frand·(2·R+1) - R   ; dR = same
- *      up = (frand > 0.5) ? △ : ▽
- *      pool_place(cur.col+dC, cur.row+dR, up)   // dedup
- *
- * KEY FORMULAS
- * ────────────
- *  Manhattan-style cell distance (cheap, monotonic-ish on the
- *  equilateral lattice for short ranges):
- *    d = |Δcol| + |Δrow| + (Δup ? 1 : 0)
- *
- *  LCG step (Numerical Recipes ch. 7):
- *    g_seed = g_seed · 1103515245 + 12345    (mod 2³²)
- *    frand  = ((g_seed >> 16) & 0x7FFF) / 32767.0
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Manhattan vs true edge distance: on the equilateral lattice the
- *    true minimum-edges distance is more complex (depends on parity).
- *    Manhattan is a useful proxy for SMALL distances; for large ones
- *    the gradient may "bend" visually. Acceptable for a colouring
- *    demo, not for pathfinding.
- *  • Density cap: density values approaching MAX_OBJ saturate the pool;
- *    pool_place deduplicates, so "tries" may not reach the requested
- *    count. The visible scatter may look thinner than density would
- *    suggest at high values.
- *  • Reseed on cursor move: NOT reseed-triggering by design. Move
- *    cursor to "rotate the spotlight" without disturbing the scatter.
- *
- * HOW TO VERIFY
- * ─────────────
- *  Place cursor in the middle of a freshly-seeded scatter — colours
- *  are warmest near '@', cooling outward. Walk the cursor to the edge:
- *  the same dots stay, but the warm/cool boundary follows the cursor.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -134,9 +28,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 #define CELL_W 2
@@ -172,9 +64,7 @@
 #define PAIR_HUD    9
 #define PAIR_HINT   10
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -191,9 +81,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static const short THEME_GRAD[N_THEMES][N_BUCKETS] = {
     /* 256-color: hot → cold */
@@ -221,20 +109,23 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx                                                             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx ── */
 
+/* Everything the demo needs to know to turn triangle coordinates into
+ * characters on screen, plus the few knobs the user can tweak live. One
+ * of these lives for the whole run and gets passed around read-only. */
 typedef struct {
-    int    rows, cols;
-    double tri_size;
-    int    cell_w, cell_h;
-    int    ox, oy;
-    double border_w;
-    int    theme;
-    int    paused;
-    int    density;            /* scatter target count           */
-    int    scatter_radius;     /* lattice half-extent of scatter */
+    int    rows, cols;         /* terminal size in characters             */
+    double tri_size;           /* triangle edge length, in sub-pixels     */
+    int    cell_w, cell_h;     /* sub-pixels packed into one character cell */
+    int    ox, oy;             /* screen cell the grid origin sits on      */
+    double border_w;           /* how close to an edge a point must be to
+                                * get drawn as an edge character (0..1)    */
+    int    theme;              /* which colour gradient is active (0..2)   */
+    int    paused;             /* unused toggle kept for the 'p' key       */
+    int    density;            /* how many triangles to scatter            */
+    int    scatter_radius;     /* scatter reaches this far from the cursor,
+                                * measured in lattice steps                */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols)
@@ -331,13 +222,20 @@ static void ctx_draw_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_BORDER));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool ── */
 
+/* One scattered triangle. col/row name which cell of the triangular
+ * lattice it sits in; up flags which of the two triangles in that cell
+ * (1 = points up, 0 = points down). glyph is the character drawn for it. */
 typedef struct { int col, row, up; char glyph; bool alive; } Obj;
+
+/* A fixed-size bag of scattered triangles. items[0..count) are the live
+ * ones; everything past count is stale and ignored. Sized for MAX_OBJ so
+ * we never allocate while the demo is running. */
 typedef struct { Obj items[MAX_OBJ]; int count; } Pool;
 
+/* Our own tiny random-number generator so the scatter is repeatable from
+ * a given seed and never depends on the system's rand(). Returns 0..1. */
 static unsigned int g_seed = 1;
 static double frand(void)
 {
@@ -347,6 +245,9 @@ static double frand(void)
 
 static void pool_clear(Pool *p) { p->count = 0; }
 
+/* A cheap stand-in for "how far apart are these two triangles." It just
+ * adds up the column and row gaps (plus one if they point opposite ways).
+ * Good enough to drive colour over short ranges; not a true path length. */
 static int triangle_distance(int aC, int aR, int aU, int bC, int bR, int bU)
 {
     int d = abs(aC - bC) + abs(aR - bR);
@@ -354,6 +255,8 @@ static int triangle_distance(int aC, int aR, int aU, int bC, int bR, int bU)
     return d;
 }
 
+/* Sort a distance into one of N_BUCKETS colour bands, 0 nearest. max_d is
+ * the farthest we expect, so the gradient spreads evenly across it. */
 static int distance_bucket(int dist, int max_d)
 {
     if (max_d <= 0) return 0;
@@ -362,12 +265,17 @@ static int distance_bucket(int dist, int max_d)
     return b;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 cursor ── */
 
+/* The '@' marker the user steers. Same col/row/up coordinates as a
+ * scattered triangle — it's just the one we measure distances from. */
 typedef struct { int col, row, up; } Cursor;
 
+/* How one arrow-key press nudges the cursor. Moving between neighbouring
+ * triangles isn't a simple grid step: where you land depends on which way
+ * the current triangle points, so each direction has two rows here, one
+ * for up-triangles and one for down-triangles. The three numbers are the
+ * change to (col, row, up). Indexed TRI_DIR[direction][cur.up]. */
 static const int TRI_DIR[4][2][3] = {
     { { -1,  0,  1 }, {  0,  0,  0 } },
     { {  0,  0,  1 }, { +1,  0,  0 } },
@@ -398,10 +306,10 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  scatter                                                             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 scatter ── */
 
+/* Throw a fresh batch of triangles around the cursor. The tries cap is a
+ * safety belt so a bad density value can't spin us forever. */
 static void scatter_seed(Pool *sp, const GridCtx *g, const Cursor *cur)
 {
     sp->count = 0;
@@ -436,9 +344,7 @@ static void scatter_draw(const Pool *sp, const GridCtx *g, const Cursor *cur)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 scene ── */
 
 static void hud_draw(const GridCtx *g, const Pool *sp, const Cursor *cur,
                      double fps)
@@ -471,9 +377,7 @@ static void scene_draw(const GridCtx *g, const Pool *sp, const Cursor *cur,
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -486,9 +390,7 @@ static void screen_init(int theme)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §10 app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §10 app ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;

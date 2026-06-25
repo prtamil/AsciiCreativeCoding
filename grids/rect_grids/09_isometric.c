@@ -1,173 +1,41 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 09_isometric.c — flat-parallelogram isometric grid
+ * 09_isometric.c — a tilted grid drawn the way 2D games like SimCity do it.
  *
- * DEMO: Same rotation formula as 08_diamond but with IW=8, IH=2 instead
- *       of DW=4, DH=2. The 4:1 char ratio gives the classic 2:1-pixel
- *       isometric look (26.6°, as used in SimCity/Age of Empires).
- *       Each cell is 16 chars wide × 4 rows tall.  Arrow keys navigate
- *       one grid cell at a time along the grid axes (not screen axes).
+ * We place square cells on screen so they look like flat, wide diamonds seen
+ * from an angle. Arrow keys walk a cursor one cell at a time along the grid's
+ * own axes. The math is the same as 08_diamond.c — only the cell shape differs.
  *
- * Study alongside: 08_diamond.c (same formula, 45° square cells)
- *
- * Section map:
- *   §1 config   — IW=8, IH=2 (classic 2:1 isometric aspect), EWMA
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 5 pairs (grid, active, cursor, HUD, HINT)
- *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_grid_char / ctx_draw_bg
- *   §5 cursor   — Cursor + cursor_reset / cursor_move (grid-axis) / cursor_draw
- *   §6 scene    — hud_draw + scene_draw
- *   §7 screen   — ncurses init / cleanup
- *   §8 app      — signals, main loop
- *
- * Keys:  right/left: c±1   up/down: r∓1   r reset   q/ESC quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/rect_grids/09_isometric.c \
- *       -o 09_isometric -lncurses -lm
+ * Study alongside: 08_diamond.c (same idea, square 45° cells).
+ * Reference: en.wikipedia.org/wiki/Isometric_projection
  */
 
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
+/*
+ * THE BIG PICTURE
  *
- * Algorithm      : Identical rotation formula to 08_diamond.
- *                  Only the half-cell extents IW and IH change.
+ * Each grid cell sits at whole-number coordinates (r, c). To draw it we turn
+ * those into a screen spot:
+ *     column = origin_col + (c - r) * IW
+ *     row    = origin_row + (c + r) * IH
+ * IW and IH are how far one cell-step stretches sideways and downward. Make a
+ * cell wide and shallow (IW big, IH small) and it looks tilted, like a game's
+ * floor tile. Make them equal-ish and it looks like a square diamond.
  *
- * Formula        :
- *   screen_col = ox + (c - r) * IW
- *   screen_row = oy + (c + r) * IH
+ * Here IW=8, IH=2, so cells are 16 chars wide and 4 rows tall — the classic
+ * 2:1 game-isometric look (about a 26.6° tilt once you account for terminal
+ * chars being taller than they are wide).
  *
- * Comparison with 08_diamond:
- *   08_diamond:   DW=4, DH=2 → 45° cells (square diamonds)
- *   09_isometric: IW=8, IH=2 → 26.6° cells (classic 2:1 game isometric)
- *                               Cell is 16 chars wide × 4 rows tall.
- *                               In pixel space (8×16 px chars): 128px × 64px = 2:1.
+ * Drawing the lines: for every screen spot we run the formula backwards to
+ * ask "does a grid line pass through here?" Two checks — one for the lines
+ * heading one way ('/'), one for the other way ('\'). Where both lines cross
+ * we draw a corner '+'. With these proportions the two line families land in
+ * different spots, so you actually see the '/' and '\' strokes, not just dots.
  *
- * Grid lines (from inverse formula with IW=8, IH=2, MODULUS=32):
- *   c-line: (u*IH + v*IW) ≡ 0 (mod 32) → (2u + 8v) ≡ 0 (mod 32) → (u + 4v) ≡ 0 (mod 16)
- *   r-line: (v*IW - u*IH) ≡ 0 (mod 32) → (8v - 2u) ≡ 0 (mod 32) → (4v - u) ≡ 0 (mod 16)
- *
- * Visual: c-lines and r-lines now land at DIFFERENT screen columns per row,
- *         so isolated '/' and '\' characters appear between the '+' corners.
- *         With IH=1 (MODULUS=16) the conditions were identical — only '+' drawn.
- *
- * References     :
- *   Isometric projection — en.wikipedia.org/wiki/Isometric_projection
- *   Same formula as 08_diamond — compare §4 in both files
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * The formula is IDENTICAL to 08_diamond.  The ONLY change is the ratio
- * IW:IH.  In 08, DW=4 and DH=2 (2:1 char ratio) makes cells look square.
- * Here, IW=8 and IH=2 (4:1 char ratio) makes cells wide and flat —
- * the classic look of 2D game isometric grids (SimCity, Age of Empires).
- *
- * Understanding how IW:IH controls the "tilt angle":
- *   The slope of a grid line in PIXELS is IH*char_h / IW*char_w.
- *   With IW=8, IH=2, char 8px wide, char 16px tall:
- *     slope = 2*16 / 8*8 = 32/64 = 0.5  →  atan(0.5) ≈ 26.6°  ← classic 2:1 iso
- *   With DW=4, DH=2:
- *     slope = 2*16 / 4*8 = 32/32 = 1.0  →  atan(1.0) = 45°    ← square diamond
- *
- * WHY IH=1 BROKE THE GRID
- * ────────────────────────
- * With IH=1, MODULUS=16.  The c-line condition (u+8v)%16=0 and r-line
- * condition (8v-u)%16=0 are mathematically equivalent: any point satisfying
- * one automatically satisfies the other.  Result: only '+' corners, no '/'
- * or '\' — the grid looked like a sparse dot pattern, not isometric.
- * With IH=2, MODULUS=32: c-line hits u=12 and r-line hits u=4 on odd rows
- * — different positions — so both '/' and '\' characters appear. ✓
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Think of IW and IH as "how far does one cell step stretch on screen?"
- *   Large IW, small IH → cells are wide and shallow (isometric).
- *   IW=IH (after aspect correction) → cells are square (=45° diamond).
- *
- * The "perspective angle" θ from horizontal satisfies:
- *   tan(θ) = (IH * char_height_px) / (IW * char_width_px)
- *
- * Common game choices:
- *   θ ≈ 26.6° (2:1 pixel ratio) — classic 2D isometric (e.g. SimCity)
- *   θ = 30°   (true isometric projection)
- *   θ = 45°   (diamond, as in 08_diamond)
- *
- * IW=8, IH=2 with 8×16 px chars: slope = 0.5 → 26.6°. ✓
- *
- * MOVEMENT — GRID-AXIS vs SCREEN-AXIS
- * ─────────────────────────────────────
- * 08_diamond uses screen-axis movement: RIGHT=(dr=-1,dc=+1) moves purely
- * horizontal on screen (Δsc=2*DW, Δsr=0).  This works for 45° because
- * Δsc = (dc-dr)*DW = 2*4 = 8 chars — a small jump.
- *
- * For isometric (IW=8), screen-axis RIGHT would require Δsc=2*IW=16 chars
- * per keypress — a very large visual jump, and RANGE=6 would place the
- * cursor 96 chars off-center (off-screen on any normal terminal).
- *
- * Instead, this file uses GRID-AXIS movement: each key changes exactly ONE
- * cell coordinate, just like navigating a normal (non-rotated) grid:
- *   RIGHT  → c += 1  (screen: 8 cols right, 2 rows down)
- *   LEFT   → c -= 1  (screen: 8 cols left,  2 rows up)
- *   UP     → r -= 1  (screen: 8 cols right, 2 rows up)
- *   DOWN   → r += 1  (screen: 8 cols left,  2 rows down)
- * Each step is IW=8 cols — half the jump of screen-axis movement.
- * The movement is "atomic": both r and c must stay in bounds, or neither moves.
- *
- * DRAWING METHOD
- * ──────────────
- *  Exactly as in 08_diamond.  Read 08's mental model first.
- *  The only change in the code: substitute IW for DW, IH for DH.
- *
- *  Grid line conditions with IW=8, IH=2, MODULUS=32:
- *    c-line: (u + 4v) % 16 == 0
- *    r-line: (4v - u) % 16 == 0
- *
- *  At v=0: both → '+' at u=0,16,32...
- *  At v=1: c-line u=12,28; r-line u=4,20 → isolated '/' and '\'
- *  At v=2: both → '+' at u=8,24... (offset corners)
- *  At v=3: c-line u=4; r-line u=12 → isolated '/' and '\'
- *
- * KEY FORMULAS
- * ────────────
- *  Forward:   sc = ox + (c-r)*IW,    sr = oy + (c+r)*IH
- *  c-line:    (u + 4v) % 16 == 0         (IW=8, IH=2)
- *  r-line:    (4v - u) % 16 == 0
- *  Tilt angle: θ = atan(IH*char_h / IW*char_w)  in radians
- *
- *  Parametric comparison:
- *    09_isometric (IW=8, IH=2): θ_px ≈ 26.6° — classic 2:1 game isometric
- *    08_diamond   (DW=4, DH=2): θ_px = 45°   — square diamonds
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Cell dimensions: 2*IW=16 cols wide × 2*IH=4 rows tall.  RANGE=4 limits
- *    the cursor to ±4 cells per axis.  Worst-case screen offset (diagonal
- *    corner r=-4, c=4): sc = ox + (4-(-4))*IW = ox + 64 cols.  The '@' guard
- *    in cursor_draw skips drawing if the centre is off-screen — no crash.
- *
- *  • The safe_mod() trick is critical: u and v can be negative near the origin
- *    and C's % operator returns negative results for negative dividends.
- *    Without safe_mod, the modular conditions would never trigger for negative
- *    (u,v), leaving a blank upper-left quadrant.
- *
- *  • '@' centre formula: top corner of cell (r,c) is at (oy+(c+r)*IH, ox+(c-r)*IW).
- *    Centre = average of all 4 corners:
- *      sc_centre = ox + (c-r)*IW          (same column as top/bottom corners)
- *      sr_centre = oy + (c+r+1)*IH        (halfway between top and bottom rows)
- *
- * HOW TO VERIFY
- * ─────────────
- *  Origin '+': at screen (oy, ox).
- *  Cell (0,0) right corner '+': at (oy+IH, ox+IW) = (oy+2, ox+8).
- *  Cell (0,0) bottom corner '+': at (oy+2*IH, ox) = (oy+4, ox).
- *  Cell width = 2*IW = 16 cols.  Cell height = 2*IH = 4 rows.
- *  The '@' for cell (0,0) sits at (oy+IH, ox) = (oy+2, ox) — 2 rows below
- *  the top corner, at the same column.
- *
- * ─────────────────────────────────────────────────────────────────────── */
+ * Moving the cursor: arrow keys change one grid coordinate at a time (like a
+ * normal grid), not one screen direction. A move only happens if it keeps the
+ * cursor inside the allowed range — both r and c must stay in bounds or
+ * neither moves.
+ */
 
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
@@ -179,38 +47,32 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS  30
 
 /*
- * IW, IH — isometric half-cell extents in screen characters.
- *   Cell dimensions: 2*IW cols wide × 2*IH rows tall  →  16 wide × 4 tall.
- *   Tilt angle in pixel space: atan(IH*char_h / IW*char_w)
- *                            = atan(2*16 / 8*8) = atan(0.5) ≈ 26.6°  ← classic 2:1 iso.
- *   To adjust the angle: decrease IW (steeper) or decrease IH (flatter).
- *   IW=4, IH=2 gives 45° (same as 08_diamond).
+ * IW, IH set the cell shape: how far one cell-step moves sideways and down.
+ * The cell ends up 2*IW=16 chars wide and 2*IH=4 rows tall — the wide, flat
+ * look of game isometric tiles. Want a different tilt? Shrink IW to stand the
+ * cells up, or shrink IH to flatten them. IW=4, IH=2 gives the square 45°
+ * diamond from 08_diamond.
  */
-#define IW     8   /* half-cell column extent — cell is 2*IW=16 chars wide */
-#define IH     2   /* half-cell row extent    — cell is 2*IH= 4 rows  tall */
+#define IW     8   /* half-cell width  — cell is 2*IW=16 chars wide */
+#define IH     2   /* half-cell height — cell is 2*IH= 4 rows  tall */
 
-/* 2*IW*IH = modulus for grid-line inverse formula */
+/* The number the line-finding math wraps around; just 2*IW*IH worked out. */
 #define MODULUS  (2 * IW * IH)   /* = 32 */
 
 /*
- * RANGE — how many cells the cursor can navigate from the origin per axis.
- * With grid-axis movement the worst-case screen position is the diagonal
- * corner (r=-RANGE, c=RANGE) or (r=RANGE, c=-RANGE):
- *   sc = ox ± (RANGE + RANGE) * IW = ox ± 2*RANGE*IW
- * RANGE=4: worst-case sc = ox ± 64.  Safe on terminals wider than 128 cols
- * (ox ≈ cols/2, so 64 px room each side).  The '@' guard prevents crashes
- * if the cursor reaches an off-screen position on a narrower terminal.
+ * How many cells the cursor may roam from the centre, each direction. At the
+ * far diagonal corner that's about 2*RANGE*IW = 64 chars off-centre, fine on a
+ * wide terminal. If it ever lands off-screen the '@' draw simply skips it, so
+ * a narrow terminal won't crash — it just won't show the cursor out there.
  */
-#define RANGE  4   /* cursor cell range: -RANGE .. +RANGE per axis */
+#define RANGE  4   /* cursor stays within -RANGE .. +RANGE on each axis */
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How much to smooth the FPS number so it doesn't jitter every frame. */
 #define FPS_EWMA_ALPHA  0.05
 
 #define PAIR_GRID    1
@@ -219,9 +81,7 @@
 #define PAIR_HUD     4
 #define PAIR_HINT    5
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -236,9 +96,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static void color_init(void)
 {
@@ -250,24 +108,19 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx and the cell ↔ screen mapping                    */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula — turning a cell (r,c) into a screen spot, and back ── */
 
 /*
- * GridCtx — geometry of the isometric grid plus origin and cursor range.
+ * GridCtx — everything we need to know to place this grid on the screen.
+ * Filled once at startup (and again on resize), then read-only while drawing.
  */
 typedef struct {
-    /* terminal extent */
-    int rows, cols;
+    int rows, cols;     /* size of the terminal, in chars */
+    int cw, ch;         /* half-cell width and height (IW, IH copied here) */
+    int ox, oy;         /* where cell (0,0) lands — the grid's centre point */
 
-    /* half-cell size in screen characters */
-    int cw, ch;
-
-    /* origin (cell (0,0) projects here) */
-    int ox, oy;
-
-    /* cursor bounds — symmetric ±range around origin */
+    /* How far the cursor may wander from the centre. range is the limit per
+     * axis; max_r / max_c are the same value kept for clarity at call sites. */
     int range;
     int max_r, max_c;
 } GridCtx;
@@ -283,31 +136,24 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->max_c = RANGE;
 }
 
-/*
- * ctx_to_screen — ISOMETRIC FORMULA (same structure as 08_diamond):
- *
- *   screen_col = ox + (c - r) * IW
- *   screen_row = oy + (c + r) * IH
- *
- * The formula is IDENTICAL to 08_diamond. Only IW=8, IH=2 instead of DW=4, DH=2.
- * Change IW/IH to get any slope between 0° (horizontal grid) and 90° (vertical grid).
- */
+/* Where does cell (r,c) land on screen? This is the whole projection.
+ *   col = ox + (c - r) * IW,   row = oy + (c + r) * IH */
 static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
     *sc = g->ox + (c - r) * g->cw;
     *sr = g->oy + (c + r) * g->ch;
 }
 
+/* C's % can return negative; this always lands in 0..b-1 so the line checks
+ * still fire in the upper-left quadrant where u and v go negative. */
 static int safe_mod(int a, int b) { return ((a % b) + b) % b; }
 
 /*
- * ctx_grid_char — inverse formula with IW=8, IH=2, MODULUS=32:
- *
- *   c-line: (u*IH + v*IW) ≡ 0 (mod 32) → (u + 4v) ≡ 0 (mod 16)  → '/'
- *   r-line: (v*IW - u*IH) ≡ 0 (mod 32) → (4v - u) ≡ 0 (mod 16)  → '\'
- *
- * The conditions hit DIFFERENT positions on odd rows (c-line u=12, r-line u=4),
- * so isolated '/' and '\' characters appear between '+' corners. ✓
+ * Which grid mark belongs at screen spot (sr,sc)? We run the projection
+ * backwards: one test says "a '/' line passes here", the other "a '\' line
+ * passes here". Both true means a corner '+'; one true means that single
+ * stroke; neither means blank. With IW=8, IH=2 the two families fall in
+ * different spots, so you see the strokes, not just the corners.
  */
 static char ctx_grid_char(const GridCtx *g, int sr, int sc)
 {
@@ -322,33 +168,23 @@ static char ctx_grid_char(const GridCtx *g, int sr, int sc)
 }
 
 /*
- * in_cursor_cell — test whether screen position (sr,sc) lies inside cell (pr,pc).
- *
- * The forward formula sc=ox+(c-r)*IW, sr=oy+(c+r)*IH can be inverted:
- *   cn = u*IH + v*IW  where  cn = c * MODULUS  (u=sc-ox, v=sr-oy)
- *   rn = v*IW - u*IH  where  rn = r * MODULUS
- *
- * Cell (pr,pc) occupies the rectangle:
- *   cn in (pc*MODULUS, (pc+1)*MODULUS]
- *   rn in (pr*MODULUS, (pr+1)*MODULUS]
- *
- * The strict left bound (>) excludes the grid line shared with the previous
- * cell; the inclusive right bound (<=) claims the grid line on the far edge.
+ * Does screen spot (sr,sc) fall inside the diamond of cell (pr,pc)?
+ * Running the projection backwards gives a scaled-up (r,c) for the spot; if
+ * both land in this cell's slice of that range, the spot is inside. Each cell
+ * owns its far edge but not its near edge, so neighbours don't fight over the
+ * shared grid line.
  */
 static bool in_cursor_cell(const GridCtx *g, int sr, int sc, int pr, int pc)
 {
     int u = sc - g->ox, v = sr - g->oy;
-    int cn = u * g->ch + v * g->cw;          /* = MODULUS * c  (scaled c-coordinate) */
-    int rn = v * g->cw - u * g->ch;          /* = MODULUS * r  (scaled r-coordinate) */
+    int cn = u * g->ch + v * g->cw;          /* scaled-up c for this spot */
+    int rn = v * g->cw - u * g->ch;          /* scaled-up r for this spot */
     return (cn > pc * MODULUS && cn <= (pc + 1) * MODULUS &&
             rn > pr * MODULUS && rn <= (pr + 1) * MODULUS);
 }
 
-/*
- * ctx_draw_bg — raster-scan every screen cell and draw the isometric grid.
- * ctx_grid_char() returns '+', '/', '\', or ' ' for each position.
- * Skipping ' ' avoids erasing the background on every cell.
- */
+/* Draw the grid: visit every screen spot, ask what mark goes there, and stamp
+ * it. We skip blanks so we don't paint over the background. */
 static void ctx_draw_bg(const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_GRID));
@@ -361,10 +197,9 @@ static void ctx_draw_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_GRID));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 cursor ── */
 
+/* The highlighted cell the user is standing on, in grid coordinates. */
 typedef struct { int r, c; } Cursor;
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
@@ -373,14 +208,8 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->r = 0; cur->c = 0;
 }
 
-/*
- * cursor_move — GRID-AXIS movement (one coordinate changes per keypress):
- *   RIGHT/LEFT → dc = ±1  (c changes; screen moves right-down / left-up)
- *   UP/DOWN    → dr = ∓1  (r changes; screen moves right-up  / left-down)
- *
- * Movement is ATOMIC: both r and c must stay within [-RANGE, RANGE],
- * otherwise neither changes.
- */
+/* Step the cursor one cell along a grid axis. The move only counts if it keeps
+ * the cursor in range — both r and c must stay valid, or nothing moves. */
 static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
 {
     int nr = cur->r + dr, nc = cur->c + dc;
@@ -391,20 +220,15 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
 }
 
 /*
- * cursor_draw — highlight the active cell interior and draw '@' at its centre.
- *
- * Two-pass approach:
- *   1. Fill interior: search a bounding box around the cell's top corner,
- *      test each position with in_cursor_cell(), draw '.' on empty space.
- *   2. Draw '@': placed at the cell centre (sc=ox+(c-r)*IW, sr=oy+(c+r+1)*IH).
- *      Guarded on the CENTRE position (not the top corner) so '@' stays visible
- *      even when the cell's top corner scrolls above the screen edge.
+ * Show where the cursor is: dot-fill the highlighted cell, then drop an '@' in
+ * the middle. We scan a small box around the cell and dot every empty spot that
+ * tests as inside it, so the fill follows the diamond shape exactly.
  */
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int csr, csc; ctx_to_screen(g, cur->r, cur->c, &csr, &csc);
-    int span_r = g->ch * 2 + 1;   /* rows to search: covers 2*IH=4 row cell height */
-    int span_c = g->cw * 2;       /* cols to search: covers 2*IW=16 col cell width */
+    int span_r = g->ch * 2 + 1;   /* tall enough to cover the 4-row cell */
+    int span_c = g->cw * 2;       /* wide enough to cover the 16-col cell */
 
     attron(COLOR_PAIR(PAIR_ACTIVE));
     for (int dr = -span_r; dr <= span_r; dr++) {
@@ -418,9 +242,9 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
     attroff(COLOR_PAIR(PAIR_ACTIVE));
 
-    /* Centre of cell (r,c): sc = ox+(c-r)*IW,  sr = oy+(c+r+1)*IH.
-     * Guard on the CENTRE (not the top corner) so @ stays visible even
-     * when the cell's top corner is above the screen edge. */
+    /* Place '@' at the cell's middle. We check the middle (not the top corner)
+     * against the screen edges, so the marker still shows when the corner has
+     * scrolled off the top. */
     int centre_sc = g->ox + (cur->c - cur->r) * g->cw;
     int centre_sr = g->oy + (cur->c + cur->r + 1) * g->ch;
     if (centre_sr >= 0 && centre_sr < g->rows - 1 &&
@@ -431,9 +255,7 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
 {
@@ -459,9 +281,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
     wnoutrefresh(stdscr); doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(void)
@@ -472,10 +292,9 @@ static void screen_init(void)
     color_init(); atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
+/* Set from signals only, so they're flagged volatile sig_atomic_t. */
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 static void on_signal(int s)
 {

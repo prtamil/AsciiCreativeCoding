@@ -1,168 +1,20 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 04_polar_scatter.c — four polar scatter strategies on a polar grid
+ * 04_polar_scatter.c — scatter dots on a polar grid four different ways.
  *
- * DEMO: Move the cursor and watch a live scatter preview update in real time.
- *       U/G/W/D select the distribution: U uniform-area, G radial Gaussian
- *       (clusters around the cursor ring), W angular wedge (fills the cursor
- *       sector), D ring-snap (objects gravitate to ring boundaries).  The
- *       preview regenerates whenever the cursor moves or a parameter changes.
- *       Press space to stamp the current preview into the permanent pool.
+ * Move the cursor, pick a scatter style with U/G/W/D, and a live preview
+ * follows along in amber. Press space to stamp the preview into a permanent
+ * pool so you can build up a picture. The four styles only differ in how
+ * each dot's distance-from-centre and angle are chosen at random.
  *
- * Study alongside: 03_polar_spiral.c (parametric path placement),
- *                  grids/rect_grids_placement/04_scatter.c (rectangular version)
+ * Sister files: 03_polar_spiral.c (placing dots along a spiral path) and
+ * grids/rect_grids_placement/04_scatter.c (the same idea on a square grid).
  *
- * Section map:
- *   §1 config   — scatter parameters: N, radii, sigma, wedge half-angle
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 5 pairs: grid, active, anchor, HUD (yellow), hint (cyan)
- *   §4 gridctx  — GridCtx (mode, origin), cell_to_polar, polar_to_screen
- *   §5 pool     — Pool: place, clear, draw, draw_preview, stamp
- *   §6 cursor   — Cursor (row, col, r, theta) + screen-space arrow move
- *   §7 mode     — draw_polar_bg: 7 inline polar background types in one switch
- *   §8 scatter  — gauss, scatter_uniform, scatter_gauss, scatter_wedge,
- *                  scatter_ringsnap
- *   §9 scene    — hud_draw + scene_draw
- *   §10 screen  — ncurses init / cleanup
- *   §11 app     — signals, resize, main loop
- *
- * Keys:  q/ESC quit   P pause   t theme   a/e prev/next background
- *        U/G/W/D select scatter mode (preview updates live)
- *        +/- N    [/] sigma (G) or wedge (W)
- *        space stamp preview to pool    C clear pool    r reset cursor
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/polar_grids_placement/04_polar_scatter.c \
- *       -o 04_polar_scatter -lncurses -lm
+ * The "uniform area" trick (picking r from sqrt of a uniform value so the
+ * middle doesn't get crowded) and the bell-curve generator come from:
+ *   en.wikipedia.org/wiki/Disk_sampling
+ *   en.wikipedia.org/wiki/Box-Muller_transform
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Four scatter strategies that differ only in how (r, θ)
- *                  is sampled.  Each converts the sample to a terminal cell
- *                  via polar_to_screen() and appends to the pool.
- *
- *                  U — Uniform area:
- *                    r  ~ sqrt(rand(r_min², r_max²))  — corrects radial bias
- *                    θ  ~ Uniform[0, 2π)
- *                    Without the sqrt correction, sampling r ~ Uniform
- *                    would over-weight the centre (small r has less area
- *                    per unit r but the same sampling probability).
- *
- *                  G — Radial Gaussian:
- *                    r  ~ |Normal(r_cursor, SIGMA_R)|
- *                    θ  ~ Uniform[0, 2π)
- *                    Objects cluster around the ring at radius r_cursor.
- *                    Box-Muller transform for the Normal deviate.
- *
- *                  W — Angular wedge:
- *                    r  ~ Uniform[R_INNER, R_OUTER]
- *                    θ  ~ Uniform[θ_cursor − WEDGE_HALF, θ_cursor + WEDGE_HALF]
- *                    Objects fill a pie-slice centred on the cursor angle.
- *
- *                  D — Ring-snap:
- *                    r  ~ nearest ring position k × RING_SNAP_SP + jitter
- *                    θ  ~ Uniform[0, 2π)
- *                    Objects appear to "snap" to ring boundaries.
- *
- * Math           : Uniform area correction: the disc of radius R has area
- *                  π × R².  Uniform sampling of r² (not r) gives uniform
- *                  areal density.  CDF inversion: r = sqrt(r_min² + rand × (r_max² − r_min²)).
- *
- *                  Box-Muller: U1, U2 ~ Uniform[0,1] →
- *                    Z = sqrt(−2 ln U1) × cos(2π U2)  ~ Normal(0,1)
- *
- * References     :
- *   Uniform disc sampling — en.wikipedia.org/wiki/Disk_sampling
- *   Box-Muller transform — en.wikipedia.org/wiki/Box-Muller_transform
- *   Rectangular analogue — grids/rect_grids_placement/04_scatter.c
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ──────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Four polar scatter strategies that differ only in how (r, θ) is sampled.
- * Every strategy converts its sample to a terminal cell via polar_to_screen()
- * and appends to the preview pool.  The dirty flag triggers regeneration
- * whenever cursor or parameters change; SPACE stamps preview → permanent pool.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine throwing darts at the polar grid with different aiming strategies:
- *
- *   U: blindfolded — completely random, but corrected so every ring band
- *      gets proportional coverage (outer bands are larger, so they get
- *      more darts when sampling uniformly over area, not over radius).
- *   G: aiming for a ring — most darts land near r_cursor with Gaussian
- *      falloff; the further from that ring the rarer the dart.
- *   W: aiming at a clock sector — darts land in a ±WEDGE_HALF wedge
- *      around the cursor angle.
- *   D: magnetised darts — they snap to ring boundaries regardless of aim.
- *
- * DRAWING METHOD
- * ──────────────
- * 1. Move cursor to set the scatter centre (r_cursor, θ_cursor).
- * 2. Select mode U/G/W/D; adjust N with +/−, param with [/].
- * 3. dirty=true triggers pool_clear(preview) + scatter_*(preview, ...).
- *    Preview drawn in amber (PAIR_ANCHOR) each frame.
- * 4. SPACE: pool_stamp copies preview → permanent pool (no regen needed).
- *
- * KEY FORMULAS
- * ────────────
- * gauss — Box-Muller transform:
- *   U1 = (rand+1)/(RAND_MAX+2) ∈ (0,1)   [+1 shift avoids log(0)]
- *   U2 = rand/(RAND_MAX+1)    ∈ [0,1)
- *   Z  = sqrt(−2 ln U1) × cos(2π U2)     ∼ Normal(0,1)
- *   return mean + sigma × Z
- *
- * scatter_uniform (U) — CDF-inversion for uniform areal density:
- *   Without correction, r~Uniform gives 4× more dots near r_min than r_max.
- *   Area of disc = π r², so sampling r² uniformly → uniform areal density.
- *   r = sqrt(R_INNER² + rand × (r_outer² − R_INNER²))
- *   θ ∈ [0, 2π) uniformly
- *
- * scatter_gauss (G) — Gaussian ring cluster:
- *   r = |Normal(r_cursor, SIGMA_R)|   [fabs keeps r > 0]
- *   r clamped to R_INNER
- *   θ ∈ [0, 2π) uniformly
- *   Slight pile-up at R_INNER when r_cursor is small and sigma is large.
- *
- * scatter_wedge (W) — angular wedge:
- *   r ∈ [R_INNER, r_outer] uniformly (no area correction — fills wedge)
- *   θ ∈ [θ_cursor − WEDGE_HALF, θ_cursor + WEDGE_HALF] uniformly
- *
- * scatter_ringsnap (D) — ring-snap with jitter:
- *   k ∈ {1, …, floor(r_outer / RING_SNAP_SP)} uniformly (integer)
- *   r = k × RING_SNAP_SP + jitter,  jitter ∈ [−RING_SNAP_JITTER, +JITTER]
- *   θ ∈ [0, 2π) uniformly
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- * - dirty flag: preview regenerates on cursor move, key, param change.
- *   pool_stamp (SPACE) does NOT set dirty, so repeated SPACE stamps the
- *   same pattern without regeneration (preserves expected behaviour).
- * - R_OUTER_FACTOR=0.42: on a large terminal (200×50) r_outer can exceed
- *   200px; with U mode the pool fills in one press.
- * - scatter_gauss: fabs(gauss(...)) causes pile-up at R_INNER when
- *   r_cursor is small.  This is visible as a bright spot at the inner radius.
- *
- * HOW TO VERIFY
- * ─────────────
- * Terminal 80×24 → ox=40, oy=12.
- * r_outer = 0.42 × sqrt((40×2)²+(12×4)²) = 0.42×sqrt(6400+2304) ≈ 39px
- *
- * scatter_uniform (U, N=1):
- *   r_min=R_INNER=8, r_max≈39, r_min²=64, r_max²≈1521, range≈1457
- *   rand=0.25: r=sqrt(64+0.25×1457)=sqrt(428)≈20.7; θ random  ✓
- *
- * scatter_ringsnap (D, r_outer≈39):
- *   n_rings=floor(39/20)=1 → only ring 1 (r≈20) available.
- *   All dots cluster near r=20±RING_SNAP_JITTER=±2px.
- *   On larger terminal (r_outer=80): n_rings=4; rings at 20,40,60,80px. ✓
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
@@ -179,63 +31,66 @@
 #  define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS    30
 #define CELL_W         2
 #define CELL_H         4
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How much each new frame nudges the displayed FPS number. Small value =
+ * smooth, slow-to-react readout instead of a jittery one. */
 #define FPS_EWMA_ALPHA  0.05
 
-/* Objects placed per key press */
+/* How many dots a scatter drops at once, and the range +/- can dial it to. */
 #define N_SCATTER_DEFAULT  60
 #define N_SCATTER_MIN      10
 #define N_SCATTER_MAX     400
 #define N_SCATTER_STEP     10
 
-/* Radial bounds for U and W scatter */
-#define R_INNER           8.0    /* pixels, minimum scatter radius */
+/* Inner and outer edge of the scatter ring for the U and W styles.
+ * R_INNER keeps dots off the very centre; R_OUTER_FACTOR sets the outer
+ * edge as a fraction of the distance from centre to corner. */
+#define R_INNER           8.0    /* sub-pixels, closest a dot may land */
 #define R_OUTER_FACTOR    0.42   /* fraction of half-screen diagonal */
 
-/* Radial Gaussian sigma (adjustable) */
+/* Width of the bell curve for the G (Gaussian) style: bigger = dots spread
+ * further from the cursor's ring. Adjustable with [ and ]. */
 #define SIGMA_R_DEFAULT   20.0
 #define SIGMA_R_MIN        5.0
 #define SIGMA_R_MAX       60.0
 #define SIGMA_R_STEP       5.0
 
-/* Angular wedge half-angle (adjustable, same variable as sigma in context) */
-#define WEDGE_DEFAULT     (M_PI / 6.0)   /* 30° either side = 60° total  */
-#define WEDGE_MIN         (M_PI / 18.0)  /* 10° */
-#define WEDGE_MAX         (M_PI)         /* 180° */
-#define WEDGE_STEP        (M_PI / 18.0)  /* 10° per step */
+/* Half-width of the pie slice for the W (wedge) style. Default fills 30 deg
+ * to each side of the cursor, so a 60 deg slice. Adjustable with [ and ]. */
+#define WEDGE_DEFAULT     (M_PI / 6.0)   /* 30 deg either side = 60 deg total */
+#define WEDGE_MIN         (M_PI / 18.0)  /* 10 deg */
+#define WEDGE_MAX         (M_PI)         /* 180 deg */
+#define WEDGE_STEP        (M_PI / 18.0)  /* 10 deg per step */
 
-/* Ring-snap: spacing between snap targets (pixels) */
+/* Ring-snap style: gap between the rings dots snap to, and how far a dot may
+ * wobble off its ring so the result doesn't look mechanically perfect. */
 #define RING_SNAP_SP      20.0
-#define RING_SNAP_JITTER   2.0   /* ± pixel jitter around each ring */
+#define RING_SNAP_JITTER   2.0   /* +/- sub-pixel wobble around each ring */
 
 /*
- * BG_* constants — the natural ring/arm/seed laws of the 7 polar
- * backgrounds (mirror values used by polar_grids/01..07 and the
- * other polar placement files).  scatter_ringsnap dispatches on
- * g->mode and samples r from the matching law so the dots actually
- * land on the active grid's rings instead of an arbitrary fixed step.
+ * Each polar background has its own rule for where its rings (or spiral arms,
+ * or seeds) sit. These numbers copy those rules from polar_grids/01..07. The
+ * ring-snap style reads them so its dots land exactly on whichever background
+ * is showing, instead of on some unrelated fixed spacing.
  */
-#define BG_RING_SP        20.0           /* mode 0: rings spacing (px)        */
-#define BG_LOG_RMIN        4.0           /* mode 1: log-polar inner radius    */
-#define BG_LOG_RATIO       0.25          /* mode 1: ln(RATIO) per ring        */
-#define BG_ARCH_PITCH     32.0           /* mode 2: archimedean pitch (px)    */
-#define BG_LOG_GROWTH    (2.0 * log(PHI) / M_PI)  /* mode 3: golden ratio    */
-#define BG_LOG_R0          4.0           /* mode 3: log-spiral inner anchor   */
-#define BG_SEED_SP         3.5           /* mode 4: sunflower seed spacing    */
-#define BG_RUNIT          18.0           /* mode 5: equal-area R_UNIT (px)    */
-#define BG_ELLIP_A         1.6           /* mode 6: elliptic x semi-axis      */
-#define BG_ELLIP_B         1.0           /* mode 6: elliptic y semi-axis      */
-#define BG_ELLIP_SP       20.0           /* mode 6: ring spacing in e_r       */
+#define BG_RING_SP        20.0           /* rings+spokes: gap between rings   */
+#define BG_LOG_RMIN        4.0           /* log-polar: innermost ring         */
+#define BG_LOG_RATIO       0.25          /* log-polar: growth step per ring   */
+#define BG_ARCH_PITCH     32.0           /* archimedean: gap between arm coils */
+#define BG_LOG_GROWTH    (2.0 * log(PHI) / M_PI)  /* log-spiral: golden growth */
+#define BG_LOG_R0          4.0           /* log-spiral: where the arm starts  */
+#define BG_SEED_SP         3.5           /* sunflower: spacing between seeds   */
+#define BG_RUNIT          18.0           /* equal-area: ring step             */
+#define BG_ELLIP_A         1.6           /* elliptic: how stretched, sideways  */
+#define BG_ELLIP_B         1.0           /* elliptic: how stretched, vertical  */
+#define BG_ELLIP_SP       20.0           /* elliptic: gap between rings        */
 
-/* Object pool */
+/* The fixed-size store of placed dots, and the character each one draws as. */
 #define MAX_OBJ        2048
 #define OBJ_GLYPH      'o'
 
@@ -245,9 +100,9 @@
 
 #define PAIR_GRID    1
 #define PAIR_ACTIVE  2
-#define PAIR_ANCHOR  3   /* amber — live scatter preview */
-#define PAIR_HUD     4   /* status bar (yellow)  */
-#define PAIR_HINT    5   /* key-hint footer (cyan) */
+#define PAIR_ANCHOR  3   /* amber — the live preview */
+#define PAIR_HUD     4   /* status line (yellow) */
+#define PAIR_HINT    5   /* key hints (cyan) */
 
 static const char *const SCATTER_NAMES[] = {
     "uniform", "radial-gauss", "wedge", "ring-snap",
@@ -268,9 +123,7 @@ static const short THEME_FG[][2] = {
 };
 #define N_THEMES  5
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -285,9 +138,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static void color_init(int theme)
 {
@@ -300,10 +151,21 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx                                                             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx ── */
 
+/*
+ * Everything the drawing code needs to know about the current screen and
+ * which polar background is showing. Recomputed whenever the terminal resizes
+ * or the user switches backgrounds, then passed (read-only) to every helper.
+ *   mode             which of the 7 backgrounds is active (0..6)
+ *   rows, cols       terminal size in character cells
+ *   cw, ch           cell width/height in sub-pixels — a character cell is
+ *                    taller than it is wide, so we measure distances in these
+ *                    units to keep circles looking round
+ *   ox, oy           centre of the grid, in cells (where r = 0 lives)
+ *   max_ring         how many rings fit before running off screen
+ *   max_spoke        how many evenly-spaced spokes the background draws
+ */
 typedef struct {
     int mode;
     int rows, cols;
@@ -340,6 +202,8 @@ static void polar_to_screen(double r, double theta, int ox, int oy,
     *row = oy + (int)round(r * sin(theta) / CELL_H);
 }
 
+/* Pick a slash that roughly points along the angle, so grid lines look like
+ * they curve instead of being a wall of identical characters. */
 static char angle_char(double theta)
 {
     double a = fmod(theta + 2.0*M_PI, M_PI);
@@ -349,11 +213,22 @@ static char angle_char(double theta)
     return '/';
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool ── */
 
+/*
+ * One placed dot: where it sits on screen and what it looks like.
+ *   row, col   its character cell on screen
+ *   glyph      the character to draw (always OBJ_GLYPH here)
+ *   alive      kept for future use; right now every dot stays alive
+ */
 typedef struct { int row, col; char glyph; bool alive; } Obj;
+
+/*
+ * A fixed-size bucket of dots. We use two of these: one permanent pool the
+ * user is building up, and one short-lived preview that gets wiped and
+ * refilled every time the cursor or settings change. No dynamic memory —
+ * count just walks up to MAX_OBJ and stops.
+ */
 typedef struct { Obj items[MAX_OBJ]; int count; } Pool;
 
 static void pool_place(Pool *p, int row, int col,
@@ -388,17 +263,24 @@ static void pool_draw_preview(const Pool *p)
     attroff(COLOR_PAIR(PAIR_ANCHOR) | A_BOLD);
 }
 
-/* pool_stamp — append all preview objects into the permanent pool */
+/* Copy the preview's dots into the permanent pool — what space:stamp does.
+ * Stops early if the permanent pool is full. */
 static void pool_stamp(Pool *dst, const Pool *src)
 {
     for (int i = 0; i < src->count && dst->count < MAX_OBJ; i++)
         dst->items[dst->count++] = src->items[i];
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 cursor ── */
 
+/*
+ * The crosshair the user steers. It lives on the screen grid (row, col), but
+ * the scatter styles think in polar terms, so we also keep its distance from
+ * centre and its angle. The two views are kept in sync by cursor_sync_polar.
+ *   row, col   position in character cells
+ *   r          distance from the grid centre, in sub-pixels
+ *   theta      angle around the centre, in radians
+ */
 typedef struct {
     int    row, col;
     double r, theta;
@@ -433,11 +315,13 @@ static void cursor_draw(const Cursor *c, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_ACTIVE) | A_REVERSE | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  mode  (polar background dispatcher)                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 mode ── */
 
-/* Mode 0 — rings + spokes (defaults from polar_grids/01_rings_spokes.c). */
+/* Each bg_*_draw paints one style of polar background. They're tuned to match
+ * the standalone demos in polar_grids/, so the scatter dots sit on the same
+ * lines those demos draw. They only read the grid; they never change it. */
+
+/* The plain rings-and-spokes background, like a dartboard. */
 static void bg_rings_spokes_draw(const GridCtx *g)
 {
     const double two_pi = 2.0 * M_PI;
@@ -458,7 +342,7 @@ static void bg_rings_spokes_draw(const GridCtx *g)
     }
 }
 
-/* Mode 1 — log-polar grid (defaults from polar_grids/02_log_polar.c). */
+/* Rings that grow further apart the further out you go (log spacing). */
 static void bg_log_polar_draw(const GridCtx *g)
 {
     const double two_pi = 2.0 * M_PI;
@@ -483,7 +367,7 @@ static void bg_log_polar_draw(const GridCtx *g)
     }
 }
 
-/* Mode 2 — archimedean 2-arm spiral (polar_grids/03_archimedean_spiral.c). */
+/* A two-armed spiral whose coils stay evenly spaced, like a coiled rope. */
 static void bg_archimedean_draw(const GridCtx *g)
 {
     const double two_pi = 2.0 * M_PI;
@@ -503,7 +387,7 @@ static void bg_archimedean_draw(const GridCtx *g)
     }
 }
 
-/* Mode 3 — golden log-spiral, 2 arms (polar_grids/04_log_spiral.c). */
+/* A two-armed spiral that widens as it turns, the shape of a nautilus shell. */
 static void bg_log_spiral_draw(const GridCtx *g)
 {
     const double two_pi = 2.0 * M_PI;
@@ -524,10 +408,12 @@ static void bg_log_spiral_draw(const GridCtx *g)
     }
 }
 
-/* Mode 4 — Vogel sunflower phyllotaxis (polar_grids/05_sunflower.c). */
+/* Seeds laid out like a sunflower head, each turned by the golden angle. */
 static void bg_sunflower_draw(const GridCtx *g)
 {
     const double sp = 3.5;
+    /* One flag per screen cell so we don't draw two seeds on the same spot.
+     * Freed before we return, so nothing leaks. */
     bool *vis = calloc((size_t)(g->rows * g->cols), 1);
     if (!vis) return;
 
@@ -544,7 +430,8 @@ static void bg_sunflower_draw(const GridCtx *g)
     free(vis);
 }
 
-/* Mode 5 — equal-area sector grid (polar_grids/06_sector.c). */
+/* Rings spaced so every ring band covers the same area (rings bunch up as
+ * you go out, since outer bands are naturally wider). */
 static void bg_equal_area_draw(const GridCtx *g)
 {
     const double two_pi = 2.0 * M_PI;
@@ -567,7 +454,7 @@ static void bg_equal_area_draw(const GridCtx *g)
     }
 }
 
-/* Mode 6 — elliptic ring grid (polar_grids/07_elliptic.c). */
+/* Oval rings instead of round ones — squashed by the A and B stretch factors. */
 static void bg_elliptic_draw(const GridCtx *g)
 {
     const double A = 1.6, B = 1.0, sp = 20.0, rwu = 0.07;
@@ -586,11 +473,7 @@ static void bg_elliptic_draw(const GridCtx *g)
     }
 }
 
-/*
- * draw_polar_bg — dispatch on g->mode and draw the matching polar grid.
- * Routes to one of seven bg_*_draw helpers (rings_spokes, log_polar,
- * archimedean, log_spiral, sunflower, equal_area, elliptic).  No mutation.
- */
+/* Draw whichever background the user picked. */
 static void draw_polar_bg(const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_GRID));
@@ -606,18 +489,14 @@ static void draw_polar_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_GRID));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  scatter                                                             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 scatter ── */
 
 /*
- * gauss — Box-Muller transform: Normal(mean, sigma) from two uniforms.
- *
- * THE FORMULA:
- *   U1 = (rand+1)/(RAND_MAX+2) ∈ (0,1)   [+1 avoids log(0)]
- *   U2 = rand/(RAND_MAX+1)    ∈ [0,1)
- *   Z  = sqrt(−2 ln U1) × cos(2π U2)     ~ Normal(0,1)
- *   return mean + sigma × Z
+ * Draw a random number from a bell curve centred on mean, with sigma setting
+ * its width — most results land near mean, far-out ones get rare. C only gives
+ * us flat random numbers, so this is the standard recipe (the Box-Muller
+ * transform) for turning two flat ones into a bell-curve one. The +1 nudge on
+ * the first random value keeps it away from zero, since the math takes its log.
  */
 static double gauss(double mean, double sigma)
 {
@@ -628,12 +507,10 @@ static double gauss(double mean, double sigma)
 }
 
 /*
- * scatter_uniform (U) — CDF-inversion for uniform areal density.
- *
- * THE FORMULA:
- *   Area ∝ r², so sampling r² uniformly → uniform dots per unit area.
- *   r = sqrt(R_INNER² + rand × (r_outer² − R_INNER²))
- *   θ ∈ [0, 2π) uniformly
+ * U style: spread dots evenly across the whole disc. The catch is that a ring
+ * far from the centre is bigger than one near it, so picking the distance
+ * straight-up would crowd the middle. Taking the square root of a flat random
+ * value cancels that out, giving the same dot density everywhere.
  */
 static void scatter_uniform(Pool *pool, int n, double r_outer, const GridCtx *g)
 {
@@ -649,12 +526,9 @@ static void scatter_uniform(Pool *pool, int n, double r_outer, const GridCtx *g)
 }
 
 /*
- * scatter_gauss (G) — Gaussian ring cluster.
- *
- * THE FORMULA:
- *   r = |Normal(r_cursor, sigma)|   [fabs keeps r positive]
- *   r clamped to R_INNER minimum
- *   θ ∈ [0, 2π) uniformly
+ * G style: cluster dots around the ring the cursor is on. Each dot's distance
+ * is a bell-curve pick centred on the cursor's radius, so most land near that
+ * ring and fewer stray away. The angle is fully random, so it's a fuzzy ring.
  */
 static void scatter_gauss(Pool *pool, int n, double r_cursor, double sigma,
                            const GridCtx *g)
@@ -670,11 +544,9 @@ static void scatter_gauss(Pool *pool, int n, double r_cursor, double sigma,
 }
 
 /*
- * scatter_wedge (W) — angular pie-slice filled uniformly.
- *
- * THE FORMULA:
- *   r ∈ [R_INNER, r_outer] uniformly (no area correction — fills the wedge)
- *   θ ∈ [theta_cursor − wedge_half, theta_cursor + wedge_half] uniformly
+ * W style: fill a pie slice aimed at the cursor's angle. The distance is just
+ * a flat random pick (no even-density trick here — we want the slice filled),
+ * and the angle is random but kept within wedge_half either side of the cursor.
  */
 static void scatter_wedge(Pool *pool, int n, double r_outer,
                            double theta_cursor, double wedge_half,
@@ -690,15 +562,16 @@ static void scatter_wedge(Pool *pool, int n, double r_outer,
     }
 }
 
-/* One symmetric ±RING_SNAP_JITTER radial jitter sample (≈ ±2 px). */
+/* A small random wobble, plus or minus RING_SNAP_JITTER, so snapped dots
+ * don't sit on a perfectly sharp ring. */
 static double ringsnap_jitter(void)
 {
     return ((double)rand()/(double)RAND_MAX - 0.5) * 2.0 * RING_SNAP_JITTER;
 }
 
-/* Place a single (r, θ) sample with R_INNER clamp into the polar→screen path.
- * Used by every ringsnap_* mode helper EXCEPT mode 6 (elliptic), which has
- * its own non-circular conversion. */
+/* Drop one dot at the given distance and angle, nudged outward if it landed
+ * too close to the centre. Every ring-snap style uses this except elliptic,
+ * which needs its own oval placement. */
 static void ringsnap_place_polar(Pool *pool, double r, double th, const GridCtx *g)
 {
     if (r < R_INNER) r = R_INNER;
@@ -707,7 +580,7 @@ static void ringsnap_place_polar(Pool *pool, double r, double th, const GridCtx 
     pool_place(pool, row, c, g->rows, g->cols, OBJ_GLYPH);
 }
 
-/* Mode 0 — linear rings: r = k × BG_RING_SP, θ uniform on [0, 2π). */
+/* Snap each dot onto one of the evenly-spaced rings, at a random angle. */
 static void ringsnap_rings_spokes(Pool *pool, int n, double r_outer, const GridCtx *g)
 {
     int n_rings = (int)(r_outer / BG_RING_SP);
@@ -720,7 +593,7 @@ static void ringsnap_rings_spokes(Pool *pool, int n, double r_outer, const GridC
     }
 }
 
-/* Mode 1 — log rings: r = BG_LOG_RMIN × e^(k × BG_LOG_RATIO). */
+/* Snap onto the log-polar rings, which sit further apart the further out. */
 static void ringsnap_log_polar(Pool *pool, int n, double r_outer, const GridCtx *g)
 {
     int n_rings = (int)(log(r_outer / BG_LOG_RMIN) / BG_LOG_RATIO);
@@ -733,7 +606,7 @@ static void ringsnap_log_polar(Pool *pool, int n, double r_outer, const GridCtx 
     }
 }
 
-/* Mode 2 — archimedean arm: r = (BG_ARCH_PITCH/2π)·t, θ = t. */
+/* Scatter dots along the archimedean spiral arm (distance grows with angle). */
 static void ringsnap_archimedean(Pool *pool, int n, double r_outer, const GridCtx *g)
 {
     double a     = BG_ARCH_PITCH / (2.0 * M_PI);
@@ -746,7 +619,7 @@ static void ringsnap_archimedean(Pool *pool, int n, double r_outer, const GridCt
     }
 }
 
-/* Mode 3 — log-spiral arm: r = BG_LOG_R0·e^(BG_LOG_GROWTH·t), θ = t. */
+/* Scatter dots along the log-spiral arm (the coils widen as they turn). */
 static void ringsnap_log_spiral(Pool *pool, int n, double r_outer, const GridCtx *g)
 {
     double t_max = log(r_outer / BG_LOG_R0) / BG_LOG_GROWTH;
@@ -759,7 +632,7 @@ static void ringsnap_log_spiral(Pool *pool, int n, double r_outer, const GridCtx
     }
 }
 
-/* Mode 4 — Vogel seeds: (r, θ) = (√i·BG_SEED_SP, i·GOLDEN_ANGLE) at random i. */
+/* Land each dot on a random sunflower seed position. */
 static void ringsnap_sunflower(Pool *pool, int n, double r_outer, const GridCtx *g)
 {
     int max_seed = (int)((r_outer / BG_SEED_SP) * (r_outer / BG_SEED_SP));
@@ -773,7 +646,7 @@ static void ringsnap_sunflower(Pool *pool, int n, double r_outer, const GridCtx 
     }
 }
 
-/* Mode 5 — equal-area rings: r = √k × BG_RUNIT, θ uniform on [0, 2π). */
+/* Snap onto the equal-area rings, at a random angle. */
 static void ringsnap_equal_area(Pool *pool, int n, double r_outer, const GridCtx *g)
 {
     int n_rings = (int)((r_outer * r_outer) / (BG_RUNIT * BG_RUNIT));
@@ -786,9 +659,9 @@ static void ringsnap_equal_area(Pool *pool, int n, double r_outer, const GridCtx
     }
 }
 
-/* Mode 6 — elliptic rings: e_r = k × BG_ELLIP_SP, then (dx, dy) = e_r·(A·cos, B·sin).
- * Bypasses ringsnap_place_polar because the screen conversion uses the ellipse axes,
- * not the standard polar→screen mapping. */
+/* Snap onto the oval elliptic rings. Does its own placement instead of the
+ * shared helper, because the screen position has to be squashed by the ellipse
+ * stretch factors rather than mapped as a plain circle. */
 static void ringsnap_elliptic(Pool *pool, int n, double r_outer, const GridCtx *g)
 {
     int n_rings = (int)(r_outer / BG_ELLIP_SP);
@@ -804,11 +677,9 @@ static void ringsnap_elliptic(Pool *pool, int n, double r_outer, const GridCtx *
 }
 
 /*
- * scatter_ringsnap (D) — objects snap to the ACTIVE grid's natural rings
- * (or arms / seeds) plus a small radial jitter.  Dispatches on g->mode to
- * one of seven ringsnap_* helpers so the dots line up with the visible
- * background (rings_spokes, log_polar, archimedean, log_spiral,
- * sunflower, equal_area, elliptic).
+ * D style: make the dots cling to whatever background is showing. It picks the
+ * matching ring-snap helper for the active background, so the dots land on its
+ * rings (or arms, or seeds) with just a little wobble, instead of floating free.
  */
 static void scatter_ringsnap(Pool *pool, int n, double r_outer,
                               const GridCtx *g)
@@ -824,11 +695,10 @@ static void scatter_ringsnap(Pool *pool, int n, double r_outer,
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 scene ── */
 
-/* Bright bold yellow status (top-right) + bold cyan key hints (bottom). */
+/* Draw the on-screen readouts: stats top-right, background name top-left,
+ * key hints along the bottom. */
 static void hud_draw(const GridCtx *g, const Pool *pool, const Cursor *cur,
                      int scatter_type, int n, double param,
                      int theme, double fps, bool paused)
@@ -867,9 +737,7 @@ static void scene_draw(const GridCtx *g, const Pool *pool, const Pool *preview,
     wnoutrefresh(stdscr); doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §10  screen                                                             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §10 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(int theme)
@@ -881,9 +749,7 @@ static void screen_init(int theme)
     srand((unsigned)time(NULL));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §11  app                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §11 app ── */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 static void on_signal(int s)
@@ -907,7 +773,8 @@ int main(void)
     Cursor  cur;     cursor_reset(&cur, &ctx);
 
     int     scatter_type = 0;   /* 0=U 1=G 2=W 3=D */
-    bool    dirty        = true;   /* regenerate preview before first draw */
+    bool    dirty        = true;   /* true = preview needs rebuilding; set so
+                                      the first frame already shows something */
     int     n_scat       = N_SCATTER_DEFAULT;
     double  sigma        = SIGMA_R_DEFAULT;
     double  wedge        = WEDGE_DEFAULT;
@@ -937,7 +804,7 @@ int main(void)
         case 't': theme = (theme+1) % N_THEMES; color_init(theme); break;
         case 'a':
             ctx_init(&ctx, (ctx.mode-1+N_BG_TYPES) % N_BG_TYPES, rows, cols);
-            dirty = true;   /* re-sample so any scatter visibly responds to bg */
+            dirty = true;   /* rebuild so ring-snap follows the new background */
             break;
         case 'e':
             ctx_init(&ctx, (ctx.mode+1) % N_BG_TYPES, rows, cols);
@@ -970,7 +837,9 @@ int main(void)
         case KEY_RIGHT: cursor_move(&cur, &ctx,  0, +1); dirty = true; break;
         }
 
-        /* regenerate preview only when cursor or params changed */
+        /* Rebuild the preview only when something changed — note that stamping
+         * (space) deliberately leaves dirty alone, so you can stamp the same
+         * pattern several times without it re-randomising. */
         if (dirty) {
             pool_clear(&preview);
             switch (scatter_type) {

@@ -1,142 +1,16 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 05_isometric_direct.c — direct object placement on iso (solid-fill) grid
+ * 05_isometric_direct.c — triangle grid where every tile is painted a solid
+ * colour, and you drop glyphs onto tiles with the arrow keys.
  *
- * DEMO: An equilateral lattice fills the screen, but every triangle is
- *       FILLED with a solid colour from a 6-cycle palette indexed by
- *       (col + 2·row + up) mod 6. Move '@' between triangles with arrow
- *       keys; SPACE toggles a glyph at the cursor triangle. Glyphs render
- *       in reverse video so they pop against the coloured fill. The
- *       palette cycle creates the characteristic "stacked cubes" iso look
- *       around every vertex.
+ * Six colours cycle around every shared corner, which tricks the eye into
+ * seeing a wall of stacked 3-D cubes. Arrows move the '@' cursor between
+ * triangles; SPACE toggles a glyph on the tile you're sitting on.
  *
- * Study alongside: grids/tri_grids/05_isometric.c (rasterizer + palette),
- *                  01_equilateral_direct.c (same Cursor + Pool, edge
- *                                           rendering instead of fills).
- *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, TRI_SIZE, MAX_OBJ, palette + pair IDs
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — N_PALETTE fill pairs + cursor / HUD / hint
- *   §4 gridctx  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg
- *                 + palette_index hash
- *   §5 pool     — Pool: place / remove / toggle / find / clear / draw
- *   §6 cursor   — Cursor + cursor_reset / cursor_move / cursor_draw
- *   §7 mode     — direct: SPACE toggles via pool_toggle
- *   §8 scene    — hud_draw + scene_draw
- *   §9 screen   — ncurses init / cleanup
- *  §10 app      — signals, main loop
- *
- * Keys:  arrows:move  spc:toggle  g:glyph  C:clear  r:reset
- *        +/-:size  t:theme  q/ESC:quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/05_isometric_direct.c \
- *       -o 05_isometric_direct -lncurses -lm
+ * Sister files: grids/tri_grids/05_isometric.c (the colour-fill grid on its
+ *               own); 01_equilateral_direct.c (same cursor + object pool, but
+ *               draws triangle edges instead of solid fills).
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Direct placement on the equilateral skew lattice with
- *                  solid-colour fills. The cursor holds (col, row, up);
- *                  SPACE toggles a glyph at that address. Each cell
- *                  colour comes from
- *                    palette_index = (col + 2·row + up) mod N_PALETTE.
- *                  Six neighbouring triangles around any vertex spell the
- *                  full palette cycle, producing the iso "cubes" illusion.
- *
- * Data-structure : Pool — flat array of Obj{col, row, up, glyph, alive}.
- *                  Removal swaps with last (O(1)). Capacity MAX_OBJ.
- *
- * GridContext    : GridCtx carries terminal extent, tri_size, CELL_W/H,
- *                  origin offsets ox/oy, plus convenience max_col/max_row
- *                  bounds. ctx_to_screen converts (col, row, up) → screen
- *                  cell via the centroid formula.
- *
- * Rendering      : Three-pass per frame:
- *                    (1) ctx_draw_bg paints every screen cell with the
- *                        triangle's palette colour as background.
- *                    (2) pool_draw renders glyphs in reverse video.
- *                    (3) cursor_draw places '@' at the cursor centroid.
- *
- * References     :
- *   Triangular tiling — https://en.wikipedia.org/wiki/Triangular_tiling
- *   Isometric projection — https://en.wikipedia.org/wiki/Isometric_projection
- *   Object pool pattern — gameprogrammingpatterns.com/object-pool.html
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Same address space as 01_equilateral_direct, different paint. The grid
- * is no longer drawn as edge characters; every screen cell is coloured
- * by which triangle owns it. Six colours cycle around every vertex, and
- * the eye recognises the cycle as 3-D cubes seen on edge.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine the equilateral tiling, but instead of inking the borders we
- * fill each tile with one of six paint cans, picked by a parity formula.
- * The cans are arranged so that every vertex (where 6 triangles meet)
- * gets all 6 colours in order. The eye reads three adjacent colours as
- * the top, left, and right faces of a cube; the tiling becomes a wall
- * of stacked cubes.
- *
- * DRAWING METHOD  (per frame)
- * ──────────────
- *  1. erase()
- *  2. ctx_draw_bg — for every screen cell:
- *       pixel_to_tri → (col, row, up)
- *       k = palette_index(col, row, up) = (col + 2·row + up) mod 6
- *       attron(COLOR_PAIR(PAIR_FILL_BASE + k))
- *       mvaddch(row, col, ' ')
- *  3. pool_draw — for each placed object, mvaddch(glyph) at its centroid
- *     screen cell using REVERSE on the cell's palette pair.
- *  4. cursor_draw — '@' on top.
- *
- * KEY FORMULAS
- * ────────────
- *  Pixel → lattice (skew inverse):
- *    h = size · √3 / 2
- *    b = py / h,   a = px / size - 0.5·b
- *    col = ⌊a⌋,    row = ⌊b⌋
- *    up  = (fa + fb ≥ 1) ? △ : ▽
- *
- *  Centroid lattice → pixel:
- *    ▽ centroid: a = col + 1/3, b = row + 1/3
- *    △ centroid: a = col + 2/3, b = row + 2/3
- *    px = (a + 0.5·b) · size,   py = b · h
- *
- *  Palette hash:
- *    palette_index(col, row, up) = (col + 2·row + up) mod N_PALETTE
- *
- *  Why (col + 2·row + up): walking RIGHT shifts k by +1; walking UP
- *  shifts k by +2; toggling up shifts k by +1. Six steps around a vertex
- *  → k advances 1+2+1+1+2+1 ≡ 0 (mod 6). The colour wheel closes
- *  exactly around every vertex.
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Cursor visibility: '@' draws over a coloured fill, so we draw it
- *    using the cell's palette pair plus A_REVERSE so the cursor is
- *    always visible no matter which palette slot is below.
- *  • Theme change recolours the whole field — but the (col,row,up)
- *    addresses of placed objects are unchanged. The same triangle may
- *    end up under a different fill colour.
- *  • Negative cells: palette_index uses a positive-modulo guard
- *    (`if (k < 0) k += N_PALETTE`) so that walking left of origin
- *    still yields valid pair IDs.
- *
- * HOW TO VERIFY
- * ─────────────
- *  Place a glyph; press 't' to cycle theme. The glyph stays at the same
- *  triangle but the surrounding fills shift. Walk one step in any
- *  cardinal direction: the colour under the cursor changes by exactly
- *  one slot of the palette.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -149,9 +23,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 
@@ -177,9 +49,7 @@
 
 static const char GLYPHS[N_GLYPHS] = { '*', 'o', '+', '#', 'X', '%' };
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -196,9 +66,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static const short PAL256[N_THEMES][N_PALETTE] = {
     /* warm  */ { 196, 214, 226, 118,  39, 129 },
@@ -217,7 +85,7 @@ static void color_init(int theme)
     use_default_colors();
     for (int i = 0; i < N_PALETTE; i++) {
         short bg = (COLORS >= 256) ? PAL256[theme][i] : PAL8[theme][i];
-        /* fg=black so the SPACE character is invisible — only background shows */
+        /* black text on a colour: we only ever print a space, so all you see is the fill */
         init_pair(PAIR_FILL_BASE + i, COLOR_BLACK, bg);
     }
     init_pair(PAIR_CURSOR, COLOR_WHITE, COLOR_BLACK);
@@ -225,24 +93,23 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx — GridCtx + pixel ↔ lattice + palette                       */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx ── */
 
 /*
- * GridCtx — geometry of the iso lattice plus cursor bounds.
+ * GridCtx — everything we need to know to place triangles on screen: how big
+ * the terminal is, how big each triangle should be, where the grid is centred,
+ * and how far the cursor is allowed to wander.
  *
- * tri_size lives here (not a global #define) so the rest of the file
- * never depends on a magic constant. The lattice is mathematically
- * unbounded; max_col/max_row exist only so cursor_move can clamp to a
- * sane visible region.
+ * The triangle size lives in here rather than a fixed #define so '+'/'-' can
+ * resize the grid at runtime. The grid itself goes on forever in theory;
+ * max_col/max_row just fence the cursor into the part you can actually see.
  */
 typedef struct {
-    int    rows, cols;            /* terminal extent */
-    int    cw, ch;                /* sub-pixel cell size (=CELL_W, CELL_H) */
-    double tri_size;              /* equilateral triangle side, pixels */
-    int    ox, oy;                /* screen origin (centring) */
-    int    max_col, max_row;      /* cursor clamp, axial extent */
+    int    rows, cols;            /* terminal size, in cells */
+    int    cw, ch;                /* how many sub-pixels one cell is worth (=CELL_W, CELL_H) */
+    double tri_size;              /* length of a triangle side, in pixels */
+    int    ox, oy;                /* screen cell the grid is centred on */
+    int    max_col, max_row;      /* how far the cursor may roam from centre */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols, double tri_size)
@@ -252,12 +119,12 @@ static void ctx_init(GridCtx *g, int rows, int cols, double tri_size)
     g->tri_size = tri_size;
     g->ox = cols / 2;
     g->oy = (rows - 1) / 2;
-    /* Half-screen worth of triangles each way is plenty for any motion. */
+    /* half a screen of triangles in each direction is plenty of room to move */
     g->max_col = cols / 2;
     g->max_row = rows / 2;
 }
 
-/* Pixel → lattice (skew inverse). */
+/* Given a point on screen, work out which triangle it lands in. */
 static void pixel_to_tri(double px, double py, double size,
                          int *col, int *row, int *up,
                          double *fa, double *fb)
@@ -273,7 +140,7 @@ static void pixel_to_tri(double px, double py, double size,
     *up = (*fa + *fb >= 1.0) ? 1 : 0;
 }
 
-/* Centroid of triangle (col, row, up) in pixel space. */
+/* Find the middle point of a given triangle, in screen pixels. */
 static void tri_centroid_pixel(int col, int row, int up, double size,
                                double *cx, double *cy)
 {
@@ -284,7 +151,7 @@ static void tri_centroid_pixel(int col, int row, int up, double size,
     *cy = b * h;
 }
 
-/* (col, row, up) → screen cell, given GridCtx centring + tri_size. */
+/* Turn a triangle address into the screen cell to draw its marker in. */
 static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
                           int *scol, int *srow)
 {
@@ -295,14 +162,12 @@ static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
 }
 
 /*
- * palette_index — assign each triangle a 6-cycle colour slot.
+ * Pick which of the six colours a triangle gets.
  *
- *   k = (col + 2·row + up) mod N_PALETTE
- *
- * The "·2" gives different colours to triangles in adjacent strips at
- * the same column; the "+up" gives different colours to ▽ vs △ in the
- * same rhombus. Around any vertex the 6 distinct slots appear in cyclic
- * order — the visual signature of an isometric "stack of cubes".
+ * The mix of column, row, and up/down is tuned so that the six triangles
+ * meeting at any shared corner each get a different colour, going round in
+ * order. That repeating ring of colours is what fools the eye into seeing
+ * stacked cubes. The mod keeps the answer in 0..5 even left of the origin.
  */
 static int palette_index(int col, int row, int up)
 {
@@ -312,10 +177,8 @@ static int palette_index(int col, int row, int up)
 }
 
 /*
- * ctx_draw_bg — paint the iso solid-fill background.
- *
- * Per-pixel raster scan: identify the triangle owning each cell and
- * paint it with that triangle's palette colour as background.
+ * Paint the whole grid: for every cell on screen, figure out which triangle
+ * covers it and colour the cell with that triangle's colour.
  */
 static void ctx_draw_bg(const GridCtx *g)
 {
@@ -334,16 +197,26 @@ static void ctx_draw_bg(const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool ── */
 
+/*
+ * Obj — one glyph the user dropped on a triangle.
+ *   col, row, up — which triangle it sits on
+ *   glyph        — the character to draw there
+ *   alive        — whether this slot is in use (false slots are skipped)
+ */
 typedef struct {
     int  col, row, up;
     char glyph;
     bool alive;
 } Obj;
 
+/*
+ * Pool — the bag of placed glyphs, kept in a plain fixed array so we never
+ * allocate memory while running. Holds up to MAX_OBJ; count is how many are
+ * actually in use. Deleting one moves the last item into the gap, so the live
+ * items always sit packed at the front.
+ */
 typedef struct {
     Obj items[MAX_OBJ];
     int count;
@@ -398,18 +271,29 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 cursor ── */
 
+/*
+ * Cursor — where the '@' is and what the user has chosen.
+ *   col, row, up — which triangle the cursor is on
+ *   glyph_idx    — which glyph SPACE will drop (index into GLYPHS)
+ *   theme        — which colour set is active
+ *   paused       — set by 'p'; shown in the HUD
+ */
 typedef struct {
-    int col, row, up;             /* lattice address */
+    int col, row, up;
     int glyph_idx;
     int theme;
     int paused;
 } Cursor;
 
-/* TRI_DIR — (Δcol, Δrow, target_up) per arrow direction, indexed by current up. */
+/*
+ * Where each arrow key takes you. Moving between triangles isn't a simple
+ * "one cell over": stepping out of an up-pointing triangle lands you somewhere
+ * different than stepping out of a down-pointing one. So this table is looked
+ * up by both the arrow pressed and which way the current triangle points, and
+ * gives back how much to shift column/row and which way the new triangle faces.
+ */
 static const int TRI_DIR[4][2][3] = {
     /* LEFT  */ { { -1,  0,  1 }, {  0,  0,  0 } },
     /* RIGHT */ { {  0,  0,  1 }, { +1,  0,  0 } },
@@ -447,20 +331,16 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     attroff(COLOR_PAIR(pair) | A_BOLD | A_REVERSE);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  mode — direct: SPACE toggles via pool_toggle                        */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 mode ── */
 
 static void mode_toggle_at_cursor(Pool *p, const Cursor *cur)
 {
     pool_toggle(p, cur->col, cur->row, cur->up, GLYPHS[cur->glyph_idx]);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 scene ── */
 
-/* Bright bold yellow fps readout (top-right) + bold cyan key hints (bottom). */
+/* The status line (cursor info + fps, top-right) and the key hints (bottom). */
 static void hud_draw(const GridCtx *g, const Cursor *cur, const Pool *p,
                      double fps)
 {
@@ -492,9 +372,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, const Pool *p,
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -509,9 +387,7 @@ static void screen_init(int theme)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §10 app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §10 app ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;

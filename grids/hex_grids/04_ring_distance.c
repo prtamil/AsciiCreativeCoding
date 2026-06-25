@@ -1,138 +1,14 @@
 /*
- * 04_ring_distance.c — hex ring-distance coloring with movable '@' cursor
+ * 04_ring_distance.c — color a hex grid by how far each hex is from a movable '@'.
  *
- * DEMO: Every hex is colored by its ring distance from the '@' cursor.
- *       Ring 0 = cursor (white); ring 1 = 6 neighbours (cyan); etc.
- *       Move the cursor with arrow keys and watch the color rings follow.
+ * Every hex is tinted by its "ring distance" from the cursor: the fewest
+ * single-hex steps to walk there. The cursor is ring 0, its 6 neighbours are
+ * ring 1, and so on, so the colors form concentric hexagon rings that follow
+ * the cursor as you move it with the arrow keys.
  *
- * Study alongside: grids/hex_grids/01_flat_top.c (same Cursor + HEX_DIR)
- *
- * Section map:
- *   §1 config   — tunable constants, ring palette size, EWMA alpha
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — ring color pairs + CURSOR + HUD + HINT
- *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_pixel_to_axial /
- *                 ctx_draw_bg + cube_round + cube_dist + angle_char
- *   §5 cursor   — Cursor + cursor_reset / cursor_move / cursor_draw, HEX_DIR
- *   §6 scene    — hud_draw + scene_draw
- *   §7 screen   — ncurses display layer
- *   §8 app      — signals, resize, main loop
- *
- * Keys:  q/ESC quit  p pause  r reset  arrows move  +/-:size  [/]:border
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/hex_grids/04_ring_distance.c \
- *       -o 04_ring_distance -lncurses -lm
+ * Sister file: grids/hex_grids/01_flat_top.c (shares the Cursor + HEX_DIR setup).
+ * Hex distance and ring math: https://www.redblobgames.com/grids/hexagons/#distances
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Ring distance = max(|ΔQ|,|ΔR|,|ΔS|) = (|ΔQ|+|ΔR|+|ΔS|)/2.
- *                  Counts minimum hex steps between two hexes.
- *                  Ring k has exactly 6k hexes (k>0); ring 0 = 1 hex.
- *
- * Data-structure : Same GridCtx + Cursor as 01_flat_top — no grid array,
- *                  every pixel recomputes its ring distance from the cursor
- *                  each frame. Moving the cursor is O(1); the entire ring
- *                  recolor is implicit in the next frame.
- *
- * Cursor movement : HEX_DIR[4][2] same as 01. Cursor moves in O(1); the
- *                  entire grid recolors instantly since distance is recomputed
- *                  per-cell each frame.
- *
- * Rendering      : Interior cells (dist < limit) filled with a colored space
- *                  so ring bands show background color, making the pattern vivid.
- *                  Border cells drawn with ring color + bold.
- *
- * References     :
- *   Hex distance — https://www.redblobgames.com/grids/hexagons/#distances
- *   Ring counts  — https://www.redblobgames.com/grids/hexagons/#rings
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * In a hex grid, the "ring distance" between two hexes is the minimum number
- * of single-hex steps to walk from one to the other. This is the hex analogue
- * of Manhattan distance in a rectangular grid, but for hexagons. Because each
- * hex has 6 neighbours, the set of hexes at ring distance exactly k forms a
- * hexagonal ring with 6k members — the hexagonal version of a circle.
- *
- * The cube distance formula computes this in O(1) without any graph traversal:
- *   ring = max(|ΔQ|, |ΔR|, |ΔS|)
- *        = (|ΔQ| + |ΔR| + |ΔS|) / 2    (both forms are equivalent)
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Picture concentric hexagonal rings painted on the floor, each one a
- * different color, centered on the cursor hex. The cursor is ring 0 (white).
- * The 6 immediate neighbors are ring 1 (cyan). The next 12 hexes are ring 2
- * (green), then ring 3 (yellow), etc. Moving the cursor moves the entire
- * color pattern instantly — no animation, just a recompute per frame.
- *
- * The visual is striking because the hex grid's isotropy shows clearly:
- * every ring is a perfect "circle" in hex geometry, even though it looks
- * like a concentric hexagon on screen.
- *
- * The coloring of INTERIOR cells (not just borders) is key to seeing the
- * rings. If only border cells are colored, you see lines; filling the
- * interior means each ring band shows a solid color.
- *
- * DRAWING METHOD  (extends 01_flat_top with interior fill + ring color)
- * ──────────────────────────────────────────────────────────────────────
- *  Same per-pixel pipeline as 01_flat_top up through cube_round and dist.
- *
- *  Then:
- *  1. Compute ring = cube_dist(Q, R, cur->q, cur->r) using the cursor.
- *  2. Select color pair:
- *       ring == 0 → PAIR_CURSOR (white-on-blue)
- *       ring  > 0 → PAIR_RING + (ring % N_RING_COLORS)  (cycles)
- *  3. Interior cells (dist < limit): draw a SPACE in the ring color.
- *     This fills the hex's background with the ring color.
- *  4. Border cells (dist ≥ limit): draw angle_char with bold ring color.
- *
- * KEY FORMULAS
- * ────────────
- *  Ring distance between cursor (cQ,cR) and hex (Q,R):
- *    ΔQ = Q − cQ,  ΔR = R − cR,  ΔS = −ΔQ − ΔR
- *    ring = max(|ΔQ|, |ΔR|, |ΔS|)
- *         = (|ΔQ| + |ΔR| + |ΔS|) / 2
- *
- *  Number of hexes at ring distance k:
- *    k == 0: 1 hex (cursor itself)
- *    k >= 1: 6k hexes (hexagonal ring)
- *    Total hexes within distance k: 1 + 6*(1+2+...+k) = 3k²+3k+1
- *
- *  Color cycling: color index = ring % N_RING_COLORS
- *    Rings 0,6,12,... → white (PAIR_CURSOR)
- *    Rings 1,7,13,... → cyan
- *    Rings 2,8,14,... → green
- *    etc.
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Interior fill uses ' ' (space), which sets the BACKGROUND color not the
- *    foreground. You MUST use the COLOR_PAIR attribute so the background color
- *    of the space is the ring color.
- *
- *  • Ring distance is always an integer; the mod % N_RING_COLORS is safe for
- *    all non-negative ring values. ring == 0 is special-cased for the cursor.
- *
- *  • Cursor movement recolors the ENTIRE grid each frame since every hex's
- *    ring distance changes. This is O(rows×cols) per frame — intentionally so.
- *    No caching is needed because the frame budget easily covers it.
- *
- * HOW TO VERIFY  (80×24 terminal, HEX_SIZE=14, cursor at (0,0))
- * ─────────────
- *  Hex (0,0): ring = max(0,0,0) = 0 → PAIR_CURSOR (white-on-blue). ✓
- *  Hex (1,0): ΔQ=1, ΔR=0, ΔS=−1 → ring = max(1,0,1) = 1 → PAIR_RING+1 (cyan). ✓
- *  Hex (2,0): ΔQ=2 → ring = 2 → green. ✓
- *  Hex (1,1): ΔQ=1, ΔR=1, ΔS=−2 → ring = max(1,1,2) = 2 → green. ✓
- *    (Confirms that (1,1) and (2,0) are both ring 2 — they're equidistant.)
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -147,9 +23,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define CELL_W             2
 #define CELL_H             4
@@ -164,16 +38,14 @@
 #define BORDER_W_MAX       0.35
 #define BORDER_W_STEP      0.02
 
-#define N_RING_COLORS      6   /* palette cycles after this many rings */
+#define N_RING_COLORS      6   /* colors repeat once you pass this many rings */
 
 #define TICK_NS           16666667LL
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How much each frame nudges the on-screen FPS number; small = steadier reading. */
 #define FPS_EWMA_ALPHA     0.05
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -189,12 +61,10 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&ts, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
-#define PAIR_RING    1   /* 1..N_RING_COLORS for rings 0..N-1, then wrap */
-#define PAIR_CURSOR  7   /* cursor hex overlay */
+#define PAIR_RING    1   /* one color per ring; rings beyond the palette reuse these */
+#define PAIR_CURSOR  7   /* the hex the '@' sits on */
 #define PAIR_HUD     8   /* yellow status bar */
 #define PAIR_HINT    9   /* cyan key-hint footer */
 
@@ -214,24 +84,26 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx and the hex ↔ screen mapping (flat-top)           */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula — turn screen cells into hexes, then measure ring distance ── */
 
-/* GridCtx — geometry of the active flat-top hex grid (with ring coloring). */
+/*
+ * GridCtx — everything we need to lay flat-top hexagons over the terminal.
+ * One of these is filled in at startup (and on resize / size changes) and then
+ * read by every drawing routine; nothing here changes during a single frame.
+ */
 typedef struct {
-    /* terminal extent */
+    /* Terminal size in character cells. */
     int rows, cols;
 
-    /* hex geometry */
-    double hex_size;
-    double border_w;
-    int    cell_w, cell_h;
+    /* Hex shape and placement. */
+    double hex_size;        /* radius of a hex, in sub-cell pixels; bigger = fewer, larger hexes */
+    double border_w;        /* fraction of a hex treated as edge rather than fill, 0..0.5 */
+    int    cell_w, cell_h;  /* sub-pixels per character cell, so squares look square */
 
-    /* screen origin = pixel (0,0) */
+    /* Where hex (0,0) lands — roughly the middle of the screen. */
     int    ox, oy;
 
-    /* cursor bounds in axial space (advisory) */
+    /* Rough count of how many hexes fit each way; only a sizing hint. */
     int    max_q, max_r;
 } GridCtx;
 
@@ -259,7 +131,7 @@ static void ctx_to_screen(const GridCtx *g, int Q, int R, int *sr, int *sc)
     *sr = g->oy + (int)(cy_pix / g->cell_h);
 }
 
-/* cube_round — see 01_flat_top for full documentation. */
+/* Snaps a fractional hex coordinate to the nearest real hex. See 01_flat_top. */
 static void cube_round(double fq, double fr, double fs, int *Q, int *R)
 {
     int rq = (int)round(fq), rr = (int)round(fr), rs = (int)round(fs);
@@ -284,25 +156,10 @@ static void ctx_pixel_to_axial(const GridCtx *g, int sr, int sc, int *Q, int *R)
 }
 
 /*
- * cube_dist — cube/ring distance between hex (Q,R) and hex (cQ,cR).
- *
- * Pure math helper — keeps its domain name.
- *
- * THE FORMULA:
- *   ΔQ = Q − cQ,  ΔR = R − cR,  ΔS = −ΔQ − ΔR   (S = −Q−R always)
- *   ring = max(|ΔQ|, |ΔR|, |ΔS|)
- *
- * EQUIVALENT FORM:
- *   ring = (|ΔQ| + |ΔR| + |ΔS|) / 2
- *   Both forms give the same integer result. The max form is slightly
- *   faster (no division); the sum form is more intuitive.
- *
- * WHY IT WORKS:
- *   In cube space, each axis (Q, R, S) constrains one "dimension" of
- *   motion. Moving diagonally in screen space changes two cube axes by
- *   ±1 simultaneously (but the third adjusts to maintain Q+R+S=0).
- *   The maximum component gives the minimum number of steps because you
- *   can always move diagonally to reduce two components at once.
+ * The fewest hex steps from one hex to another — the "ring distance" that
+ * drives all the coloring. Hexes use three axes (Q, R, and S = -Q-R) that
+ * always sum to zero; the biggest gap along any one axis is the answer,
+ * because you can shrink two axes at once by stepping diagonally.
  */
 static int cube_dist(int Q, int R, int cQ, int cR)
 {
@@ -311,7 +168,7 @@ static int cube_dist(int Q, int R, int cQ, int cR)
     return a > b ? (a > c ? a : c) : (b > c ? b : c);
 }
 
-/* angle_char — same as 01_flat_top. */
+/* Picks an ASCII slash/bar to draw a hex edge at the given tilt. See 01_flat_top. */
 static char angle_char(double theta)
 {
     double t = fmod(theta, M_PI);
@@ -324,28 +181,11 @@ static char angle_char(double theta)
 }
 
 /*
- * ctx_draw_bg — rasterize flat-top hex grid with ring-distance coloring.
- *
- * THE PIPELINE (extends 01_flat_top with interior fill and ring color):
- *
- *   pixel → cube → nearest hex (Q,R)  [same as 01_flat_top]
- *      │
- *      ▼  Compute ring distance from cursor
- *   ring = cube_dist(Q, R, cQ, cR)
- *   pair = (ring==0) ? PAIR_CURSOR : PAIR_RING + (ring % N_RING_COLORS)
- *      │
- *      ├── dist < limit (interior):
- *      │     Draw ' ' (space) with ring's COLOR_PAIR.
- *      │     The space's BACKGROUND fills the hex interior with ring color.
- *      │
- *      └── dist ≥ limit (border):
- *            Draw angle_char with bold ring color.
- *            The entire hex border glows in its ring's color.
- *
- * WHY FILL INTERIOR:
- *   If only border cells are drawn, the ring bands appear as colored outlines
- *   with black gaps between them. Filling the interior makes each ring a solid
- *   colored region — the concentric-hexagon pattern becomes obvious.
+ * Paints the whole grid for one frame. For each screen cell it works out which
+ * hex it belongs to, measures that hex's ring distance from the cursor, and
+ * colors it. We fill the inside of each hex (not just its outline) so each ring
+ * shows as a solid color band — otherwise you'd see thin colored rings with
+ * black gaps and the pattern would be hard to read.
  */
 static void ctx_draw_bg(const GridCtx *g, int cQ, int cR)
 {
@@ -385,12 +225,12 @@ static void ctx_draw_bg(const GridCtx *g, int cQ, int cR)
             int attr = COLOR_PAIR(pair);
 
             if (dist < limit) {
-                /* Interior: fill with ring background color */
+                /* Inside the hex: a colored space paints the background solid. */
                 attron(attr);
                 mvaddch(row, col, ' ');
                 attroff(attr);
             } else {
-                /* Border: ring-colored character */
+                /* On a hex edge: draw a slash in the ring's color. */
                 double cx = size * 1.5 * fQ;
                 double cy = size * (sq3_2 * fQ + sq3 * fR);
                 double theta = atan2(py - cy, px - cx);
@@ -403,12 +243,12 @@ static void ctx_draw_bg(const GridCtx *g, int cQ, int cR)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 cursor ── */
 
 /*
- * Cursor — just (q, r) in axial hex space. Same struct as 01_flat_top.
+ * Cursor — which hex the '@' is on, named by its two hex coordinates (q, r).
+ * That's all the state we keep; every ring color is recomputed from it each
+ * frame, so moving the cursor instantly recolors the whole grid.
  */
 typedef struct { int q, r; } Cursor;
 
@@ -420,12 +260,9 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
 }
 
 /*
- * HEX_DIR — 4-direction axial movement (same table as 01–03).
- *
- * Effect on ring pattern:
- *   Moving RIGHT (Q+1): ring-0 hex shifts east; rings re-center instantly.
- *   Moving DOWN  (R+1): ring-0 hex shifts lower-right; rings follow.
- * The entire gradient redraws per frame — no caching needed.
+ * HEX_DIR — the (q, r) step each arrow key adds to the cursor. Same table
+ * as 01–03. Each move shifts where the rings are centered, and the next frame
+ * redraws them around the new spot.
  */
 static const int HEX_DIR[4][2] = {
     { 0, -1 },   /* UP    */
@@ -441,11 +278,7 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dq, int dr)
     cur->r += dr;
 }
 
-/*
- * cursor_draw — '@' at cursor hex center, drawn on top of ring fill.
- *
- * Drawn after ctx_draw_bg so '@' is on top of the ring fill at the cursor hex.
- */
+/* Stamps the '@' on the cursor hex. Called after the grid fill so it sits on top. */
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc;
@@ -457,9 +290,7 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, int paused, double fps)
 {
@@ -489,9 +320,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, int paused, double f
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -505,9 +334,7 @@ static void screen_init(void)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;

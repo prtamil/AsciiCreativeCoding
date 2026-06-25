@@ -1,153 +1,20 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 06_sector.c — equal-area polar sector grid
+ * 06_sector.c — a polar grid where every cell covers the same area.
  *
- * DEMO: Rings are placed at r_k = √k × R_UNIT so that each annular band
- *       (between consecutive rings) has the same area — like a bullseye
- *       target where every ring is equally "hard to hit".  Combined with
- *       uniform angular sectors the result is a grid where every cell covers
- *       the same area.  An '@' cursor sits at one (ring, spoke) cell — arrows
- *       step it across the grid.  +/- adjusts unit radius; [/] sector count.
+ * Rings get packed tighter as you go out (spacing follows √k) so each band
+ * between two rings has the same area — like a dartboard where every ring is
+ * equally hard to hit.  Mix that with even pie-slice sectors and every cell is
+ * the same size.  An '@' marker sits on one cell; arrows move it, +/- changes
+ * the ring spacing, [/] changes the number of sectors.
  *
- * Study alongside: 01_rings_spokes.c (linear rings — unequal area),
- *                  02_log_polar.c (log rings — equal log-area),
- *                  ../rect_grids/01_uniform_rect.c (the GridCtx template)
+ * Sister files: 01_rings_spokes.c (evenly-spaced rings — outer cells bigger),
+ *               02_log_polar.c (log-spaced rings), ../rect_grids/01_uniform_rect.c.
  *
- * Section map:
- *   §1 config   — R_UNIT, sector count, themes, EWMA
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — theme-switchable PAIR_GRID + HUD/HINT/CURSOR
- *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg + angle_char
- *   §5 cursor   — Cursor (ring, spoke) + cursor_reset / cursor_move / cursor_draw
- *   §6 scene    — hud_draw + scene_draw
- *   §7 screen   — ncurses init / cleanup
- *   §8 app      — signals, resize, main loop
- *
- * Keys:  q/ESC quit   p pause   t theme   r reset
- *        arrows move @   +/- unit radius   [/] sector count
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/polar_grids/06_sector.c \
- *       -o 06_sector -lncurses -lm
+ * The "same area per cell" idea shows up in real tools: HEALPix maps the sky
+ * into equal-area pixels (Górski et al. 2005, ApJ 622:759), and camera sensors
+ * bin pixels this way so each bin catches the same amount of light.
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Equal-area ring placement.  The k-th ring is at:
- *
- *                    r_k = √k × R_UNIT
- *
- *                  The annular area between ring k and ring k+1 is:
- *                    π × r_{k+1}² − π × r_k²
- *                    = π × R_UNIT² × ((k+1) − k) = π × R_UNIT²
- *
- *                  Constant!  Every annular band has area π×R_UNIT².
- *
- *                  Detection: for a cell with radius r_px, the continuous ring
- *                  index is k_float = (r_px / R_UNIT)².  We test whether k_float
- *                  is near an integer:
- *
- *                    frac = k_float − floor(k_float)
- *                    on_ring: frac < RING_W_F || frac > 1 − RING_W_F
- *
- *                  RING_W_F is a fractional threshold in "ring-index² space".
- *                  The visual ring width grows with radius (∝ √r) because
- *                  d(r²)/dr = 2r — a fixed Δ(k_float) maps to larger Δr at
- *                  larger r.  This keeps all rings visually present without
- *                  becoming invisible at large radii.
- *
- * Data-structure : Two structs — GridCtx (terminal extent, R_UNIT, n_sectors,
- *                  ox/oy) and Cursor (linear ring index, sector index).
- *                  ctx_to_screen places (ring, spoke) at the equal-area
- *                  midpoint √(ring + 0.5) × R_UNIT and the angular midpoint
- *                  (spoke + 0.5) × 2π/N_SECTORS.
- *
- * Math           : Sector detection is identical to 01_rings_spokes: divide
- *                  [0, 2π) into N_SECTORS equal wedges of width 2π/N_SECTORS
- *                  and use the same fmod spoke test.
- *
- *                  Equal-area grids appear in:
- *                    • HEALPix (astronomy): equal-area pixels on the sphere
- *                    • Camera sensor binning: equal photon counts per cell
- *                    • Polling / bin statistics: each bin equally informative
- *
- * Rendering      : angle_char() gives the tangent direction for rings;
- *                  the same character for sector lines.  Ring/sector
- *                  intersections use '+'.
- *
- * Performance    : O(rows × cols) per frame with one sqrt per cell (for
- *                  r_px) plus a squaring r_px² / R_UNIT² — no extra log().
- *
- * References     :
- *   Equal-area projection — en.wikipedia.org/wiki/Equal-area_map
- *   HEALPix equal-area tessellation — Górski et al. 2005, ApJ 622:759
- *   Area of annulus — en.wikipedia.org/wiki/Annulus_(mathematics)
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ──────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- *   Rings are placed at r_k = √k × R_UNIT so that each annular band has the
- *   same area: π × R_UNIT².  Combined with uniform angular sectors, every grid
- *   cell covers the same area — the standard equal-area polar grid.  Cursor
- *   address (ring k, spoke s) maps to the equal-area midpoint of cell (k, s).
- *
- * HOW TO THINK ABOUT IT
- *   A dartboard where each ring should be equally likely to be hit needs equal-
- *   area rings.  Linear spacing (01) makes outer rings larger → hit more often.
- *   The √k spacing equalises the probability.  Visually: inner rings are closer
- *   together (small Δr), outer rings farther apart — softer growth than log (02).
- *
- *   Detection: map r to "ring index squared" k_float = (r/R_UNIT)².  If k_float
- *   is near an integer, the cell is near ring k = floor(k_float).
- *
- * DRAWING METHOD
- *   1. dx = (col−ox)×CELL_W,  dy = (row−oy)×CELL_H
- *   2. r = √(dx²+dy²),  θ = atan2(dy,dx)
- *   3. If r < R_MIN: skip
- *   4. k_float = (r / R_UNIT)²             ← continuous ring index in k² space
- *   5. frac = k_float − floor(k_float)     ← position within current ring interval
- *   6. on_ring = (frac < RING_W_F || frac > 1 − RING_W_F)
- *   7. Sector test same as 01 spoke test.
- *   8. Draw intersection/ring/sector/skip.
- *
- * KEY FORMULAS
- *   Ring placement: r_k = √k × R_UNIT
- *     Equal-area proof: annular area from r_{k−1} to r_k
- *       = π r_k² − π r_{k−1}² = π R_UNIT²(k − (k−1)) = π R_UNIT²  (constant) ✓
- *
- *   Ring detection: k_float = (r / R_UNIT)²
- *     If r = r_k then k_float = k exactly (integer → frac=0 → on_ring).
- *
- *   Cursor → screen (ring k, sector s):
- *     mid_radius = √(k + 0.5) × R_UNIT     (equal-area midpoint)
- *     theta_mid  = (s + 0.5) × (2π / N_SECTORS)
- *     cx = mid_radius × cos theta_mid;  cy = mid_radius × sin theta_mid
- *
- *   Adaptive pixel width:
- *     dk = RING_W_F.  dr = r × dk (from d(r²/R_UNIT²)/dr = 2r/R_UNIT²).
- *     Outer rings are wider in pixels — they remain visible at large radii.
- *
- * EDGE CASES TO WATCH
- *   • r=0: k_float=0 → frac=0 → always on_ring.  Guard with R_MIN.
- *   • SECTOR_MIN_R: prevents smeared disc at origin for sector lines.
- *   • RING_W_F ≥ 0.5: every cell becomes "on_ring".  Keep < 0.3.
- *   • Cursor max_ring re-derived in ctx_init from current R_UNIT.
- *
- * HOW TO VERIFY
- *   R_UNIT=18px, ox=40, oy=12.  Rings at r_k = 18√k px:
- *     k=1: 18px,  k=2: 25.5px,  k=4: 36px,  k=9: 54px.
- *
- *   Cell (col=49, row=12): dx=(49−40)×2=18, dy=0  →  r=18px
- *     k_float = (18/18)² = 1.000  →  frac=0 < RING_W_F(0.06)  →  on_ring ✓
- *     θ=0  →  angle_char(0) = '-'  ✓
- *
- *   Cell (col=53, row=12): dx=(53−40)×2=26, dy=0  →  r=26px
- *     k_float = (26/18)² = 2.087  →  frac=0.087 > RING_W_F(0.06)
- *     NOT on_ring  (between ring 2 at 25.5px and ring 3 at 31.2px)  ✓
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
@@ -164,34 +31,33 @@
 #  define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS      30
 #define CELL_W          2
 #define CELL_H          4
 
-/* Unit radius: r_1 = R_UNIT (innermost ring).  Each ring k is at √k × R_UNIT. */
+/* Size of the innermost ring.  The first ring sits here, and each ring out is
+ * spaced by √k of this so the bands all come out equal-area. */
 #define R_UNIT_DEFAULT  18.0
 #define R_UNIT_MIN       6.0
 #define R_UNIT_MAX      40.0
 #define R_UNIT_STEP      2.0
 
-/* Fractional width of a ring in k² space (k_float = (r/R_UNIT)²) */
+/* How wide a ring is allowed to look when we draw it.  Bigger = thicker rings. */
 #define RING_W_F        0.06
 
 /* Sectors */
 #define N_SECTORS_DEFAULT  12
 #define N_SECTORS_MIN       4
 #define N_SECTORS_MAX      36
-#define SECTOR_W           0.10   /* radian half-width of a sector boundary */
+#define SECTOR_W           0.10   /* how thick each sector line is, in radians */
 #define SECTOR_MIN_R       3.0
 
-/* Minimum radius — avoid centre smear */
+/* Ignore anything closer than this to the centre — keeps it from smearing. */
 #define R_MIN            3.0
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How fast the on-screen fps number reacts; small = smooth, slow to change. */
 #define FPS_EWMA_ALPHA   0.05
 
 #define PAIR_GRID    1
@@ -208,9 +74,7 @@ static const short THEME_FG[][2] = {
 };
 #define N_THEMES 5
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -225,9 +89,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static void color_init(int theme)
 {
@@ -239,36 +101,27 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,  -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx and the equal-area ring/sector ↔ screen mapping  */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula — turn a (ring, sector) address into a screen spot, and back ── */
 
 /*
- * GridCtx — equal-area sector geometry plus cursor bounds.
- *
- * r_unit = innermost ring radius; rings at r_k = √k × r_unit.
- * n_spokes (called n_sectors in the file's prose) = angular wedges.
- * max_ring = floor((r_visible / r_unit)² − 0.5).
+ * GridCtx — everything we need to know to draw the grid and place the cursor:
+ * the terminal size, how the rings are spaced, how many sectors, where the
+ * centre is, and how far the cursor is allowed to roam.
  */
 typedef struct {
     int rows, cols;
 
-    double r_unit;         /* unit radius (pixels)                          */
-    int    n_spokes;       /* number of equal-area angular sectors          */
-    int    cell_w, cell_h;
+    double r_unit;         /* size of the innermost ring, in pixels         */
+    int    n_spokes;       /* how many pie-slice sectors                     */
+    int    cell_w, cell_h; /* pixels packed into one character cell          */
 
-    int    ox, oy;
+    int    ox, oy;         /* centre of the grid, in character cells         */
 
-    int    max_ring, max_spoke;
+    int    max_ring, max_spoke; /* furthest ring/sector the cursor can reach */
 } GridCtx;
 
-/*
- * ctx_init — derive geometry from terminal size.
- *
- * For a sample at the equal-area centre of (ring k, spoke s):
- *   mid_radius = √(k + 0.5) × r_unit ≤ r_visible
- *   k_max      = floor((r_visible / r_unit)² − 0.5)
- */
+/* Recompute the centre and how far out the rings fit, from the terminal size.
+ * Called again on resize and whenever the ring spacing changes. */
 static void ctx_init(GridCtx *g, int rows, int cols)
 {
     g->rows   = rows;
@@ -293,19 +146,9 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->max_spoke = g->n_spokes - 1;
 }
 
-/*
- * ctx_to_screen — equal-area centre of (ring k, sector s).
- *
- * THE FORMULA:
- *   mid_radius = √(k + 0.5) × r_unit       (equal-area midpoint of annulus k)
- *   theta_mid  = (s + 0.5) × (2π / n_spokes)
- *   cx = mid_radius × cos theta_mid;  cy = mid_radius × sin theta_mid
- *   sc = ox + (int)round(cx / CELL_W);  sr = oy + (int)round(cy / CELL_H)
- *
- * The √(k+0.5) midpoint splits the annular area in two equal halves —
- * the natural centre for an equal-area cell, just as the arithmetic
- * midpoint splits a uniform-spaced annulus in 01_rings_spokes.
- */
+/* Find the screen spot at the middle of cell (ring, sector).  We aim for the
+ * point that splits the cell into two equal-area halves, then convert that
+ * pixel position into a row and column. */
 static void ctx_to_screen(const GridCtx *g, int ring, int spoke,
                           int *sr, int *sc)
 {
@@ -317,14 +160,8 @@ static void ctx_to_screen(const GridCtx *g, int ring, int spoke,
     *sr = g->oy + (int)round(cy / (double)g->cell_h);
 }
 
-/*
- * angle_char — pick the ASCII line character that best matches orientation theta.
- *
- * THE FORMULA:
- *   a = fmod(theta + 2π, π)  ← fold into [0, π) (orientation, not direction)
- *   a ∈ [0, π/8) or [7π/8, π) → '-';  a ∈ [π/8, 3π/8) → '\'
- *   a ∈ [3π/8, 5π/8) → '|';          a ∈ [5π/8, 7π/8) → '/'
- */
+/* Pick the line character that best points along a given angle:
+ * -, \, |, or /.  Direction up vs down doesn't matter, only the slant. */
 static char angle_char(double theta)
 {
     double a = fmod(theta + 2.0*M_PI, M_PI);
@@ -334,19 +171,8 @@ static char angle_char(double theta)
     return '/';
 }
 
-/*
- * ctx_draw_bg — sweep every cell, apply equal-area ring and sector tests, draw.
- *
- * THE PIPELINE:
- *   for each cell:
- *     dx = (col−ox)×CELL_W,  dy = (row−oy)×CELL_H
- *     r  = √(dx²+dy²),  θ = atan2(dy,dx);  if r < R_MIN: skip
- *     k_float = (r / r_unit)²           continuous ring index in k² space
- *     frac    = k_float − floor(k_float)
- *     on_ring = frac < RING_W_F  ||  frac > 1 − RING_W_F
- *     on_sector = same fmod test as 01 spoke test on θ_norm
- *     draw '+'/angle_char/skip
- */
+/* Walk every cell on screen and decide if it lands on a ring, a sector line,
+ * both, or nothing — then draw the matching character. */
 static void ctx_draw_bg(const GridCtx *g)
 {
     double sector_angle = 2.0 * M_PI / (double)g->n_spokes;
@@ -362,11 +188,9 @@ static void ctx_draw_bg(const GridCtx *g)
 
             double theta = atan2(dy, dx);
 
-            /*
-             * Equal-area ring test:
-             *   k_float = (r_px / R_UNIT)²  — continuous ring index
-             *   on_ring: fractional part near 0 or 1
-             */
+            /* Which ring are we near?  Squaring the distance turns the
+             * √k spacing into evenly-spaced numbers, so a cell sits on a
+             * ring when that number lands close to a whole number. */
             double k_float = (r_px * r_px) / r_unit_sq;
             double frac    = k_float - floor(k_float);
             bool on_ring = (frac < RING_W_F || frac > 1.0 - RING_W_F);
@@ -386,13 +210,11 @@ static void ctx_draw_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_GRID));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 cursor ── */
 
 /*
- * Cursor — (ring index, sector index).  Same shape as 01_rings_spokes;
- * only ctx_to_screen's radial law differs (equal-area, not uniform).
+ * Cursor — which cell the '@' marker is on, given as a ring number (0 = inner)
+ * and a sector number (0 = first pie slice).
  */
 typedef struct { int ring, spoke; } Cursor;
 
@@ -426,9 +248,7 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, int theme,
                      bool paused, double fps)
@@ -458,9 +278,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, int theme,
     wnoutrefresh(stdscr); doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(void)
@@ -471,9 +289,7 @@ static void screen_init(void)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 static void on_signal(int s)

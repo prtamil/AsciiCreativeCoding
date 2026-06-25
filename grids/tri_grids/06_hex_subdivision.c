@@ -1,162 +1,42 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 06_hex_subdivision.c — flat-top hexagons split into 6 equilateral tris
+ * 06_hex_subdivision.c — flat-top hexagons, each sliced into 6 triangles.
  *
- * DEMO: A flat-top hex grid, with each hexagon further divided into 6
- *       equilateral triangles by drawing radii from the hex centre to
- *       each vertex (three diagonals through the centre). Arrow keys
- *       move the cursor between hexes; ',' and '.' rotate the cursor
- *       sub-triangle within the hex (sector 0..5, CCW / CW).
+ * Draws a grid of hexagons and cuts each one into 6 pie-slice triangles by
+ * running three lines through its centre. Arrow keys move a cursor from hex
+ * to hex; ',' and '.' spin the cursor around the 6 slices of its hex.
  *
- * Study alongside: grids/hex_grids/01_flat_top.c — base hex rasterizer.
- *                  04_30_60_90.c — kis-operation on equilateral triangles
- *                  (this file is the analogous kis-operation on hexagons).
- *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, HEX_SIZE, BORDER_W, RADIUS_T_FRAC,
- *                 FPS_EWMA_ALPHA
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 5 pairs: edge / radius / cursor / HUD / HINT
- *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_pixel_to_hex /
- *                 ctx_draw_bg + hex_centre_pixel + sector_of + angle_char
- *   §5 cursor   — Cursor + cursor_reset / cursor_move / cursor_rotate /
- *                 cursor_draw, HEX_DIR
- *   §6 scene    — hud_draw + scene_draw
- *   §7 screen   — ncurses init / cleanup
- *   §8 app      — signals, main loop
- *
- * Keys:  arrows move hex   ,/. rotate sector   r reset   t theme   p pause
- *        +/- size          [/] border thickness   q/ESC quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids/06_hex_subdivision.c \
- *       -o 06_hex_subdivision -lncurses -lm
+ * Sister files: grids/hex_grids/01_flat_top.c (the plain hex grid this builds
+ *   on) and 04_30_60_90.c (the same "slice each tile up" idea, but on
+ *   triangles instead of hexagons).
+ * Background: Red Blob Games hex guide — https://www.redblobgames.com/grids/hexagons/
  */
 
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
+/* ── how it works ──
  *
- * Algorithm      : A regular hexagon contains 6 equilateral triangles —
- *                  three "long diagonals" through its centre pass through
- *                  opposite vertices, dividing the hex into 6 wedges.
- *                  Each wedge is equilateral because hex circumradius
- *                  equals hex edge length. Pixel→hex via the cube-rounding
- *                  trick from hex_grids/01; sector ID via atan2 of
- *                  (Δx, Δy) bucketed into 60° bins.
+ * There is no grid stored in memory. For every character cell on screen we
+ * work out, from its position alone, which hexagon it falls in and which of
+ * that hex's 6 slices it falls in. Two bits of math do the whole job:
  *
- * Data-structure : Two structs — GridCtx (terminal extent, hex_size,
- *                  CELL_W/CELL_H, screen origin ox/oy, border_w) and
- *                  Cursor (Q, R, sector). No grid array.
+ *   - Which hex?  A hexagon's corners are the same distance from its centre
+ *     as its edges are long, so the three lines joining opposite corners cut
+ *     it into 6 identical triangles, like slices of a pie. To find the hex,
+ *     we use the standard flat-top hex lookup from hex_grids/01 (round the
+ *     cell's position to the nearest hex).
  *
- * Formula        : Hex identification (flat-top inverse, see hex_grids/01):
- *                    fq =  (2/3 · px) / size
- *                    fr = (-px/3 + √3·py/3) / size
- *                    cube_round → integer (Q, R)
- *                  Sector classification within hex (Δ from centre):
- *                    angle = atan2(Δy, Δx)
- *                    sector = ⌊(angle + π/6) / (π/3)⌋ mod 6
+ *   - Which slice?  Take the cell's offset from the hex centre and ask which
+ *     way it points (the angle, measured counter-clockwise from due east).
+ *     Sort that angle into one of six 60-degree wedges — that's the slice.
  *
- * Edge chars     : Hex edges drawn by angle_char() of the tangent angle
- *                  (same as hex_grids/01). Radii drawn by perpendicular-
- *                  distance test against the three diagonal lines through
- *                  the hex centre, each at 0°, 60°, 120° from horizontal:
- *                    line at  0° → '-'    line at 60° → '/'
- *                    line at 120° → '\\'
+ * Drawing each cell: if it's near the hex's outline, paint a border character
+ * angled to follow the edge. If it's near one of the three centre lines,
+ * paint that line. Otherwise leave it blank (unless it's the cursor's slice,
+ * which gets a faint dot so you can still see which slice is selected).
  *
- * Movement       : Arrows walk hex by HEX_DIR[4][2] axial deltas (4 of
- *                  the 6 hex faces). Comma/period rotate the sub-sector
- *                  within the current hex (CCW / CW).
- *
- * References     :
- *   Triangular tiling decomposition of hexagon — https://en.wikipedia.org/wiki/Triangular_tiling
- *   Red Blob Games hex guide  — https://www.redblobgames.com/grids/hexagons/
- *   Coxeter, "Regular Polytopes" §4.6
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Combine two analytical formulas. The first identifies WHICH HEX you are
- * in (cube rounding). The second identifies WHICH WEDGE of that hex you
- * are in (atan2 angular bin). Two formulas, no data structure, the entire
- * hex+sub-triangle topology drops out per pixel.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Each hexagon has 6 corners. The three "long diagonals" connect opposite
- * corners and all pass through the hex centre. They split the hexagon into
- * 6 equilateral triangles like slices of a pie. To know which slice owns
- * a pixel, just take the pixel's offset from the hex centre and ask "what
- * angle does that point at, measured CCW from due east?". Bucket the
- * angle into 60° bins and you have the sector.
- *
- * For rendering, we paint (a) the hex border using the hex_grids/01 trick
- * (pixels far enough from hex centre are on a border), and (b) the 3
- * diagonals as lines through centre — perpendicular distance to each line
- * gives us the radius character.
- *
- * DRAWING METHOD  (raster scan, the approach used here)
- * ──────────────
- *  1. Pick HEX_SIZE = circumradius of one hex in pixels.
- *  2. Loop every screen cell; convert to centred pixel.
- *  3. Pixel→fractional cube; cube_round → integer (Q, R); compute distance
- *     to nearest hex centre.
- *  4. If distance > 0.5 − BORDER_W: BORDER. Pick angle_char of tangent.
- *     Skip the radius test (we're outside the interior anyway).
- *  5. Otherwise INTERIOR — test 3 radii (perpendicular distance to each
- *     line through hex centre). Smallest distance < RADIUS_T → draw the
- *     radius character.
- *  6. Cursor highlight if (Q, R) matches AND sector matches.
- *
- * KEY FORMULAS
- * ────────────
- *  Flat-top hex inverse (px → fractional cube):
- *    fq =  2/3 · px / size
- *    fr = (-1/3 · px + √3/3 · py) / size
- *    fs = -fq - fr
- *
- *  Cube round (fix the largest-error component):
- *    rq = round(fq), rr = round(fr), rs = round(fs)
- *    if dq largest: rq = -rr - rs
- *    elif dr largest: rr = -rq - rs
- *    else: rs = -rq - rr
- *
- *  Sector of (dx, dy) from hex centre:
- *    angle = atan2(dy, dx)              ∈ [-π, π]
- *    sector = ⌊(angle + π/6) / (π/3)⌋ mod 6
- *
- *  Radii (3 lines through centre, perpendicular distance):
- *    line  0°: |dy|
- *    line 60°: |dy/2 − dx·√3/2|
- *    line 120°: |dy/2 + dx·√3/2|
- *
- *  Sub-triangle centroid pixel (for placing '@'):
- *    angle = sector · 60°
- *    centroid = hex_centre + (size·√3/3)·(cos angle, sin angle)
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Sector boundary at angle = ±π is the cusp where atan2 wraps. The
- *    "+ π/6" offset in the bucket formula avoids landing the boundary
- *    exactly on a vertex direction.
- *  • The radius test only fires for interior pixels (after the border
- *    check). Otherwise the diagonals would extend past the hex outline
- *    and bleed into neighbour hexes' borders.
- *  • If the cursor sub-triangle has no border / radius pixel inside its
- *    interior (small HEX_SIZE), we draw a dim '.' marker so the user can
- *    still tell which sector is selected.
- *  • Resize is free — the per-pixel formula doesn't care about screen size.
- *
- * HOW TO VERIFY
- * ─────────────
- *  At hex (Q=0, R=0) the centre is at screen pixel (0, 0) (after centring).
- *  A pixel at (size·√3/3, 0) ≈ (0.577·size, 0) sits on the radius going east
- *  (sector 0). atan2(0, +) = 0 → sector ⌊(0 + π/6)/(π/3)⌋ = 0 ✓.
- *  At (0, -size·√3/3) atan2(-, 0) = -π/2 → sector ⌊(-π/2 + π/6)/(π/3)⌋
- *  = ⌊-1⌋ = -1 → mod 6 = 5. Sector 5 = lower-right wedge. ✓
- *
- * ─────────────────────────────────────────────────────────────────────── */
+ * One thing to watch: the slice test only runs for inside-the-hex cells. If
+ * we let the centre lines run on past the outline, they'd leak into the
+ * neighbouring hexagons' borders.
+ */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -173,9 +53,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 
@@ -192,13 +70,14 @@
 #define BORDER_W_MAX     0.30
 #define BORDER_W_STEP    0.02
 
-/* Pixel-distance threshold for the three centre-to-vertex diagonals,
- * in fraction of HEX_SIZE — tuned to look about as thick as the border. */
+/* How wide the three centre lines are drawn, as a fraction of the hex size.
+ * Picked so they look about as thick as the hex border. */
 #define RADIUS_T_FRAC 0.12
 
 #define N_THEMES 4
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How much each frame nudges the on-screen fps number toward the latest
+ * reading. Small value = a steady, slow-moving display instead of jitter. */
 #define FPS_EWMA_ALPHA 0.05
 
 #define PAIR_BORDER 1
@@ -207,9 +86,7 @@
 #define PAIR_HUD    4
 #define PAIR_HINT   5
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -226,12 +103,13 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
+/* Each theme: a colour for the hex outline and a colour for the centre lines.
+ * THEME_FG is the rich 256-colour version; THEME_FG_8 is the fallback for
+ * terminals that only have 8 colours. */
 static const short THEME_FG[N_THEMES][2] = {
-    /* edge,  radius */
+    /* outline, centre-lines */
     {  75,  39 },
     {  82, 226 },
     { 207, 196 },
@@ -258,33 +136,35 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx, pixel ↔ cube + sector                            */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula — find the hex and slice for any point ── */
 
 /*
- * GridCtx — geometry of the active hex-subdivision grid.
+ * GridCtx — everything we need to know to lay the hex grid out on screen.
  *
- * Same centring scheme as the hex template: ox = cols/2, oy = (rows-1)/2.
- * hex_size and border_w are tunable per frame from the main loop.
- *
- * max_q / max_r are advisory cursor bounds — the hex plane is infinite,
- * so "bounds" here means the largest Q/R that still places its centre on
- * screen given the current hex_size.
+ * Bundled together so any drawing routine can be handed one struct and work
+ * out where every hexagon goes. The grid is recentred (and these numbers
+ * recomputed) on startup, resize, and whenever the size is changed.
  */
 typedef struct {
-    /* terminal extent */
+    /* Terminal size, in character cells. */
     int rows, cols;
 
-    /* hex geometry */
-    double hex_size;       /* circumradius in pixels                         */
-    double border_w;       /* fraction of cube distance that counts as border */
-    int    cw, ch;         /* sub-pixel scaling — CELL_W, CELL_H              */
+    /* hex_size: how big one hexagon is, in pixels (centre to corner).
+     * border_w: how thick the hex outline is, as a fraction (0..0.5) — bigger
+     *   means a chunkier border.
+     * cw, ch: how many pixels one character cell is worth across and down,
+     *   so wide-looking cells still produce round-looking hexes. */
+    double hex_size;
+    double border_w;
+    int    cw, ch;
 
-    /* screen origin = pixel (0,0) */
+    /* Where pixel (0,0) lands on screen — the grid's anchor point, kept in
+     * the middle so the layout stays centred. */
     int    ox, oy;
 
-    /* advisory cursor bounds in axial space */
+    /* Rough hint for how far the cursor can roam and still be on screen. The
+     * hex plane is endless, so these aren't hard limits — just the largest
+     * hex coordinates whose centre still fits at the current size. */
     int    max_q, max_r;
 } GridCtx;
 
@@ -302,12 +182,10 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->max_r = (int)((double)rows * CELL_H / (sqrt(3.0) * g->hex_size)) + 1;
 }
 
-/*
- * angle_char — copy from hex_grids/01_flat_top.c.
- *
- * Maps a tangent angle to the best-fit ASCII line character.
- * Folded into [0, π) because line characters are symmetric under 180° flip.
- */
+/* Picks the ASCII character ( - \ | / ) that best matches the slope of a
+ * line pointing in the given direction. Copied from hex_grids/01_flat_top.c.
+ * A line looks the same flipped 180 degrees, so opposite angles share a
+ * character. */
 static char angle_char(double theta)
 {
     double t = fmod(theta, M_PI);
@@ -319,17 +197,10 @@ static char angle_char(double theta)
     else                              return '-';
 }
 
-/*
- * sector_of — angular bin around the hex centre (returns 0..5).
- *
- * Bins are 60° wide, starting at sector 0 = "right" (toward vertex 0).
- *   sector 0:  −30° ≤ θ <  30°
- *   sector 1:   30° ≤ θ <  90°
- *   sector 2:   90° ≤ θ < 150°
- *   sector 3:  150° ≤ θ ... wraps  (around left vertex)
- *   sector 4:  −150° ≤ θ < −90°
- *   sector 5:  −90° ≤ θ < −30°
- */
+/* Which of the 6 pie slices does this offset point into? Takes how far a
+ * point sits to the right (dx) and below (dy) the hex centre and returns a
+ * slice number 0..5. Slice 0 faces right; the rest follow counter-clockwise,
+ * each spanning 60 degrees. */
 static int sector_of(double dx, double dy)
 {
     double ang = atan2(dy, dx);
@@ -338,16 +209,12 @@ static int sector_of(double dx, double dy)
     return s;
 }
 
-/*
- * ctx_pixel_to_hex — cube round; returns (Q, R) and dist (cube distance).
- *
- * THE FORMULA (flat-top inverse + cube round, see hex_grids/01):
- *
- *   fq = (2/3 · px) / size
- *   fr = (-px/3 + √3·py/3) / size
- *   fs = -fq - fr
- *   round each → restore Q+R+S=0 by fixing the largest-error axis
- */
+/* Given a pixel, find which hexagon it lands in. Returns that hex's
+ * coordinates (Q, R) plus dist: how far out toward the hex's edge the pixel
+ * is, where small means near the centre and ~0.5 means near the outline.
+ * This is the standard flat-top hex lookup from hex_grids/01 — snap the
+ * pixel to the nearest of the three hex axes, then nudge the result so the
+ * coordinates stay consistent. */
 static void ctx_pixel_to_hex(const GridCtx *g, double px, double py,
                              int *Q, int *R, double *dist)
 {
@@ -374,15 +241,8 @@ static void ctx_pixel_to_hex(const GridCtx *g, double px, double py,
     *dist = d;
 }
 
-/*
- * hex_centre_pixel — pure forward map (Q, R) → pixel of hex centre.
- *
- *   cx = size · 3/2 · Q
- *   cy = size · (√3/2 · Q + √3 · R)
- *
- * Pure math helper — keeps its domain name. Used by ctx_to_screen and
- * ctx_draw_bg.
- */
+/* The reverse of the lookup above: given a hexagon's coordinates (Q, R),
+ * work out the pixel where its centre sits. */
 static void hex_centre_pixel(int Q, int R, double size,
                               double *cx, double *cy)
 {
@@ -391,13 +251,9 @@ static void hex_centre_pixel(int Q, int R, double size,
     *cy = size * (sq3*0.5 * (double)Q + sq3 * (double)R);
 }
 
-/*
- * ctx_to_screen — terminal cell of the centroid of sub-triangle (Q, R, sector).
- *
- * Sub-triangle centroid: 2/3 of the way from hex centre to outer-edge
- * midpoint. Outer-edge midpoint at angle (sector·60°), distance size·√3/2.
- * Centroid distance from hex centre = (2/3)·size·√3/2 = size·√3/3.
- */
+/* Finds the character cell sitting at the middle of one pie slice, so we can
+ * drop the cursor marker there. The middle of a slice is partway out from
+ * the hex centre toward the slice's outer edge. */
 static void ctx_to_screen(const GridCtx *g, int Q, int R, int sector,
                           int *sr, int *sc)
 {
@@ -411,13 +267,9 @@ static void ctx_to_screen(const GridCtx *g, int Q, int R, int sector,
     *sr = g->oy + (int)(my / g->ch);
 }
 
-/*
- * ctx_draw_bg — raster scan: hex border + 3 radii at every cell.
- *
- * Per cell: cube_round picks the hex; cube distance picks border vs interior.
- * Interior cells run the 3-radius perpendicular-distance test for the
- * sub-triangle separators. Cursor sub-triangle highlighted with PAIR_CURSOR.
- */
+/* Draws the whole grid by walking every character cell and deciding what,
+ * if anything, belongs there: a hex outline, one of the three centre lines,
+ * or nothing. The cursor's slice is drawn in a highlight colour. */
 static void ctx_draw_bg(const GridCtx *g, int cQ, int cR, int cSector)
 {
     double sq3   = sqrt(3.0);
@@ -442,7 +294,7 @@ static void ctx_draw_bg(const GridCtx *g, int cQ, int cR, int cSector)
             int sector     = sector_of(dxp, dyp);
             int on_cur_sec = (on_cur_hex && sector == cSector);
 
-            /* Border */
+            /* Near the hex's outline: draw an edge piece. */
             if (dist >= limit_inner) {
                 double theta = atan2(dyp, dxp);
                 char ch = angle_char(theta + M_PI / 2.0);
@@ -454,7 +306,8 @@ static void ctx_draw_bg(const GridCtx *g, int cQ, int cR, int cSector)
                 continue;
             }
 
-            /* Interior — test 3 radii */
+            /* Inside the hex: how close are we to each of the three centre
+             * lines? Keep the nearest one; if it's close enough, draw it. */
             double r0 = fabs(dyp);
             double r1 = fabs(0.5 * dyp - sq3_2 * dxp);
             double r2 = fabs(0.5 * dyp + sq3_2 * dxp);
@@ -470,7 +323,8 @@ static void ctx_draw_bg(const GridCtx *g, int cQ, int cR, int cSector)
                 continue;
             }
 
-            /* Empty interior — drop a faint marker if cursor sub-triangle */
+            /* Blank cell, but it's in the cursor's slice — leave a faint dot
+             * so the selected slice is still visible when it has no lines. */
             if (on_cur_sec) {
                 attron(COLOR_PAIR(PAIR_CURSOR));
                 mvaddch(row, col, '.');
@@ -480,21 +334,18 @@ static void ctx_draw_bg(const GridCtx *g, int cQ, int cR, int cSector)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 cursor ── */
 
 /*
- * Cursor — (q, r, sector) where (q, r) is axial hex space and
- * sector ∈ 0..5 picks the CCW wedge inside that hex.
+ * Cursor — where the user's selection sits: which hexagon (q, r) and which
+ * of its 6 slices (sector, 0..5).
  *
- * Bounds and geometry live in GridCtx, not here — the cursor doesn't know
- * how big the grid is. The two structs compose: Cursor + GridCtx → screen
- * position via ctx_to_screen().
+ * It holds nothing about screen size or hex size — that lives in GridCtx.
+ * Hand both to ctx_to_screen() to turn a selection into a screen position.
  */
 typedef struct { int q, r, sector; } Cursor;
 
-/* HEX_DIR — same as hex_grids/01 (4 of the 6 hex faces). */
+/* The four arrow-key moves, as steps in hex coordinates (up/down/left/right). */
 static const int HEX_DIR[4][2] = {
     { 0, -1 },   /* UP    */
     { 0, +1 },   /* DOWN  */
@@ -510,12 +361,8 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->sector = 0;
 }
 
-/*
- * cursor_move — apply (dq, dr) in axial space.
- *
- * The hex plane is infinite; we do not clamp here. (max_q/max_r in GridCtx
- * are advisory — visible-extent only.)
- */
+/* Steps the cursor one hex in an arrow direction. No edge to bump into — the
+ * grid is endless, so the cursor can wander off screen if pushed far enough. */
 static void cursor_move(Cursor *cur, const GridCtx *g, int idx)
 {
     (void)g;
@@ -540,9 +387,7 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, int theme,
                      int paused, double fps)
@@ -573,9 +418,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, int theme,
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -589,9 +432,7 @@ static void screen_init(void)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;

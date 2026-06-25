@@ -1,128 +1,18 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 03_double_diagonal_patterns.c — preset stamps on the tetrakis grid
+ * 03_double_diagonal_patterns.c — drop preset shapes onto an X-cut grid
  *
- * DEMO: Cursor moves with arrows on a tetrakis grid (each square split
- *       by both diagonals into 4 N/E/S/W wedges). Press 1..5 to STAMP
- *       a preset pattern at the cursor:
- *         1 = RING    (4 wedges around the cursor's square)
- *         2 = LINE    (horizontal strip of wedges)
- *         3 = STAR    (RING + outer ring)
- *         4 = TRI     (3-wedge triangular cluster)
- *         5 = SCATTER (random wedges within a small box)
- *       SPACE clears all objects. 'g' cycles the placed glyph.
+ * Move a cursor with the arrows over a grid where every square is sliced
+ * by both diagonals into 4 little triangles (north/east/south/west). Press
+ * a digit 1..5 to stamp a ready-made shape (ring, line, star, triangle, or
+ * a random scatter) at the cursor. SPACE wipes everything; 'g' changes the
+ * mark used.
  *
- * Study alongside: 03_double_diagonal_direct.c (manual SPACE-toggle),
- *                  grids/tri_grids/03_double_diagonal.c (rasterizer),
- *                  02_right_isosceles_patterns.c (1-diagonal sibling).
- *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, TRI_SIZE, MAX_OBJ
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 5 pairs: edge / cursor / object / HUD / hint
- *   §4 gridctx  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg
- *   §5 pool     — Pool: place / remove / toggle / find / clear / draw
- *   §6 cursor   — Cursor + TETRA_DIR + reset / move / draw
- *   §7 mode     — pattern offset tables + pattern_stamp + pattern_scatter
- *   §8 scene    — hud_draw + scene_draw
- *   §9 screen   — ncurses init / cleanup
- *  §10 app      — signals, main loop
- *
- * Keys:  arrows:move  1..5:stamp  spc:clear  g:glyph
- *        +/-:size  t:theme  r:reset  q/ESC:quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/03_double_diagonal_patterns.c \
- *       -o 03_double_diagonal_patterns -lncurses -lm
+ * Sister files: 03_double_diagonal_direct.c (place one wedge at a time),
+ *               grids/tri_grids/03_double_diagonal.c (just draws the grid),
+ *               02_right_isosceles_patterns.c (same idea, one diagonal).
+ * Tiling reference: https://en.wikipedia.org/wiki/Tetrakis_square_tiling
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Stamp-based placement. Each pattern is a STATIC array
- *                  of (Δcol, Δrow, target_wedge) triples relative to the
- *                  cursor. Pressing a digit translates the array by the
- *                  cursor and inserts each entry into the pool.
- *
- * Data-structure : Pool — flat array of Obj{col, row, wedge, glyph,
- *                  alive}. Pattern tables are read-only in §7. SCATTER
- *                  picks random offsets and a random wedge via LCG.
- *
- * The trick      : target_wedge is ABSOLUTE (one of N/E/S/W), not a
- *                  delta. Each (col, row) holds 4 wedges; the stamp's
- *                  silhouette must not rotate when translated, so we
- *                  store wedge directly per entry.
- *
- * References     :
- *   Tetrakis square tiling — https://en.wikipedia.org/wiki/Tetrakis_square_tiling
- *   Object pool pattern — gameprogrammingpatterns.com/object-pool.html
- *   Linear congruential generator — Numerical Recipes ch. 7
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * A pattern is a static list of (Δcol, Δrow, wedge) entries. Pressing
- * '1' translates the RING list by the cursor and inserts each entry
- * into the pool. The cursor never moves; only objects appear.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Think rubber stamps on X-cut graph paper. The RING stamp's ink dots
- * are pre-placed at the four wedges around the cursor's square; the
- * STAR stamp adds the outer ring. SCATTER generates a fresh random
- * stamp on each press.
- *
- * DRAWING METHOD  (per frame)
- * ──────────────
- *  1. erase()
- *  2. ctx_draw_bg — raster scan: pixel_to_tri → tri_edge_char draws
- *     '/', '\\', '|', '_' near each wedge's edges.
- *  3. pool_draw — every placed object's glyph at its wedge centroid.
- *  4. cursor_draw — '@' on top.
- *  5. hud_draw — top-right status, bottom-row hint.
- *
- *  Stamping (only on key press):
- *    pattern_stamp(pool, PAT_xxx, cur.col, cur.row, glyph)
- *      for each entry (Δc, Δr, wedge_abs):
- *        pool_place(pool, cur.col+Δc, cur.row+Δr, wedge_abs, glyph)
- *
- * KEY FORMULAS
- * ────────────
- *  Pattern entry shape:  (Δcol, Δrow, target_wedge)        [3-tuple]
- *  Sentinel:             { 0xDEAD, 0, 0 }
- *  Iteration:            for i in 0..; while !IS_END(pat[i])
- *
- *  Wedge centroid (used by pool_draw, see §4 of the file):
- *    N: a = col+1/2, b = row+1/6
- *    E: a = col+5/6, b = row+1/2
- *    S: a = col+1/2, b = row+5/6
- *    W: a = col+1/6, b = row+1/2
- *    px = a · size, py = b · size
- *
- *  Why ABSOLUTE target_wedge: every (col, row) holds all 4 wedges
- *  simultaneously, so the stamp's footprint is a fixed shape relative
- *  to the cursor regardless of where it lands. A delta would have no
- *  meaning — there is no "relative direction" between two wedges of
- *  the same square.
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • MAX_OBJ cap: large STAR plus repeated SCATTER saturates; new
- *    entries silently dropped. SPACE clears.
- *  • Glyph cycle: glyph used by next stamp comes from
- *    GLYPHS[cur.glyph_idx] AT stamp time.
- *  • Pattern overlap: pool_place deduplicates; stamping a RING twice at
- *    the same cursor has no effect.
- *
- * HOW TO VERIFY
- * ─────────────
- *  Press '1' (RING) at the origin: 4 wedges placed at (0,0,N), (0,0,E),
- *  (0,0,S), (0,0,W) — all four wedges of the cursor's square.
- *  Press '2' (LINE): a horizontal strip of wedges along row 0.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -135,9 +25,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 #define CELL_W 2
@@ -169,9 +57,7 @@
 static const char  GLYPHS[N_GLYPHS] = { '*', 'o', '+', '#', 'X', '%' };
 static const char *DIR_NAME[4]      = { "N", "E", "S", "W" };
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -188,9 +74,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static const short THEME_FG[N_THEMES][2] = {
     {  82, 226 }, { 207, 226 }, { 207,  82 }, {  15,  39 },
@@ -214,9 +98,7 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx                                                             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx ── */
 
 typedef struct {
     int    rows, cols;
@@ -236,6 +118,9 @@ static void ctx_init(GridCtx *g, int rows, int cols, double tri_size)
     g->border_w = BORDER_W;
 }
 
+/* Given a point on screen, work out which square it's in and which of the
+ * four diagonal wedges it falls into. The wedge is decided by whichever
+ * diagonal the point is closest to relative to the square's centre. */
 static void pixel_to_tri(double px, double py, double size,
                          int *col, int *row, int *wedge,
                          double *fa, double *fb)
@@ -265,6 +150,9 @@ static void tri_centroid_pixel(int col, int row, int wedge, double size,
     *cy = ((double)row + b) * size;
 }
 
+/* Picks the line character ('/', '\', '|', '_') to draw a point near a
+ * wedge's edge, and reports how close the point is to that edge in
+ * *out_min — the caller only draws the outline, not the wedge interior. */
 static char tri_edge_char(int wedge, double fa, double fb, double *out_min)
 {
     double l1, l2, l3; char ch1, ch2, ch3;
@@ -323,11 +211,16 @@ static void ctx_draw_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_BORDER));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool ── */
 
+/* One placed mark. It lives in a specific triangle: the square at
+ * (col, row), and which of the 4 wedges (DIR_N/E/S/W) inside it.
+ * glyph is the character to show; alive lets us tombstone an entry
+ * without shuffling the array. */
 typedef struct { int col, row, wedge; char glyph; bool alive; } Obj;
+
+/* All the placed marks. Fixed-size array, no malloc — count says how
+ * many slots are used; everything past count is unused. */
 typedef struct { Obj items[MAX_OBJ];  int count; } Pool;
 
 static int pool_find(const Pool *p, int col, int row, int wedge)
@@ -364,10 +257,12 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_OBJECT) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 cursor ── */
 
+/* The thing you steer with the arrows, plus the demo's current settings.
+ * col/row/wedge is which triangle it's pointing at. glyph_idx picks the
+ * mark used by the next stamp (index into GLYPHS). theme is the colour
+ * scheme; paused is the running/paused flag shown in the HUD. */
 typedef struct {
     int col, row, wedge;
     int glyph_idx;
@@ -375,6 +270,11 @@ typedef struct {
     int paused;
 } Cursor;
 
+/* Where one arrow press takes the cursor. The cursor sits in a wedge,
+ * so "move left" means something different depending on which wedge
+ * you're in — sometimes you just flip to the neighbouring wedge in the
+ * same square, sometimes you step into the next square. Each entry is
+ * (column step, row step, wedge you land in), indexed by [arrow][wedge]. */
 static const int TETRA_DIR[4][4][3] = {
     /* LEFT  */ { {  0,  0, DIR_W }, {  0,  0, DIR_W }, {  0,  0, DIR_W }, { -1,  0, DIR_E } },
     /* RIGHT */ { {  0,  0, DIR_E }, { +1,  0, DIR_W }, {  0,  0, DIR_E }, {  0,  0, DIR_E } },
@@ -408,10 +308,12 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  mode — pattern stamps                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 mode — pattern stamps ── */
 
+/* A pattern is just a list of wedges to drop, written as
+ * (column offset, row offset, which wedge) relative to the cursor.
+ * PAT_END is a marker row that means "end of list" — 0xDEAD is just an
+ * unmistakable value no real offset would ever be. */
 #define PAT_END   { 0xDEAD, 0, 0 }
 #define IS_END(p) ((p)[0] == 0xDEAD)
 
@@ -443,6 +345,8 @@ static void pattern_stamp(Pool *pool, const int (*pat)[3],
         pool_place(pool, cC + pat[i][0], cR + pat[i][1], pat[i][2], glyph);
 }
 
+/* A tiny home-made random number generator (0..1). Good enough for
+ * scattering marks around; not for anything that needs real randomness. */
 static unsigned int g_seed = 1;
 static double frand(void)
 {
@@ -452,8 +356,8 @@ static double frand(void)
 
 static void pattern_scatter(Pool *pool, int cC, int cR, char glyph)
 {
-    g_seed ^= (unsigned int)clock_ns();
-    int n = 10, tries = 0;
+    g_seed ^= (unsigned int)clock_ns();   /* stir in the clock so each press differs */
+    int n = 10, tries = 0;                /* want 10 marks, but give up after 100 attempts */
     while (n > 0 && tries < 100) {
         int dC    = (int)(frand() * 9) - 4;
         int dR    = (int)(frand() * 9) - 4;
@@ -465,9 +369,7 @@ static void pattern_scatter(Pool *pool, int cC, int cR, char glyph)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, const Pool *pool,
                      double fps)
@@ -500,9 +402,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, const Pool *pool,
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -515,9 +415,7 @@ static void screen_init(int theme)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §10 app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §10 app ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;
@@ -546,7 +444,7 @@ int main(void)
     while (g_running) {
         if (g_need_resize) {
             g_need_resize = 0;
-            endwin(); refresh();
+            endwin(); refresh();   /* ncurses needs this poke to pick up the new size */
             ctx_init(&g, LINES, COLS, g.tri_size);
         }
         int ch;

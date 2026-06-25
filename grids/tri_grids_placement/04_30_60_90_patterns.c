@@ -1,117 +1,13 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 04_30_60_90_patterns.c — preset pattern stamps on the kisrhombille grid (equilaterals + 3 medians)
+ * 04_30_60_90_patterns.c — stamp ready-made shapes onto a triangle grid.
  *
- * DEMO: Cursor moves with arrows. Press 1..5 to STAMP a preset pattern
- *       at the cursor position. Patterns:
- *         1 = RING    (6 triangles surrounding the cursor)
- *         2 = LINE    (8 triangles in a horizontal strip)
- *         3 = STAR    (RING + 6 outer triangles)
- *         4 = TRI     (cursor + 3 corner triangles forming a triforce)
- *         5 = SCATTER (10 random within 4-step radius)
- *       SPACE clears all objects. 'g' cycles the placed glyph.
+ * Move the cursor with the arrows, then press 1..5 to drop a whole shape
+ * (ring, line, star, triforce, or a random scatter) at the cursor in one keypress.
  *
- * Study alongside: 04_30_60_90_direct.c (manual SPACE-toggle placement),
- *                  grids/tri_grids/04_30_60_90.c (background).
- *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, MAX_OBJ, patterns
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 6 pairs: edge / median / cursor / object / HUD / hint
- *   §4 gridctx  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg
- *   §5 pool     — Pool: place / find / clear / draw
- *   §6 cursor   — Cursor + TRI_DIR + reset / move / draw
- *   §7 mode     — pattern offset tables + pattern_stamp + pattern_scatter
- *   §8 scene    — hud_draw + scene_draw
- *   §9 screen   — ncurses init / cleanup
- *  §10 app      — signals, main loop
- *
- * Keys:  arrows:move  1..5:stamp  spc:clear  g:glyph
- *        +/-:size  t:theme  r:reset  q/ESC:quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/04_30_60_90_patterns.c \
- *       -o 04_30_60_90_patterns -lncurses -lm
+ * Companion files: 04_30_60_90_direct.c (place triangles one at a time) and
+ * grids/tri_grids/04_30_60_90.c (the plain grid this builds on).
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Stamp-based placement. Each pattern is a STATIC array
- *                  of (Δcol, Δrow, target_up) triples relative to the
- *                  cursor. Pressing a digit translates the array by the
- *                  cursor and inserts each entry into the pool.
- *
- * Data-structure : Pool — same as 04_30_60_90_direct. Pattern tables
- *                  are read-only in §7.
- *
- * The trick      : For △ vs ▽ children of the cursor, we use ABSOLUTE
- *                  target_up (0 or 1) — not a delta — because triangle
- *                  orientation depends only on (col+row) parity in this
- *                  grid, so we want exact orientation control per stamp.
- *
- * References     :
- *   Equilateral tiling — https://en.wikipedia.org/wiki/Triangular_tiling
- *   Kisrhombille tiling — https://en.wikipedia.org/wiki/Kisrhombille_tiling
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Rubber-stamp placement on the kisrhombille — but the stamps address
- * WHOLE equilaterals (col, row, up), not the 30-60-90 sub-triangles.
- * The medians render automatically in ctx_draw_bg and form a backdrop
- * for the stamped glyphs at parent centroids.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Same as 01_equilateral_patterns: each pattern is a static list of
- * relative addresses; pressing a digit translates the list by the
- * cursor. The medians are visual extras only — patterns are unaware
- * of them.
- *
- * DRAWING METHOD  (per frame)
- * ──────────────
- *  1. erase()
- *  2. ctx_draw_bg — equilateral edges + 3-median proximity overlay.
- *  3. pool_draw — every placed object's glyph at its centroid cell.
- *  4. cursor_draw — '@' on top.
- *  5. hud_draw — top-right status, bottom-row hint.
- *
- *  Stamping (only on key press):
- *    pattern_stamp(pool, PAT_xxx, cur.col, cur.row, glyph)
- *      for each entry (Δc, Δr, up_abs):
- *        pool_place(pool, cur.col+Δc, cur.row+Δr, up_abs, glyph)
- *
- * KEY FORMULAS
- * ────────────
- *  Pattern entry shape:  (Δcol, Δrow, target_up)        [3-tuple]
- *  Sentinel:             { 0xDEAD, 0, 0 }
- *  Iteration:            for i in 0..; while !IS_END(pat[i])
- *
- *  Why ABSOLUTE target_up: equilateral orientation depends on
- *  (col+row) parity, so a delta would flip the stamp's silhouette
- *  every other position. Storing absolute orientations keeps the
- *  stamp shape invariant under translation.
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Medians under glyphs: every parent centroid is the median
- *    concurrent point. The glyph paints over the median ink.
- *  • MAX_OBJ cap, glyph cycle, scatter seed: identical to
- *    01_equilateral_patterns.c.
- *  • Patterns ADD, not REPLACE: stamping the same pattern twice at
- *    the same cursor has no effect (pool_place deduplicates).
- *
- * HOW TO VERIFY
- * ─────────────
- *  Press '1' (RING): exactly 6 stamped triangles around the cursor.
- *  Each stamped triangle still shows its 3 medians beneath the glyph.
- *  Press '4' (TRI): 4 entries forming a triforce — three corners
- *  plus the inverted centre.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -128,9 +24,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 #define CELL_W 2
@@ -159,9 +53,7 @@
 
 static const char GLYPHS[N_GLYPHS] = { '*', 'o', '+', '#', 'X', '%' };
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -178,9 +70,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static const short THEME_FG[N_THEMES][2] = {
     {  75, 226 }, {  82, 207 }, { 207,  82 }, {  15,  39 },
@@ -205,10 +95,16 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx                                                             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx ── */
 
+/*
+ * Everything needed to turn a triangle address into a spot on the screen.
+ *   rows, cols          size of the terminal in characters
+ *   cw, ch              how many sub-pixels wide/tall one character cell is
+ *   ox, oy             screen cell the grid is centred on (triangle 0,0 lands here)
+ *   tri_size            triangle size in pixels — bigger means a coarser grid
+ *   border_w, median_t  how close to an edge / median line a cell must be to get inked
+ */
 typedef struct {
     int    rows, cols;
     int    cw, ch;
@@ -327,11 +223,11 @@ static void ctx_draw_bg(const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool ── */
 
+/* one placed mark: which triangle it sits on (col, row, up) and what to draw there */
 typedef struct { int col, row, up; char glyph; bool alive; } Obj;
+/* fixed-size bag of placed marks; items[0..count-1] are the live ones */
 typedef struct { Obj items[MAX_OBJ];  int count; } Pool;
 
 static int pool_find(const Pool *p, int col, int row, int up)
@@ -368,10 +264,15 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_OBJECT) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 cursor ── */
 
+/*
+ * Where the user is pointing, plus the few settings the user can toggle.
+ *   col, row, up   the triangle the cursor sits on (up = points up vs down)
+ *   glyph_idx      which mark from GLYPHS gets stamped
+ *   theme          which colour scheme is active
+ *   paused         whether the sim is paused
+ */
 typedef struct {
     int col, row, up;
     int glyph_idx;
@@ -410,21 +311,20 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  mode — pattern stamps                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 mode — pattern stamps ── */
 
 /*
- * Pattern format: (Δcol, Δrow, target_up). target_up is ABSOLUTE (0 or 1),
- * not a delta — the cursor's current orientation does not affect what the
- * pattern looks like. Each table is sentinel-terminated.
+ * Each pattern is a fixed list of triangles given as offsets from the cursor:
+ * (column shift, row shift, points-up?). The points-up flag is the final answer,
+ * not an adjustment — that way the shape looks the same no matter where you stamp
+ * it. A junk last row (the sentinel) marks the end of each list.
  */
 
 #define PAT_END   { 0xDEAD, 0, 0 }
 #define IS_END(p) ((p)[0] == 0xDEAD)
 
 static const int PAT_RING[][3] = {
-    /* 6 triangles around cursor — neighbours of ▽(0,0) plus a few    */
+    /* a small cluster of triangles right around the cursor */
     {  0,  0,  0 }, {  0,  0,  1 },
     { -1,  0,  1 }, { +1,  0,  0 },
     {  0, -1,  1 }, {  0, +1,  0 },
@@ -432,7 +332,7 @@ static const int PAT_RING[][3] = {
 };
 
 static const int PAT_LINE[][3] = {
-    /* horizontal strip of 8 alternating ▽△                           */
+    /* a horizontal strip, up and down triangles alternating */
     {  0,  0,  0 }, {  0,  0,  1 },
     {  1,  0,  0 }, {  1,  0,  1 },
     {  2,  0,  0 }, {  2,  0,  1 },
@@ -441,7 +341,7 @@ static const int PAT_LINE[][3] = {
 };
 
 static const int PAT_STAR[][3] = {
-    /* RING + outer 6                                                  */
+    /* the ring plus an outer arm of triangles for a star shape */
     {  0,  0,  0 }, {  0,  0,  1 },
     { -1,  0,  1 }, { +1,  0,  0 },
     {  0, -1,  1 }, {  0, +1,  0 },
@@ -452,7 +352,7 @@ static const int PAT_STAR[][3] = {
 };
 
 static const int PAT_TRI[][3] = {
-    /* Triforce: 3 corner triangles + cursor                            */
+    /* the triforce: three corner triangles with an inverted one in the middle */
     {  0,  0,  0 },
     {  0,  0,  1 },
     { +1,  0,  0 },
@@ -467,7 +367,7 @@ static void pattern_stamp(Pool *pool, const int (*pat)[3],
         pool_place(pool, cC + pat[i][0], cR + pat[i][1], pat[i][2], glyph);
 }
 
-/* Random scatter — 10 triangles within 4-step radius from cursor. */
+/* scatters 10 triangles at random spots a few steps out from the cursor */
 static unsigned int g_seed = 1;
 static double frand(void)
 {
@@ -490,9 +390,7 @@ static void pattern_scatter(Pool *pool, int cC, int cR, char glyph)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, const Pool *pool,
                      double fps)
@@ -525,9 +423,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, const Pool *pool,
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -540,9 +436,7 @@ static void screen_init(int theme)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §10 app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §10 app ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;

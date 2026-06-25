@@ -1,151 +1,18 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 02_log_polar.c — logarithmic polar grid: exponentially-spaced rings
+ * 02_log_polar.c — a polar grid whose rings grow apart as you move outward.
  *
- * DEMO: Rings are spaced so that each successive ring is a fixed RATIO
- *       further from the centre than the previous one (geometric progression).
- *       Inner rings are dense; outer rings grow increasingly wide.  This is
- *       the coordinate system of conformal optics, SIFT descriptors, and
- *       human retinal sampling.  An '@' cursor sits at one (ring, spoke)
- *       cell — arrows step it across the grid.  +/- adjusts the growth ratio.
+ * Normal polar grids put rings at even gaps. Here each ring sits a fixed
+ * multiple further out than the one before it, so inner rings crowd together
+ * and outer rings spread wide — the same way our eyes pack detail near the
+ * centre of vision. An '@' marker lives in one (ring, spoke) cell; arrows
+ * move it. The sister file 01_rings_spokes.c uses plain even spacing instead.
  *
- * Study alongside: 01_rings_spokes.c (linear ring spacing),
- *                  ../rect_grids/01_uniform_rect.c (the GridCtx template)
- *
- * Section map:
- *   §1 config   — R_MIN, log step (ratio), spoke count, themes, EWMA
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — theme-switchable PAIR_GRID + HUD/HINT/CURSOR
- *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg + angle_char
- *   §5 cursor   — Cursor + cursor_reset / cursor_move / cursor_draw
- *   §6 scene    — hud_draw + scene_draw
- *   §7 screen   — ncurses init / cleanup
- *   §8 app      — signals, resize, main loop
- *
- * Keys:  q/ESC quit   p pause   t theme   r reset
- *        arrows move @   +/- growth ratio   [/] spoke count
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/polar_grids/02_log_polar.c \
- *       -o 02_log_polar -lncurses -lm
- */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Logarithmic polar grid.  Instead of rings at equal pixel
- *                  intervals (r = k × SPACING), rings sit at exponentially
- *                  growing radii:
- *
- *                    r_k = R_MIN × RATIO^k
- *
- *                  Equivalently: ln(r / R_MIN) increases by ln(RATIO) per
- *                  ring.  To test membership, compute the continuous ring
- *                  index u = ln(r / R_MIN) / ln(RATIO) and check its
- *                  fractional part:
- *
- *                    u = ln(r / R_MIN) / LOG_STEP      (LOG_STEP = ln(RATIO))
- *                    on_ring : fmod(u, 1.0) < RING_W_U || > 1 − RING_W_U
- *
- *                  RING_W_U is a fractional width in "ring-index space", not
- *                  pixels.  This keeps all rings the same visual thickness in
- *                  log-space (thin inner rings would be imperceptible with a
- *                  fixed pixel width, so we use adaptive width here instead).
- *
- * Data-structure : Two structs — GridCtx (terminal extent, R_MIN, log_step,
- *                  ring_w_u, n_spokes, ox/oy) and Cursor (linear ring index,
- *                  spoke index).  ctx_to_screen places the cursor at the
- *                  geometric mean of two consecutive log-rings — the natural
- *                  "midpoint" in log space.
- *
- * Math           : The log-polar transform maps (r, θ) → (ln r, θ).  In this
- *                  space, concentric circles become horizontal lines — it is
- *                  a conformal (angle-preserving) map.  Biologically, the
- *                  human fovea has approximately log-polar sampling density.
- *                  Scale changes in Cartesian space become translations in
- *                  log-polar space — the basis of scale-invariant feature
- *                  descriptors (SIFT, SURF).
- *
- * Rendering      : Same angle_char() as 01_rings_spokes.  Rings near the
- *                  centre are tightly packed; outer rings are wide apart.
- *                  The visual is like a radar screen with fine inner detail
- *                  and coarse outer bins.
- *
- * Performance    : Same O(rows × cols) sweep as 01; adds one log() call
- *                  per cell.  Still imperceptibly fast at terminal resolution.
- *
- * References     :
- *   Log-polar transform — en.wikipedia.org/wiki/Log-polar_coordinates
+ * Background reading:
+ *   Log-polar coordinates — en.wikipedia.org/wiki/Log-polar_coordinates
  *   SIFT scale-invariant features — Lowe 2004, IJCV 60(2):91–110
  *   Human retinal sampling — Schwartz 1980, Biol. Cybernetics 37(4):199–208
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ───────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- *   Replace the evenly-spaced rings of 01 with exponentially-spaced rings.
- *   Each ring is RATIO times further from the centre than the previous one.
- *   Detection: compute the continuous "ring index" u = log(r/R_MIN)/LOG_STEP;
- *   a cell is on a ring when u's fractional part is near 0 or 1.  The Cursor
- *   address (ring k, spoke s) maps to the geometric midpoint of rings k and k+1.
- *
- * HOW TO THINK ABOUT IT
- *   Imagine zooming into the centre of a photo: each zoom level reveals the
- *   same structural detail.  Ring k is at r_k = R_MIN × RATIO^k, so each ring
- *   represents an equal multiplicative step in distance, not an additive one.
- *   The log-polar transform maps (r, θ) → (ln r, θ): circles become horizontal
- *   lines in log-space, and scale changes become translations.
- *
- *   Comparison with 01_rings_spokes:
- *     01: r_k = k × RING_SPACING   (CONSTANT pixel gap between rings)
- *     02: r_k = R_MIN × RATIO^k    (CONSTANT log gap; pixel gap grows with r)
- *
- * DRAWING METHOD
- *   1. dx = (col−ox)×CELL_W,  dy = (row−oy)×CELL_H
- *   2. r = √(dx²+dy²),  θ = atan2(dy,dx)
- *   3. If r ≤ R_MIN: skip (log undefined at or below inner anchor)
- *   4. u = log(r / R_MIN) / LOG_STEP     ← continuous ring index: u=0 at r=R_MIN
- *   5. frac = u − floor(u)               ← position within current ring interval
- *   6. on_ring = (frac < RING_W_U || frac > 1 − RING_W_U)
- *   7. Spoke test same as 01_rings_spokes.
- *   8. Draw intersection/ring/spoke/skip.
- *
- * KEY FORMULAS
- *   Ring placement: r_k = R_MIN × e^(k × LOG_STEP)
- *     LOG_STEP = ln(RATIO).  Each ring is e^LOG_STEP ≈ RATIO times the previous.
- *
- *   Ring detection: u = ln(r/R_MIN) / LOG_STEP  (inverse of r_k formula)
- *     If r = r_k exactly, then u = k (integer → frac=0 → on_ring).
- *
- *   Cursor → screen (ring k, spoke s):
- *     mid_radius = R_MIN × e^((k + 0.5) × LOG_STEP)   (geometric midpoint)
- *     theta_mid  = (s + 0.5) × (2π / N_SPOKES)
- *     cx = mid_radius × cos theta_mid;  cy = mid_radius × sin theta_mid
- *     sc = ox + (int)round(cx / CELL_W); sr = oy + (int)round(cy / CELL_H)
- *
- *   Adaptive ring width: RING_W_U is a fraction of the log-space interval,
- *     NOT a pixel width.  Physical width at ring k:
- *       Δr = r_k × LOG_STEP × RING_W_U  (from d(log r)/dr = 1/r)
- *     So outer rings are wider in pixels — they remain visible at large radii.
- *
- * EDGE CASES TO WATCH
- *   • r ≤ R_MIN: log(r/R_MIN) ≤ 0 → u ≤ 0 → rings cluster at origin.
- *     Hard guard: skip cells with r ≤ R_MIN.
- *   • LOG_STEP = 0: division by zero.  Constrained to [LOG_STEP_MIN, LOG_STEP_MAX].
- *   • θ normalisation: same as 01 — add 2π before fmod to avoid negative phases.
- *   • Cursor max_ring depends on ring_spacing; recomputed in ctx_init.
- *
- * HOW TO VERIFY
- *   Terminal 80×24, R_MIN=4, LOG_STEP=0.25 (RATIO=e^0.25≈1.284), ox=40, oy=12.
- *
- *   Ring radii: r_0=4px, r_1≈5.1px, r_2≈6.6px, r_4≈10.9px, r_6≈17.9px.
- *
- *   Cell (col=49, row=12): dx=(49−40)×2=18, dy=0  →  r=18.0
- *     u = log(18/4) / 0.25 = ln(4.5) / 0.25 = 1.504 / 0.25 = 6.017
- *     frac = 0.017 < RING_W_U(0.08)  →  on_ring = true
- *     r_6 = 4 × e^(6×0.25) = 4 × e^1.5 = 4 × 4.482 ≈ 17.9 px  ← matches ✓
- *
- * ─────────────────────────────────────────────────────────────────────── */
+ */
 
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
@@ -162,26 +29,28 @@
 #  define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS   30
 #define CELL_W       2
 #define CELL_H       4
 
-/* Smallest ring radius in pixels.  Rings below R_MIN are suppressed. */
+/* Innermost ring radius, in pixels. Anything closer to the centre is left blank. */
 #define R_MIN               4.0
 
-/* ln(RATIO): the log-step between consecutive rings.
- * RATIO = e^LOG_STEP.  LOG_STEP=0.25 → each ring is e^0.25 ≈ 1.28× further.
- * Range [0.10, 0.60]: small = dense inner rings; large = widely spaced.   */
+/* How much bigger each ring is than the one inside it.
+ * It's stored as a log-step, so the actual size multiple is e^LOG_STEP:
+ * 0.25 means every ring sits about 1.28x further out than the last.
+ * The +/- keys nudge it within [0.10, 0.60] — small packs rings tight,
+ * large spreads them apart. */
 #define LOG_STEP_DEFAULT    0.25
 #define LOG_STEP_MIN        0.10
 #define LOG_STEP_MAX        0.60
 #define LOG_STEP_DELTA      0.05
 
-/* Fractional thickness of a ring in log-ring-index space (0..1 per ring) */
+/* How thick to draw a ring, measured as a fraction of the gap to the next ring
+ * (0..1). Using a fraction instead of fixed pixels keeps thin inner rings from
+ * vanishing — every ring stays equally visible. */
 #define RING_W_U            0.08
 
 #define N_SPOKES_DEFAULT    12
@@ -190,7 +59,7 @@
 #define SPOKE_W             0.10
 #define SPOKE_MIN_R         3.0
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How quickly the FPS readout reacts to change. Small = smooth and steady. */
 #define FPS_EWMA_ALPHA      0.05
 
 #define PAIR_GRID    1
@@ -207,9 +76,7 @@ static const short THEME_FG[][2] = {
 };
 #define N_THEMES 5
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -224,9 +91,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static void color_init(int theme)
 {
@@ -238,37 +103,33 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,  -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx and the log-ring/spoke ↔ screen mapping          */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula — turn a (ring, spoke) cell into a screen spot, and back ── */
 
 /*
- * GridCtx — geometry of the log-polar grid plus cursor bounds.
- *
- * r_min, log_step, ring_w_u carry the radial law parameters.
- * n_spokes carries the angular wedge count.
- * max_ring is the largest ring index whose centre stays on screen.
+ * GridCtx — everything we need to know to draw the grid and place the cursor.
+ * One copy lives for the whole run and gets rebuilt whenever the terminal
+ * resizes or the user changes the ring spacing or spoke count.
  */
 typedef struct {
-    int rows, cols;
+    int rows, cols;     /* terminal size, in character cells               */
 
-    double r_min;       /* inner anchor (pixels)                          */
-    double log_step;    /* ln(RATIO)                                      */
-    double ring_w_u;    /* fractional ring width in log-index space       */
+    double r_min;       /* radius of the innermost ring, in pixels         */
+    double log_step;    /* spacing knob: bigger = rings further apart       */
+    double ring_w_u;    /* ring thickness, as a fraction of the ring gap   */
 
-    int    n_spokes;
-    int    cell_w, cell_h;
+    int    n_spokes;    /* how many evenly-spaced spokes radiate out        */
+    int    cell_w, cell_h; /* pixels per character cell (chars aren't square) */
 
-    int    ox, oy;
+    int    ox, oy;      /* centre of the grid, in cell coordinates          */
 
-    int    max_ring, max_spoke;
+    int    max_ring;    /* highest ring whose centre still fits on screen   */
+    int    max_spoke;   /* highest spoke index (n_spokes - 1)               */
 } GridCtx;
 
 /*
- * ctx_init — derive geometry from terminal size.
- *
- * max_ring solves r_min × e^((k + 0.5) × log_step) ≤ r_visible:
- *   k_max = floor( ln(r_visible / r_min) / log_step − 0.5 )
+ * Recompute the grid layout for the current terminal size. Mostly it works out
+ * the centre and the outermost ring that still fits, so the cursor can't wander
+ * off-screen. Call it again after any resize or spacing change.
  */
 static void ctx_init(GridCtx *g, int rows, int cols)
 {
@@ -297,17 +158,10 @@ static void ctx_init(GridCtx *g, int rows, int cols)
 }
 
 /*
- * ctx_to_screen — centre cell of (ring k, spoke s) in screen coordinates.
- *
- * THE FORMULA (geometric midpoint between rings k and k+1):
- *   mid_radius = r_min × e^((k + 0.5) × log_step)
- *   theta_mid  = (s + 0.5) × (2π / n_spokes)
- *   cx = mid_radius × cos theta_mid;  cy = mid_radius × sin theta_mid
- *   sc = ox + (int)round(cx / CELL_W);  sr = oy + (int)round(cy / CELL_H)
- *
- * The geometric mean (k+0.5 in log-index space) is the natural "centre" of
- * a log-ring annulus, just as the arithmetic mean (k+0.5 in linear-index
- * space) is the centre of a uniform annulus in 01_rings_spokes.
+ * Find the screen cell sitting in the middle of one (ring, spoke) cell — that's
+ * where the '@' cursor gets drawn. Because rings grow by multiplying, the
+ * "middle" radius is half a log-step out, which lands it visually centred in
+ * the widening gap rather than hugging the inner edge.
  */
 static void ctx_to_screen(const GridCtx *g, int ring, int spoke,
                           int *sr, int *sc)
@@ -321,12 +175,10 @@ static void ctx_to_screen(const GridCtx *g, int ring, int spoke,
 }
 
 /*
- * angle_char — pick the ASCII line character that best matches orientation theta.
- *
- * THE FORMULA:
- *   a = fmod(theta + 2π, π)  ← fold into [0, π) (lines have no direction)
- *   a ∈ [0, π/8) or [7π/8, π) → '-';  a ∈ [π/8, 3π/8) → '\'
- *   a ∈ [3π/8, 5π/8) → '|';          a ∈ [5π/8, 7π/8) → '/'
+ * Pick the ASCII character that best mimics a line pointing in direction theta:
+ * a dash for near-horizontal, a bar for near-vertical, a slash either way for
+ * the diagonals. A line looks the same flipped end-to-end, so we ignore which
+ * way it points and only care about its tilt.
  */
 static char angle_char(double theta)
 {
@@ -338,18 +190,12 @@ static char angle_char(double theta)
 }
 
 /*
- * ctx_draw_bg — sweep every cell, apply log-ring and spoke tests, draw.
- *
- * THE PIPELINE:
- *   for each cell (col, row):
- *     dx = (col−ox)×CELL_W,  dy = (row−oy)×CELL_H
- *     r  = √(dx²+dy²),  θ = atan2(dy,dx)
- *     if r ≤ r_min: skip
- *     u    = log(r / r_min) / log_step          continuous log ring index
- *     frac = u − floor(u)                        ∈ [0, 1)
- *     on_ring  = frac < ring_w_u  ||  frac > 1 − ring_w_u
- *     on_spoke = same fmod test as 01 on θ_norm
- *     draw '+'/angle_char/skip
+ * Draw the grid by walking every cell on screen and asking two questions:
+ * is this cell on a ring, and is it on a spoke? For the ring test we measure
+ * how far out the cell is, convert that distance into a ring count (a few rings
+ * close in, then sparser as we go out), and check whether it's right on top of
+ * a whole ring. Cells on both a ring and a spoke get a '+'; otherwise they get
+ * a line character; everything else stays blank.
  */
 static void ctx_draw_bg(const GridCtx *g)
 {
@@ -385,15 +231,17 @@ static void ctx_draw_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_GRID));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 cursor ── */
 
 /*
- * Cursor — (ring index, spoke index).  Same shape as 01_rings_spokes, but
- * ctx_to_screen interprets ring as a log-ring index (geometric spacing).
+ * Where the '@' marker currently sits, as a grid address rather than a pixel
+ * spot: which ring (counting out from the centre) and which spoke (counting
+ * around). ctx_to_screen turns this pair into an actual screen cell.
  */
-typedef struct { int ring, spoke; } Cursor;
+typedef struct {
+    int ring;   /* 0 = innermost ring, up to g->max_ring                  */
+    int spoke;  /* 0..n_spokes-1, going around; wraps past the last       */
+} Cursor;
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
 {
@@ -402,7 +250,9 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
 }
 
 /*
- * cursor_move — apply (d_ring, d_spoke); ring clamped, spoke wraps.
+ * Step the marker by some rings and spokes. Rings stop at the edges so it can't
+ * leave the grid; spokes wrap around, since going past the last spoke just
+ * brings you back to the first.
  */
 static void cursor_move(Cursor *cur, const GridCtx *g, int d_ring, int d_spoke)
 {
@@ -428,9 +278,7 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, int theme,
                      bool paused, double fps)
@@ -461,9 +309,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, int theme,
     wnoutrefresh(stdscr); doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(void)
@@ -474,9 +320,7 @@ static void screen_init(void)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 static void on_signal(int s)

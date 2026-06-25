@@ -1,164 +1,15 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 07_barycentric.c — recursive barycentric subdivision of one triangle
+ * 07_barycentric.c — keep splitting one triangle into smaller triangles
  *
- * DEMO: One big equilateral triangle is recursively split into 6 smaller
- *       triangles via "barycentric subdivision" — each step adds the
- *       centroid plus the three edge midpoints, then connects them.
- *       Use +/- to change recursion depth (0..5). At depth 0 you see the
- *       original triangle; at depth 1 the kisrhombille of one tri; at
- *       depth N there are 6^N leaf triangles.
+ * Start with one equilateral triangle. Split it into 6 smaller ones: find
+ * the center point and the middle of each side, then connect them. Do that
+ * to every piece, over and over. The depth key (+/-) sets how many times.
+ * A depth-N picture has 6^N little triangles, all self-similar.
  *
- * Study alongside: 04_30_60_90.c — single-level barycentric subdivision
- *                  applied uniformly to the equilateral tiling.
- *                  08_triforce.c — 4-way midpoint split (no centroid).
- *                  ../README.md — GridCtx primitive (this file builds a
- *                  mesh on demand instead of a per-pixel inverse).
- *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, DEPTH, SIZE_FRAC, EWMA constant
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — depth-keyed palette + HUD / hint
- *   §4 formula  — GridCtx + ctx_init + slope_char + Bresenham line_draw
- *   §5 mesh     — 6-way recursive subdivide, leaf emitter
- *                 (no Cursor — depth is the user-controlled parameter,
- *                  arrow keys go unused; +/- adjusts depth instead)
- *   §6 scene    — hud_draw + scene_draw (seed triangle + recursion)
- *   §7 screen   — ncurses init / cleanup
- *   §8 app      — signals, main loop
- *
- * Keys:  +/- depth   [/] size   r reset   t theme   p pause   q/ESC quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids/07_barycentric.c \
- *       -o 07_barycentric -lncurses -lm
+ * Related files: 04_30_60_90.c does a single split; 08_triforce.c splits
+ * a different way (corners to midpoints, no center point).
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Barycentric subdivision (algebraic topology). Take a
- *                  triangle with vertices V0, V1, V2. Compute centroid
- *                  C = (V0+V1+V2)/3 and midpoints Mij = (Vi+Vj)/2. The
- *                  six new triangles are
- *                    (C, V0, M01), (C, M01, V1), (C, V1, M12),
- *                    (C, M12, V2), (C, V2, M20), (C, M20, V0).
- *                  Each sub-triangle is a 30-60-90 right triangle.
- *                  Recurse for N levels: 6^N leaves.
- *
- * Data-structure : GridCtx carries the recursion parameters (depth,
- *                  size_frac) and screen extent. No persistent mesh array
- *                  — the recursion emits each leaf's edges directly into
- *                  the framebuffer. See ../README.md "The two primitives".
- *
- * Formula        : Centroid:    C = (V0+V1+V2)/3
- *                  Midpoints:   Mij = (Vi+Vj)/2
- *                  Six children listed above; recursion depth controlled
- *                  by +/- keys (0..5).
- *
- * Edge chars     : Each leaf triangle draws its 3 edges as Bresenham
- *                  line segments in cell space. Slope→character map:
- *                    |angle| < 22.5°  → '-'
- *                    angle near ±90°  → '|'
- *                    otherwise        → '/' or '\\' (sign of dx·dy)
- *
- * Movement       : None — depth is the user-controlled parameter.
- *                  +/- inc/dec depth, [/] adjust seed triangle size.
- *
- * References     :
- *   Barycentric subdivision  — https://en.wikipedia.org/wiki/Barycentric_subdivision
- *   Hatcher, "Algebraic Topology" §2.1 — formal definition + properties
- *   Bresenham line algorithm — https://en.wikipedia.org/wiki/Bresenham%27s_line_algorithm
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Take a triangle. Find its centroid and the midpoint of each edge.
- * Connect the centroid to all 6 (3 vertices + 3 midpoints). You get 6
- * smaller triangles. Repeat on each. Result: a self-similar fractal
- * decomposition. We don't store any of the leaves — the recursion just
- * draws their edges directly.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Every depth-N leaf is a 30-60-90 right triangle with one vertex at the
- * parent's centroid, one at a parent's edge midpoint, and one at a parent
- * vertex. The centroid sits at the intersection of the three medians.
- * Walking around the centroid you see 6 sectors — exactly the kisrhombille
- * pattern you saw in 04_30_60_90.c, applied recursively.
- *
- * For depth N, leaf count = 6^N. Each leaf draws 3 edges. Many edges are
- * shared between leaves; we draw them twice without optimisation — both
- * Bresenham passes paint the same pixels with the same character.
- *
- * DRAWING METHOD  (recursive emit, the approach used here)
- * ──────────────
- *  1. Pick DEPTH and SIZE_FRAC.
- *  2. Build the seed triangle as 3 (x, y) pixel coords centered on screen.
- *  3. Recursive function subdivide(t, depth):
- *       if depth == max_depth: draw t's 3 edges with line_draw + slope_char
- *       else:
- *         compute C and 3 midpoints
- *         build 6 children
- *         recurse on each
- *  4. Bresenham line_draw for each leaf edge in cell-space.
- *
- * KEY FORMULAS
- * ────────────
- *  Centroid of triangle (V0, V1, V2):
- *    C = ((V0.x + V1.x + V2.x) / 3,  (V0.y + V1.y + V2.y) / 3)
- *
- *  Midpoint of edge (Vi, Vj):
- *    Mij = ((Vi.x + Vj.x) / 2,  (Vi.y + Vj.y) / 2)
- *
- *  Six children of (V0, V1, V2):
- *    (C, V0, M01), (C, M01, V1), (C, V1, M12),
- *    (C, M12, V2), (C, V2, M20), (C, M20, V0)
- *
- *  Slope → character (after aspect-correcting for CELL_W, CELL_H):
- *    angle = atan2(|dy|/CELL_H, |dx|/CELL_W)
- *    angle < 22.5°       → '-'
- *    angle > 67.5°       → '|'
- *    same sign (dx, dy)  → '\\'
- *    opposite signs      → '/'
- *
- *  Equilateral seed centered on screen with apex up:
- *    base = SIZE_FRAC · min(screen_w_pix, screen_h_pix)
- *    h    = base · √3 / 2
- *    V0 = (cx,            cy − 2·h/3)   ← apex
- *    V1 = (cx − base/2,   cy +   h/3)
- *    V2 = (cx + base/2,   cy +   h/3)
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Recursion depth is bounded by stack size, which for 6^N at N=5 is
- *    fine (~7000 stack frames in the deepest path). N=6 would be 46656
- *    leaves — likely slow at 60 fps.
- *  • Bresenham draws each leaf edge in cell-space. Adjacent leaves share
- *    an edge; we draw it twice. The repaint is harmless (same character,
- *    same color) but doubles the line work. Tolerable at the depths used.
- *  • Color is keyed to depth, not leaf identity. All leaves at the same
- *    recursion depth are the same color — visually communicates the
- *    hierarchical structure.
- *  • Resize: recompute the seed triangle each frame from the current
- *    GridCtx extent. No state to recompute; the recursion is pure.
- *
- * HOW TO VERIFY
- * ─────────────
- *  At depth 0: 6^0 = 1 leaf — the original equilateral. HUD shows
- *    "depth:0 leaves:1".
- *  At depth 1: 6 leaves, all 30-60-90s meeting at the equilateral's
- *    centroid. HUD shows "depth:1 leaves:6".
- *  At depth N: HUD shows leaves = 6^N.
- *
- *  Quick sanity: every leaf at depth ≥ 1 has at least one vertex at the
- *  parent's centroid (which is the parent's centroid at depth ≥ 2 too,
- *  recursively). So you should see 6 distinct edges meeting at every
- *  centroid in the figure.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -175,9 +26,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 
@@ -196,16 +45,14 @@
 #define MAX_DEPTH_LEVELS (DEPTH_MAX + 1)
 #define N_THEMES         3
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How much each new frame nudges the displayed fps. Small = steady number. */
 #define FPS_EWMA_ALPHA 0.05
 
 #define PAIR_DEPTH_BASE  1
 #define PAIR_HUD        (PAIR_DEPTH_BASE + MAX_DEPTH_LEVELS)
 #define PAIR_HINT       (PAIR_HUD + 1)
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -222,9 +69,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static const short PAL256[N_THEMES][MAX_DEPTH_LEVELS] = {
     /* ocean */ {  15,  39,  21, 207, 196, 226 },
@@ -249,36 +94,33 @@ static void color_init(int theme)
     init_pair(PAIR_HINT, COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx + slope_char + Bresenham line                     */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula — grid context, line characters, line drawing ── */
 
 /*
- * GridCtx — geometry + recursion parameters for the substitution mesh.
+ * GridCtx — everything we need to draw one frame.
  *
- * Shape mirrors the canonical GridCtx (rect_grids/01_uniform_rect.c) but
- * carries the substitution-specific extras: depth and size_frac. The
- * recursion is pure — no persistent mesh array — so GridCtx is also the
- * complete state needed to redraw.
+ * It holds the current terminal size, where the center of the picture sits,
+ * and the two knobs the user controls (how many times to split, how big the
+ * triangle is). Because we never store the triangles themselves, this little
+ * struct is the whole picture's state — hand it to the drawing code and it
+ * can redraw from scratch.
  */
 typedef struct {
-    /* terminal extent */
+    /* how many rows and columns the terminal currently has */
     int    rows, cols;
 
-    /* cell size in screen characters (aspect-correction only) */
+    /* one character is this many tiny units wide/tall; lets us treat the
+       screen as square even though characters are taller than they are wide */
     int    cw, ch;
 
-    /* screen origin (centre of seed triangle, in pixel-sub-units) */
+    /* center of the picture, measured in those tiny units */
     int    ox, oy;
 
-    /* recursion parameters */
-    int    depth;
-    double size_frac;
+    int    depth;       /* how many times to split (0..5) */
+    double size_frac;   /* triangle size, as a fraction of the screen */
 } GridCtx;
 
-/*
- * ctx_init — derive geometry from terminal size + scene parameters.
- */
+/* Work out the geometry from the current terminal size and the user's knobs. */
 static void ctx_init(GridCtx *g, int rows, int cols, int depth, double size_frac)
 {
     g->rows = rows; g->cols = cols;
@@ -290,14 +132,10 @@ static void ctx_init(GridCtx *g, int rows, int cols, int depth, double size_frac
 }
 
 /*
- * slope_char — pixel-space (dx, dy) → ASCII line character.
- *
- * Aspect-correct by normalising dx, dy by (CELL_W, CELL_H) before
- * computing the angle. Lines are bucketed into 4 classes:
- *   |angle| < 22.5°    → '-'
- *   |angle| > 67.5°    → '|'
- *   same-sign dx, dy   → '\\'
- *   opposite-sign      → '/'
+ * Pick the character that best matches a line's slant: '-' for nearly flat,
+ * '|' for nearly upright, and '/' or '\' for the diagonals. We squish the
+ * direction by the cell shape first so the choice looks right on screen,
+ * where characters are taller than they are wide.
  */
 static char slope_char(double dx, double dy)
 {
@@ -310,11 +148,9 @@ static char slope_char(double dx, double dy)
 }
 
 /*
- * line_draw — Bresenham in cell space.
- *
- * Pixel endpoints (px0, py0) → (px1, py1) are converted to cell coords
- * by integer division by (CELL_W, CELL_H). The character is constant
- * along the line (chosen by slope_char of the pixel delta).
+ * Draw a straight line between two points using Bresenham's method — the
+ * classic trick for stepping along a line one cell at a time using only
+ * integers. The whole line uses one character, chosen from its slant.
  */
 static void line_draw(const GridCtx *g, double px0, double py0,
                       double px1, double py1, int attr)
@@ -337,18 +173,18 @@ static void line_draw(const GridCtx *g, double px0, double py0,
     attroff(attr);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  mesh — 6-way recursive subdivide                                    */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 mesh — split each triangle into 6 ── */
 /*
- * No Cursor struct: the user "moves" through the visualisation by changing
- * DEPTH (+/-) and SIZE_FRAC ([/]), not by stepping through individual
- * leaves. A leaf-index cursor would need pre-computing the mesh just to
- * count leaves; we keep the recursion pure-emit.
+ * There's no "cursor" here. You explore by changing the depth (+/-) and the
+ * size ([/]), not by stepping through individual triangles. So we never
+ * store the triangles at all — we just draw them as we generate them.
  */
 
+/* One triangle: its three corners, stored as x's and y's. */
 typedef struct { double x[3], y[3]; } Tri;
 
+/* Draw a triangle's three sides. Color comes from depth, so every triangle
+   at the same split level looks alike; level 0 is drawn bold to stand out. */
 static void tri_draw_edges(const GridCtx *g, Tri t, int depth)
 {
     int pair = PAIR_DEPTH_BASE + depth;
@@ -359,10 +195,10 @@ static void tri_draw_edges(const GridCtx *g, Tri t, int depth)
 }
 
 /*
- * subdivide — emit leaves at max_depth, otherwise split into 6 children.
- *
- * Six children are formed by the centroid + 3 edge midpoints. Each
- * child is (C, V_i, M_ij) traversing around the parent counter-clockwise.
+ * The heart of it. If we've split enough, just draw this triangle. Otherwise
+ * find its center point and the middle of each side, fan out into 6 smaller
+ * triangles (each one runs center -> a corner -> the next side's middle),
+ * and do the same to every piece.
  */
 static void subdivide(const GridCtx *g, Tri t, int depth, int max_depth)
 {
@@ -385,13 +221,8 @@ static void subdivide(const GridCtx *g, Tri t, int depth, int max_depth)
 }
 
 /*
- * scene_seed — equilateral seed triangle centered on screen, apex up.
- *
- *   base = SIZE_FRAC · min(pw, ph)
- *   h    = base · √3 / 2
- *   V0 = (cx,           cy − 2·h/3)   ← apex
- *   V1 = (cx − base/2,  cy +   h/3)
- *   V2 = (cx + base/2,  cy +   h/3)
+ * Build the starting triangle: a centered equilateral one, point up, sized
+ * to a fraction of whichever screen dimension is smaller so it always fits.
  */
 static Tri scene_seed(const GridCtx *g)
 {
@@ -408,15 +239,14 @@ static Tri scene_seed(const GridCtx *g)
     return t;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
+/* The user's current settings — everything the keys can change. */
 typedef struct {
-    int    depth;
-    double size_frac;
-    int    theme;
-    int    paused;
+    int    depth;       /* how many times to split (0..5) */
+    double size_frac;   /* triangle size, fraction of the screen */
+    int    theme;       /* which color palette is active */
+    int    paused;      /* true while paused */
 } Scene;
 
 static void scene_reset(Scene *s)
@@ -427,9 +257,10 @@ static void scene_reset(Scene *s)
     s->paused    = 0;
 }
 
-/* Bright bold yellow fps readout (top-right) + bold cyan key hints (bottom). */
+/* Status line top-right, key hints bottom-left. */
 static void hud_draw(const GridCtx *g, const Scene *s, double fps)
 {
+    /* each split turns one triangle into six, so the count is 6 to the depth */
     long leaves = 1; for (int i = 0; i < s->depth; i++) leaves *= 6;
     char buf[128];
     snprintf(buf, sizeof buf,
@@ -456,9 +287,7 @@ static void scene_draw(const GridCtx *g, const Scene *s, double fps)
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -473,9 +302,7 @@ static void screen_init(int theme)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;
@@ -503,6 +330,8 @@ int main(void)
     int64_t t0  = clock_ns();
 
     while (g_running) {
+        /* terminal was resized: tear ncurses down and back up so it picks
+           up the new size, otherwise the display stays corrupted */
         if (g_need_resize) {
             g_need_resize = 0;
             endwin(); refresh();

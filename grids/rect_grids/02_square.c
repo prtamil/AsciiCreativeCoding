@@ -1,142 +1,14 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 02_square.c — rectangular grid with visually square cells
+ * 02_square.c — a grid whose cells actually look square on screen.
  *
- * DEMO: Same formula as 01_uniform_rect.c but CELL_W is derived from
- *       CELL_H using the terminal's character aspect ratio (~2:1 h:w).
- *       The HUD shows both character dimensions and pixel estimates so
- *       you can see why CELL_W must be 2× CELL_H for square pixels.
+ * Terminal characters are taller than they are wide (roughly twice as tall),
+ * so a cell that's equal in rows and columns ends up looking thin. The fix:
+ * make each cell twice as wide (in characters) as it is tall. Move the @ with
+ * the arrow keys. Same drawing as 01_uniform_rect.c — only the width changes.
  *
- * Study alongside: 01_uniform_rect.c (base formula), 03_fine_dense.c
- *
- * Section map:
- *   §1 config   — CELL_H, ASPECT_RATIO, CELL_W (derived), EWMA constant
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — grid / active / cursor / HUD / HINT pairs
- *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_grid_char / ctx_draw_bg
- *   §5 cursor   — Cursor + cursor_reset / cursor_move / cursor_draw
- *   §6 scene    — hud_draw + scene_draw
- *   §7 screen   — ncurses init / cleanup
- *   §8 app      — signals, main loop
- *
- * Keys:  arrows move @   r reset   q/ESC quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/rect_grids/02_square.c \
- *       -o 02_square -lncurses
+ * Study alongside: 01_uniform_rect.c (the base version), 03_fine_dense.c
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Identical to 01_uniform_rect. Only CELL_W is chosen
- *                  differently — derived from CELL_H using the character
- *                  aspect ratio rather than picked independently.
- *
- * Aspect ratio   : Terminal character cells are NOT square in pixels.
- *                  A typical font has:  char_w ≈ 8 px,  char_h ≈ 16 px
- *                  → aspect ratio = char_h / char_w ≈ 2.0
- *
- *                  For a cell to appear square in pixels:
- *                    pixel_cell_w  = pixel_cell_h
- *                    CELL_W * char_w = CELL_H * char_h
- *                    CELL_W = CELL_H * (char_h / char_w)
- *                    CELL_W = CELL_H * ASPECT_RATIO
- *
- *                  With CELL_H=4, ASPECT_RATIO=2.0:
- *                    CELL_W = 4 * 2 = 8  → cells are 8 chars wide, 4 chars tall
- *                    pixel size ≈ 8*8=64px × 4*16=64px  ✓  square
- *
- * Formula        : Identical to 01_uniform_rect:
- *                    screen_row = r * ch
- *                    screen_col = c * cw          (but cw = ch * ASPECT)
- *                  See ctx_to_screen() in §4.
- *
- * References     :
- *   Terminal font metrics — en.wikipedia.org/wiki/Monospace_font
- *   Pixel aspect ratio    — en.wikipedia.org/wiki/Pixel_aspect_ratio
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Terminal characters are NOT square pixels — they are taller than they are
- * wide.  A typical monospace font cell is ~8 px wide × ~16 px tall.  If you
- * use equal CELL_W and CELL_H in character counts, your grid cells appear
- * tall and thin on the physical display.  To make them look square you must
- * compensate: set CELL_W = CELL_H * (char_height / char_width).
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Think in TWO coordinate systems simultaneously:
- *
- *   Character space:  positions measured in terminal characters (cols/rows).
- *   Pixel space:      positions measured in physical screen pixels.
- *
- * The grid formula lives in character space.  The visual result lives in
- * pixel space.  They are related by the character aspect ratio:
- *
- *   pixel_x = char_x * char_width_px      (typically * 8)
- *   pixel_y = char_y * char_height_px     (typically * 16)
- *
- * For a cell to appear square in pixels:
- *   pixel_cell_width = pixel_cell_height
- *   CELL_W * char_w  = CELL_H * char_h
- *   CELL_W           = CELL_H * (char_h / char_w)
- *   CELL_W           = CELL_H * ASPECT_RATIO
- *
- * DRAWING METHOD
- * ──────────────
- *  1. Pick CELL_H (how many rows per cell).  This is the "base" dimension.
- *  2. DERIVE CELL_W: CELL_W = CELL_H * ASPECT_RATIO (do NOT pick independently).
- *  3. Draw the grid exactly as in 01_uniform_rect using these derived values.
- *  4. Verify visually: the cells should look square on your monitor.
- *
- *  If cells look too tall:  ASPECT_RATIO is too low — increase it.
- *  If cells look too wide:  ASPECT_RATIO is too high — decrease it.
- *  Common values: 2.0 (most terminals), 1.6 (some HD setups), 2.1 (retro).
- *
- * KEY FORMULAS
- * ────────────
- *  Aspect ratio derivation:
- *    ASPECT_RATIO = char_height_px / char_width_px  (≈ 2.0 typical)
- *
- *  Derived cell width (the only formula that differs from 01):
- *    CELL_W = CELL_H * ASPECT_RATIO
- *
- *  Pixel size of each cell (for verification):
- *    pixel_w = CELL_W * char_w  =  CELL_H * ASPECT_RATIO * char_w
- *            =  CELL_H * (char_h/char_w) * char_w
- *            =  CELL_H * char_h    <- equals pixel_h. Square! ✓
- *
- *  Everything else (line test, forward/inverse) is identical to 01.
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Integer ASPECT_RATIO: using ASPECT_RATIO=2 (integer) avoids floating
- *    point and keeps CELL_W exact.  If your font is not exactly 2:1, cells
- *    will be slightly non-square but close enough for most purposes.
- *
- *  • Font changes: switching fonts changes the aspect ratio.  The grid
- *    cells will look non-square until ASPECT_RATIO is tuned.  There is no
- *    way to query the true pixel dimensions from within ncurses.
- *
- *  • CELL_H=1 and ASPECT_RATIO=2 gives CELL_W=2: a valid grid but very
- *    dense (every other row is a line, lines 2 chars wide).
- *
- *  • Do NOT pick CELL_W and CELL_H independently for a "square" grid —
- *    their ratio must equal the aspect ratio.  Getting this wrong is the
- *    most common mistake when first drawing grids.
- *
- * HOW TO VERIFY
- * ─────────────
- *  Take a screenshot at 1:1 pixel zoom.  Measure one cell in pixels.
- *  width_px / height_px should be ~1.0 for a square grid.
- *  In the terminal: a cell with CELL_W=8, CELL_H=4 at a 8×16 font is
- *  exactly 64 × 64 pixels — perfectly square.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
@@ -148,39 +20,31 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS      30
 
 /*
- * ASPECT_RATIO = char_height / char_width ≈ 2.0 for most terminal fonts.
- *
- * Derivation:
- *   We want: CELL_W * char_w  ==  CELL_H * char_h   (square in pixels)
- *   →  CELL_W = CELL_H * (char_h / char_w) = CELL_H * ASPECT_RATIO
- *
- * If your cells look taller than wide: increase ASPECT_RATIO.
- * If your cells look wider than tall:  decrease ASPECT_RATIO.
+ * How much taller a character is than it is wide — about 2 for most fonts.
+ * That's why the cell width is the height times this number: it cancels out
+ * the stretch so the cell looks square. If cells still look too tall, bump
+ * this up; too wide, bring it down.
  */
-#define CELL_H          4               /* rows per cell (you tune this)        */
-#define ASPECT_RATIO    2               /* char_h / char_w; integer for clarity */
-#define CELL_W          (CELL_H * ASPECT_RATIO)  /* = 8: derived, not a guess  */
+#define CELL_H          4               /* rows per cell — the one you pick     */
+#define ASPECT_RATIO    2               /* whole number keeps the width exact   */
+#define CELL_W          (CELL_H * ASPECT_RATIO)  /* width follows from the height */
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* Smoothing for the FPS number so it doesn't jitter every frame. */
 #define FPS_EWMA_ALPHA  0.05
 
 /* Color pair IDs */
-#define PAIR_GRID    1   /* dim grid lines               */
-#define PAIR_ACTIVE  2   /* highlighted cell fill        */
-#define PAIR_CURSOR  3   /* bright '@'                   */
-#define PAIR_HUD     4   /* status bar (yellow)          */
-#define PAIR_HINT    5   /* key-hint footer (cyan)       */
+#define PAIR_GRID    1   /* grid lines              */
+#define PAIR_ACTIVE  2   /* fill of the cell you're on */
+#define PAIR_CURSOR  3   /* the '@' marker          */
+#define PAIR_HUD     4   /* status bar (yellow)     */
+#define PAIR_HINT    5   /* key hints (cyan)        */
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -197,9 +61,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static void color_init(void)
 {
@@ -211,24 +73,19 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx and the cell ↔ screen mapping                    */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula — turning a cell (row, col) into a spot on the screen ── */
 
 /*
- * GridCtx — geometry of the active grid plus cursor bounds.
+ * GridCtx — everything we need to know to lay the grid out on this terminal.
  *
- * cw is derived from ch via ASPECT_RATIO so cells appear square in pixels.
+ * One of these is built when the program starts and rebuilt on every resize.
+ * The width is always the height times ASPECT_RATIO, which is the whole point
+ * of this file: that's what keeps the cells looking square.
  */
 typedef struct {
-    /* terminal extent */
-    int rows, cols;
-
-    /* cell size in screen characters (cw = ch * ASPECT_RATIO) */
-    int cw, ch;
-
-    /* cursor bounds — last whole cell that fits in (rows-1) × cols */
-    int max_r, max_c;
+    int rows, cols;      /* size of the terminal, in characters                */
+    int cw, ch;          /* one cell's width and height in characters (cw = ch * ASPECT_RATIO) */
+    int max_r, max_c;    /* the highest cell the cursor can sit on without falling off the edge */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols)
@@ -239,15 +96,7 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->max_c = cols / CELL_W - 1;
 }
 
-/*
- * ctx_to_screen — top-left corner of cell (r,c) in screen coordinates.
- *
- *   screen_row = r * ch
- *   screen_col = c * cw          (cw = ch * ASPECT_RATIO)
- *
- * The ONLY difference from 01 is that cw is derived from ch.
- * That single constraint makes the cells appear square in pixels.
- */
+/* Finds the top-left corner of a cell: step over by one cell per row/column. */
 static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
     *sr = r * g->ch;
@@ -277,10 +126,9 @@ static void ctx_draw_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_GRID));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 cursor ── */
 
+/* Which cell the '@' is sitting on, in grid coordinates (row, column). */
 typedef struct { int r, c; } Cursor;
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
@@ -312,9 +160,7 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
 {
@@ -343,9 +189,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -357,9 +201,7 @@ static void screen_init(void)
     color_init(); atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;

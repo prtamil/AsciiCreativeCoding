@@ -1,140 +1,13 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 04_coarse_sparse.c — large-cell rectangular grid with coordinate labels
+ * 04_coarse_sparse.c — a rectangular grid with big cells, each one labelled
+ * with its own (row,col) so the grid reads like a map. Big cells make the
+ * point clear: a grid cell is just a named patch of the screen. Move the @
+ * around with the arrow keys.
  *
- * DEMO: CELL_W=20, CELL_H=6. The large interior space of each cell is
- *       used to display its (row,col) coordinate label, making the grid
- *       read like a map. This shows what a grid cell actually IS:
- *       a named region of screen space.
- *
- * Study alongside: 03_fine_dense.c (small cells), 01_uniform_rect.c (base)
- *
- * Section map:
- *   §1 config   — CELL_W=20, CELL_H=6, EWMA constant
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — grid / active / cursor / HUD / HINT / LABEL pairs
- *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_grid_char / ctx_draw_bg
- *   §5 cursor   — Cursor + cursor_reset / cursor_move / cursor_draw
- *   §6 scene    — labels_draw + hud_draw + scene_draw
- *   §7 screen   — ncurses init / cleanup
- *   §8 app      — signals, main loop
- *
- * Keys:  arrows move @   r reset   q/ESC quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/rect_grids/04_coarse_sparse.c \
- *       -o 04_coarse_sparse -lncurses
+ * Sister files: 03_fine_dense.c (tiny cells), 01_uniform_rect.c (the basic
+ * version this builds on).
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Same Cartesian grid formula. The large cell size lets us
- *                  place a text label inside each cell, turning the grid
- *                  into a visible coordinate system.
- *
- * Label position : The label "(r,c)" is placed at:
- *                    label_row = sr + 1             (first interior row)
- *                    label_col = sc + 1             (first interior col)
- *                  where (sr, sc) = ctx_to_screen(g, r, c).
- *                  With CELL_H=6 there are 5 interior rows — plenty of space.
- *
- * Why large cells : A real-world use case is a map grid (room layout,
- *                  dungeon floor, spreadsheet). The coordinate label inside
- *                  each cell is the first step toward named grid regions.
- *
- * References     :
- *   Grid-based maps in games — www.redblobgames.com/pathfinding/grids/graphs.html
- *   Same formula as 01_uniform_rect — see §4 there for derivation
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * When cells are large, they become REGIONS — named, addressable areas of
- * screen space.  The grid lines are now "walls" and the cell interior is
- * "floor".  A text label "(row,col)" placed inside each cell turns the
- * grid into a navigable coordinate map.  This is the mental model behind
- * map grids, spreadsheets, dungeon rooms, and game tile editors.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Stop thinking of cells as tiny pixels.  Think of them as rooms in a
- * building.  Each room has:
- *   - An address: (row, col) — its grid coordinate.
- *   - A floor area: the interior characters.
- *   - Walls: the grid line characters that border it.
- *
- * The cell formula maps the room address to its top-left wall corner.
- * Everything else about the room is computed relative to that corner.
- *
- *   top-left corner: (r*CELL_H, c*CELL_W)
- *   top-right corner: (r*CELL_H, (c+1)*CELL_W)
- *   bottom-left: ((r+1)*CELL_H, c*CELL_W)
- *   floor (interior top-left): (r*CELL_H+1, c*CELL_W+1)
- *   floor size: (CELL_H-1) rows  x  (CELL_W-1) cols
- *   centre: (r*CELL_H + CELL_H/2, c*CELL_W + CELL_W/2)
- *
- * DRAWING METHOD
- * ──────────────
- *  Phase 1 — draw grid lines (same as 01_uniform_rect):
- *    raster scan; on_h = sr%CELL_H==0; on_v = sc%CELL_W==0.
- *
- *  Phase 2 — fill cell content:
- *    For each cell (r, c), compute top-left corner (sr, sc) via ctx_to_screen.
- *    Place label at (sr + 1, sc + 2) — first interior row, slight left indent.
- *    Place '@' at centre: (sr + CELL_H/2, sc + CELL_W/2).
- *
- *  ORDER MATTERS: draw grid lines first, then content on top.
- *  If you draw content first and grid lines second, the '+'/'−'/'|'
- *  characters will overwrite the first column/row of your label.
- *  Alternatively: draw grid lines ONLY on borders and skip interior positions.
- *
- * KEY FORMULAS
- * ────────────
- *  Cell top-left corner (sr, sc):
- *    sr = r * CELL_H,   sc = c * CELL_W
- *
- *  Label position (top-left of interior, with indent):
- *    label_row = sr + 1                <- first interior row
- *    label_col = sc + 2                <- 2 cols from left border
- *
- *  Cell centre (for '@'):
- *    centre_row = sr + CELL_H / 2
- *    centre_col = sc + CELL_W / 2
- *
- *  Label character budget (max label length before truncation):
- *    max_label_len = CELL_W - 3        (2 left indent + 1 right margin)
- *    For CELL_W=20: max_label_len = 17 chars — plenty for "(rr,cc)".
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Label truncation: if CELL_W < label_length + 3, the label will overflow
- *    into the right border or neighbouring cell.  Use snprintf with a buffer
- *    sized generously (at least 24 bytes for "(row,col)" with 2-digit coords).
- *
- *  • Cursor cell: skip the label draw for the cursor's cell — the cursor
- *    draws its own content.  Otherwise you get label text drawn under '@'.
- *
- *  • Iterating cells vs. raster scan: for coarse grids it is more efficient
- *    to iterate cells (two nested loops over r,c) than to raster-scan every
- *    pixel and check if it is in a cell interior.
- *
- *  • Bottom/right partial cells: if LINES or COLS is not a multiple of
- *    CELL_H or CELL_W, the last row or column of cells is truncated.
- *    The label may be clipped.  Guard: only draw label if sr+1 < LINES-1
- *    and sc+2 < COLS.
- *
- * HOW TO VERIFY
- * ─────────────
- *  Each visible cell should show exactly one "(r,c)" label.  If labels
- *  appear twice or overlap: check draw order (grid lines must come after
- *  interior fill, or you must deliberately not draw over interior).
- *  If label is missing from last column: increase buffer size or check
- *  the max_c computation in ctx_init.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
@@ -146,35 +19,29 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS  30
 
-/*
- * Large cells — the interior (excluding border) has room for text:
- *   interior height = CELL_H - 1 = 5 rows
- *   interior width  = CELL_W - 1 = 19 cols
- * An 80×24 terminal holds 4 cols × 3 rows = 12 cells (easy to navigate).
- */
+/* Each cell is 20 wide and 6 tall, so there's plenty of empty space inside
+ * the borders to print a label. On a normal 80x24 terminal that's about a
+ * 4-by-3 grid of cells — small enough to wander around comfortably. */
 #define CELL_W  20
 #define CELL_H   6
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* The frame rate shown in the corner jitters frame to frame, so we average
+ * it gently over time to give a steady, readable number. Smaller = smoother. */
 #define FPS_EWMA_ALPHA  0.05
 
-/* Color pair IDs */
-#define PAIR_GRID    1   /* grid lines                   */
-#define PAIR_ACTIVE  2   /* highlighted cell fill        */
-#define PAIR_CURSOR  3   /* bright '@'                   */
-#define PAIR_HUD     4   /* status bar (yellow)          */
-#define PAIR_LABEL   5   /* coordinate labels in cells   */
-#define PAIR_HINT    6   /* key-hint footer (cyan)       */
+/* Named slots for our colours. */
+#define PAIR_GRID    1   /* the grid lines               */
+#define PAIR_ACTIVE  2   /* the filled-in cell under @    */
+#define PAIR_CURSOR  3   /* the bright @ itself           */
+#define PAIR_HUD     4   /* the status readout (yellow)   */
+#define PAIR_LABEL   5   /* the (row,col) text in a cell  */
+#define PAIR_HINT    6   /* the key-hints footer (cyan)   */
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -189,9 +56,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static void color_init(void)
 {
@@ -204,22 +69,21 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx and the cell ↔ screen mapping                    */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula — turning a (row,col) into a screen position ── */
 
 /*
- * GridCtx — geometry of the active grid plus cursor bounds.
- * Same shape as 01_uniform_rect; only cw/ch differ (large coarse cells).
+ * GridCtx — everything we need to know to lay the grid out and keep the
+ * cursor in bounds. Computed once at startup (and again on resize), then
+ * passed around read-only. Same idea as 01_uniform_rect; only the cell size
+ * is bigger here.
  */
 typedef struct {
-    /* terminal extent */
-    int rows, cols;
+    int rows, cols;   /* size of the terminal, in characters              */
+    int cw, ch;       /* size of one cell: width and height in characters */
 
-    /* cell size in screen characters */
-    int cw, ch;
-
-    /* cursor bounds — last whole cell that fits in (rows-1) × cols */
+    /* The highest cell the cursor may sit on. We leave the bottom screen
+     * row free for the key-hints footer, so only whole cells that fit above
+     * it count. */
     int max_r, max_c;
 } GridCtx;
 
@@ -231,21 +95,9 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->max_c = cols / CELL_W - 1;
 }
 
-/*
- * ctx_to_screen — THE FORMULA (unchanged from 01_uniform_rect):
- *
- *   screen_row = r * ch    (= r * 6)
- *   screen_col = c * cw    (= c * 20)
- *
- * LABEL PLACEMENT FORMULA:
- *   A text label "(r,c)" is placed at the first interior position:
- *     label_row = sr + 1           ← one row below top border
- *     label_col = sc + 2           ← two cols right of left border
- *
- *   Centre the '@' using:
- *     centre_row = sr + ch / 2     (= sr + 3)
- *     centre_col = sc + cw / 2     (= sc + 10)
- */
+/* Where on the screen does cell (r,c) start? Its top-left corner is simply
+ * the cell number times the cell size. Everything we draw in a cell — the
+ * label, the @ — is measured from this corner. */
 static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
     *sr = r * g->ch;
@@ -274,10 +126,10 @@ static void ctx_draw_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_GRID));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 cursor ── */
 
+/* Where the @ currently sits, as a cell coordinate (which row, which column).
+ * Not pixels — just which cell. */
 typedef struct { int r, c; } Cursor;
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
@@ -304,7 +156,7 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
             mvaddch(sr + dr, sc + dc, (chtype)' ');
     attroff(COLOR_PAIR(PAIR_ACTIVE));
 
-    /* Label in active cell */
+    /* the cell under the cursor shows its own label, in the highlight colour */
     char lbl[24]; snprintf(lbl, sizeof lbl, "(%d,%d)", cur->r, cur->c);
     attron(COLOR_PAIR(PAIR_ACTIVE));
     mvprintw(sr + 1, sc + 2, "%s", lbl);
@@ -315,17 +167,11 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
-/*
- * labels_draw — place "(row,col)" text in the top-left of every visible cell.
- *
- * Label position formula:
- *   label_row = cell_screen_row + 1   (first interior row)
- *   label_col = cell_screen_col + 2   (first interior col, slight indent)
- */
+/* Print each cell's own coordinate near its top-left, just inside the border.
+ * The cell under the cursor is skipped here — cursor_draw paints that one in
+ * its own colour, so we'd just be drawing over it. */
 static void labels_draw(const GridCtx *g, const Cursor *cur)
 {
     int gr = (g->rows - 1) / g->ch;
@@ -333,7 +179,7 @@ static void labels_draw(const GridCtx *g, const Cursor *cur)
 
     for (int r = 0; r < gr; r++) {
         for (int c = 0; c < gc; c++) {
-            if (r == cur->r && c == cur->c) continue;  /* cursor draws own cell */
+            if (r == cur->r && c == cur->c) continue;  /* cursor paints this one */
             int sr, sc;
             ctx_to_screen(g, r, c, &sr, &sc);
             char lbl[24];
@@ -371,9 +217,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(void)
@@ -384,9 +228,7 @@ static void screen_init(void)
     color_init(); atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 static void on_signal(int s)
@@ -410,6 +252,8 @@ int main(void)
 
     while (g_running) {
         if (g_need_resize) {
+            /* the window changed size — tear ncurses down and bring it back
+             * so LINES/COLS are correct, then recompute the grid to fit */
             g_need_resize = 0;
             endwin(); refresh();
             ctx_init(&g, LINES, COLS);

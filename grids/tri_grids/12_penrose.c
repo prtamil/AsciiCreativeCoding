@@ -1,185 +1,57 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 12_penrose.c — Penrose-style aperiodic substitution with Robinson triangles
+ * 12_penrose.c — a Penrose-style tiling drawn by splitting triangles forever.
  *
- * DEMO: Two golden-ratio isoceles triangles — "acute" (apex 36°) and
- *       "obtuse" (apex 108°) — recursively substitute into smaller
- *       copies of themselves with the golden ratio φ. Use +/- to change
- *       depth (0..10). Triangle count grows roughly as 2^N. The result
- *       is a fragment of a Penrose P3 tiling: aperiodic, with 5-fold
- *       rotational symmetry on average and self-similar at scale 1/φ.
+ * We start with one of two special triangles and keep cutting each one into
+ * two smaller copies of the same family. After a few rounds the screen fills
+ * with a pattern that never quite repeats — the hallmark of a Penrose tiling.
  *
- * Study alongside: 10_pinwheel.c — another aperiodic substitution
- *                  (5-way split with √5 scaling).
- *                  09_sierpinski.c — periodic 3-way self-similar split.
- *                  ../README.md — GridCtx primitive (this file builds a
- *                  mesh on demand instead of a per-pixel inverse).
- *
- * Section map:
- *   §1 config   — CELL_W, CELL_H, DEPTH, SIZE_FRAC, PHI, EWMA constant
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — type-keyed palette (acute vs obtuse) + HUD / hint
- *   §4 formula  — GridCtx + ctx_init + slope_char + Bresenham line_draw
- *   §5 mesh     — golden-ratio substitute for each Robinson triangle
- *                 (no Cursor — depth is the user-controlled parameter,
- *                  arrow keys go unused; +/- adjusts depth instead)
- *   §6 scene    — hud_draw + scene_draw (acute/obtuse seed + recursion)
- *   §7 screen   — ncurses init / cleanup
- *   §8 app      — signals, main loop
- *
- * Keys:  +/- depth   [/] size   s swap-seed-type   r reset
- *        t theme   p pause   q/ESC quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids/12_penrose.c \
- *       -o 12_penrose -lncurses -lm
+ * Sister files: 10_pinwheel.c and 09_sierpinski.c — other "split a shape into
+ * smaller copies of itself" demos to compare against.
+ * The full math: https://en.wikipedia.org/wiki/Penrose_tiling
  */
 
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
+/* ── the idea ───────────────────────────────────────────────────────────── *
  *
- * Algorithm      : Robinson-triangle substitution. Two prototiles:
- *                    Acute (A): isoceles, apex 36°, base angles 72° each,
- *                              leg = φ, base = 1.
- *                    Obtuse (B): isoceles, apex 108°, base angles 36° each,
- *                              leg = 1, base = φ.
- *                  Substitution rule (the "half-rhomb" 2/2 version):
- *                    A → B + A    (B at full scale, A at scale 1/φ)
- *                    B → A + B    (both at scale 1/φ)
+ * Two triangles do all the work. One is tall and thin (we call it "acute",
+ * sharp point at the top). One is wide and shallow ("obtuse", blunt point at
+ * the top). Both are built around the golden ratio, the famous number
+ * φ ≈ 1.618 that shows up whenever something splits into a 1-to-bigger
+ * proportion.
  *
- *                  NOT a strict Penrose P3 inflation rule — strict P3 uses
- *                  A→A+B and B→A+2B with all children at scale 1/φ. The
- *                  2/2 simplification produces an aperiodic-looking
- *                  golden-ratio fractal that demonstrates the same key
- *                  ideas (two prototiles, golden split, self-similarity).
+ * The trick: each triangle can be cut into two smaller triangles drawn from
+ * the same two-shape family. Cut those, cut their pieces, and so on. The
+ * cut always lands at the golden-ratio point along one edge, which is why
+ * the pattern never settles into a repeating grid — you can't tile the plane
+ * periodically with an irrational ratio baked in. That "never repeats" quality
+ * is what makes it a Penrose-style tiling.
  *
- * Data-structure : GridCtx carries the recursion parameters (depth,
- *                  size_frac, seed_type) and screen extent. No persistent
- *                  mesh array — the recursion emits each leaf's edges
- *                  directly into the framebuffer. See ../README.md
- *                  "The two primitives".
+ * A note on honesty: this uses a simplified cut (each triangle makes exactly
+ * two children) rather than the textbook Penrose rule (which makes two or
+ * three). It looks aperiodic and shows the same core ideas — two shapes, a
+ * golden-ratio cut, self-similarity — without the bookkeeping.
  *
- * Formula        : Place a split point P on a chosen edge at the golden-
- *                  ratio fraction (1/φ along the leg or base). The two
- *                  children share the apex of one of the parent's triangles
- *                  with this new vertex; see §5 substitute for explicit
- *                  vertex lists.
+ * The cut, in words:
+ *   - For the thin (acute) triangle, mark a point along one leg at the
+ *     golden-ratio spot, then join it up to form one wide child and one
+ *     thin child.
+ *   - For the wide (obtuse) triangle, mark a point along the long base at
+ *     the golden-ratio spot, then join it up the same way.
+ *   Either way: one acute child + one obtuse child, both smaller.
  *
- * Edge chars     : Same Bresenham + slope_char as 07-11. Each leaf draws
- *                  3 edges in its prototype color (acute or obtuse).
+ * The exact corner-by-corner recipe lives next to the substitute() function
+ * in §5 — that's where the meaning of each vertex is spelled out.
  *
- * Movement       : None. Depth controlled by +/-, seed type by 's'.
+ * What you'll see: bump the depth up with +/-. Depth 0 is just the starting
+ * triangle; each step doubles the triangle count, so depth 10 is ~1024 of
+ * them. Around depth 4 and up the familiar Penrose motifs (suns, stars,
+ * kites, darts) start to appear. Acute and obtuse triangles are drawn in
+ * different colors so you can see which is which.
  *
- * References     :
+ * References:
  *   Penrose, "Pentaplexity" (1979)
  *   Robinson, "Undecidability and Nonperiodicity for Tilings" (1971)
  *   Senechal, "Quasicrystals and Geometry" (1995) §7
- *   Penrose tiling — https://en.wikipedia.org/wiki/Penrose_tiling
- *   Golden ratio   — https://en.wikipedia.org/wiki/Golden_ratio
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Penrose tilings are aperiodic — they tile the plane without ever
- * repeating. The Robinson-triangle decomposition expresses Penrose P3
- * (rhomb tilings) as just TWO triangle types (acute and obtuse), both
- * isoceles with golden-ratio side lengths. A substitution rule maps each
- * triangle to a SMALLER COMBINATION of the same two types. Recursing
- * the rule produces the aperiodic pattern at any chosen "magnification".
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Acute (A): apex angle 36°, isoceles, legs = φ × base. Picture a tall,
- * thin isoceles triangle.
- *
- * Obtuse (B): apex angle 108°, isoceles, base = φ × legs. Picture a wide,
- * shallow isoceles triangle.
- *
- * Both are "Robinson triangles" — specifically the golden gnomon and
- * golden triangle. Their shared link is the golden ratio φ ≈ 1.618.
- *
- * The substitution rule places a new vertex P at golden-ratio position
- * along one edge. P, together with the existing vertices, defines two
- * smaller triangles: one of type A and one of type B. Their sides also
- * form 1:φ ratios because P split a side that was already a Fibonacci-
- * related length.
- *
- * Why aperiodic? Because the substitution scales by 1/φ — an irrational
- * factor. Any periodic pattern would need rational scaling. So no
- * translation symmetry can exist in the limit; the tiling is forced to
- * be aperiodic.
- *
- * Why "half-rhomb"? Two acutes joined at their bases form a thin Penrose
- * rhomb (36°-144°-36°-144°). Two obtuses joined at their bases form a
- * fat Penrose rhomb (72°-108°-72°-108°). The rhomb-level Penrose tiling
- * IS the union of these triangles.
- *
- * DRAWING METHOD  (recursive emit)
- * ──────────────
- *  1. Pick DEPTH and SIZE_FRAC.
- *  2. Build the seed triangle (A or B based on user choice).
- *  3. substitute(t, depth):
- *       if depth == max_depth: draw 3 edges in t's prototype color
- *       else:
- *         compute P at golden-ratio position
- *         build 2 children (A + B for A-parent; A + B for B-parent)
- *         recurse on each
- *  4. Bresenham line_draw per leaf edge.
- *
- * KEY FORMULAS
- * ────────────
- *  Golden ratio:  φ = (1 + √5) / 2 ≈ 1.6180339887
- *  Inverse:       1/φ = φ − 1 ≈ 0.6180339887
- *
- *  ACUTE (legs φ, base 1; apex 36° at index 0):
- *    Place P on segment apex→base[1] at fraction 1/φ from apex.
- *    (V0 to V1 has length φ; V0-P = 1, P-V1 = 1/φ.)
- *
- *    Child #1 (OBTUSE): apex at P (108°), base = V0-V2.
- *      sides |V0-V2| = φ, |P-V0| = 1, |P-V2| = 1.
- *
- *    Child #2 (ACUTE):  apex at V2 (36°), base = P-V1.
- *      sides |V2-V1| = 1, |V2-P| = 1, |P-V1| = 1/φ.
- *
- *  OBTUSE (legs 1, base φ; apex 108° at index 0):
- *    Place P on base[0]→base[1] at fraction 1/φ from base[0].
- *    (V1 to V2 has length φ; V1-P = 1, P-V2 = 1/φ.)
- *
- *    Child #1 (ACUTE):  apex at V1 (36°), base = V0-P.
- *      sides |V1-V0| = 1, |V1-P| = 1, |V0-P| = 1/φ.
- *
- *    Child #2 (OBTUSE): apex at P (108°), base = V0-V2.
- *      sides |V0-V2| = 1, |P-V0| = 1/φ, |P-V2| = 1/φ.
- *
- *  Vertex convention :
- *    t.v[0] is always the APEX (36° for acute, 108° for obtuse).
- *    t.v[1], t.v[2] are the base corners.
- *    Substitutions preserve this so children inherit it cleanly.
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Depth grows leaf count as 2^N. At N=10, 1024 leaves; still fast.
- *    Strict Penrose P3 with 2/3 child counts grows faster (3^N for B).
- *  • Different seed types (A vs B) produce different patterns; toggle
- *    with 's' to compare.
- *  • The aperiodicity is approximate at finite depth — a periodic eye
- *    might still find motifs. The true aperiodicity is the LIMIT as N→∞.
- *  • Leaf colors are by TYPE (acute vs obtuse), not by depth — to make
- *    the prototile structure visually obvious.
- *
- * HOW TO VERIFY
- * ─────────────
- *  At depth 0: 1 leaf — the seed.
- *  At depth 1: 2 leaves — one acute and one obtuse, geometrically
- *    arranged inside the parent.
- *  At depth N: 2^N leaves total.
- *
- *  Visual check at depth ≥ 4: you should see the characteristic Penrose
- *  motifs (sun, star, kite, dart) once enough leaves have accumulated
- *  to spell them out. The 5-fold symmetry on average is approximate at
- *  finite depth.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -198,9 +70,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 
@@ -221,7 +91,7 @@
 
 #define N_THEMES 3
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How heavily to smooth the fps number so it doesn't jitter every frame. */
 #define FPS_EWMA_ALPHA 0.05
 
 #define PAIR_ACUTE  1
@@ -229,9 +99,7 @@
 #define PAIR_HUD    3
 #define PAIR_HINT   4
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -248,9 +116,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static const short THEME_FG[N_THEMES][2] = {
     /* acute, obtuse */
@@ -277,24 +143,24 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx + slope_char + Bresenham line                     */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula — screen layout + line drawing ── */
 
 #define TYPE_ACUTE   0
 #define TYPE_OBTUSE  1
 
 /*
- * GridCtx — geometry + recursion parameters for the Robinson-triangle mesh.
- * Mirrors 07_barycentric.c's GridCtx with an extra seed_type knob.
+ * GridCtx — everything we need to place the tiling on this particular screen.
+ * It bundles the terminal size, where the center of the drawing sits, and the
+ * three knobs the user controls: how many rounds of cutting (depth), how big
+ * the starting triangle is (size_frac), and which triangle we start from.
  */
 typedef struct {
-    int    rows, cols;
-    int    cw, ch;
-    int    ox, oy;
-    int    depth;
-    double size_frac;
-    int    seed_type;        /* TYPE_ACUTE or TYPE_OBTUSE */
+    int    rows, cols;       /* terminal size, in characters */
+    int    cw, ch;           /* sub-cell resolution: how many sub-units fit in one character cell */
+    int    ox, oy;           /* center of the drawing, in sub-cell units */
+    int    depth;            /* how many rounds of cutting to do */
+    double size_frac;        /* how much of the screen the starting triangle fills, 0..1 */
+    int    seed_type;        /* which triangle we begin with: TYPE_ACUTE or TYPE_OBTUSE */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols,
@@ -309,6 +175,7 @@ static void ctx_init(GridCtx *g, int rows, int cols,
     g->seed_type = seed_type;
 }
 
+/* Pick the ASCII character (- | / \) that best matches the slope of a line. */
 static char slope_char(double dx, double dy)
 {
     double ax = fabs(dx) * (1.0 / CELL_W);
@@ -340,18 +207,18 @@ static void line_draw(const GridCtx *g, double px0, double py0,
     attroff(attr);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  mesh — golden-ratio substitute for Robinson triangles               */
-/* ═══════════════════════════════════════════════════════════════════════ */
-/*
- * No Cursor struct: the user navigates by changing DEPTH, SIZE_FRAC and
- * SEED_TYPE — not by stepping through individual leaves of an aperiodic
- * tiling (where "next leaf" has no canonical meaning).
- */
+/* ── §5 mesh — cut each triangle into smaller ones ── */
 
+/*
+ * PTri — one triangle in the tiling, plus which family it belongs to.
+ * We always keep the corners in a fixed order: corner 0 is the apex (the
+ * sharp 36° point for acute, the blunt 108° point for obtuse), and corners
+ * 1 and 2 are the two base corners. Every cut preserves this order so the
+ * children come out with their apex in the right place automatically.
+ */
 typedef struct {
-    double x[3], y[3];      /* x[0]/y[0] = apex, x[1..2]/y[1..2] = base */
-    int    type;            /* TYPE_ACUTE or TYPE_OBTUSE */
+    double x[3], y[3];      /* corner 0 = apex, corners 1 and 2 = base */
+    int    type;            /* TYPE_ACUTE (thin) or TYPE_OBTUSE (wide) */
 } PTri;
 
 static void tri_draw_edges(const GridCtx *g, PTri t)
@@ -364,19 +231,23 @@ static void tri_draw_edges(const GridCtx *g, PTri t)
 }
 
 /*
- * substitute — recursive Robinson-triangle inflation.
+ * The heart of the demo: cut one triangle into two smaller ones, then do the
+ * same to those, until we've gone as deep as the user asked. When we hit the
+ * bottom we stop cutting and actually draw the triangle.
  *
- *   ACUTE (legs φ, base 1; apex 36° at index 0):
- *     P on apex→base[1] at fraction 1/φ from apex.
+ * Each cut marks a point P along one edge at the golden-ratio spot (that's
+ * what INV_PHI is), then wires P up to the existing corners to form one acute
+ * child and one obtuse child. The exact corners used:
  *
- *     Child OBTUSE: apex at P, base V0-V2.
- *     Child ACUTE:  apex at V2, base P-V1.
+ *   Starting from a thin (acute) triangle:
+ *     P sits along the leg from apex toward base corner 1.
+ *     Wide child: apex at P, base across corners 0 and 2.
+ *     Thin child: apex at corner 2, base across P and corner 1.
  *
- *   OBTUSE (legs 1, base φ; apex 108° at index 0):
- *     P on base[0]→base[1] at fraction 1/φ from base[0].
- *
- *     Child ACUTE:  apex at V1, base V0-P.
- *     Child OBTUSE: apex at P, base V0-V2.
+ *   Starting from a wide (obtuse) triangle:
+ *     P sits along the long base between corners 1 and 2.
+ *     Thin child: apex at corner 1, base across corner 0 and P.
+ *     Wide child: apex at P, base across corners 0 and 2.
  */
 static void substitute(const GridCtx *g, PTri t, int depth, int max_depth)
 {
@@ -400,11 +271,10 @@ static void substitute(const GridCtx *g, PTri t, int depth, int max_depth)
 }
 
 /*
- * Build the seed triangle. Two flavors: an acute or obtuse Robinson tile
- * centered on screen, sized to fit. Apex always at the top.
- *
- *   ACUTE: leg = base · φ, apex angle 36°. Height = leg · sin(72°).
- *   OBTUSE: base = leg · φ, apex angle 108°. Height = leg · sin(36°).
+ * Build the very first triangle — the one everything else is cut from. It's
+ * centered on screen with its point at the top, and sized to fill the
+ * fraction of the screen the user picked. Returns either a thin or wide
+ * starting triangle depending on which seed type is selected.
  */
 static PTri scene_seed(const GridCtx *g)
 {
@@ -436,16 +306,19 @@ static PTri scene_seed(const GridCtx *g)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
+/*
+ * Scene — the live state the user is steering: how deep to recurse, how big
+ * the starting triangle is, which triangle to start from, the color theme,
+ * and whether the demo is paused. This is what the keypresses in main() edit.
+ */
 typedef struct {
-    int    depth;
-    double size_frac;
-    int    seed_type;       /* TYPE_ACUTE or TYPE_OBTUSE */
-    int    theme;
-    int    paused;
+    int    depth;           /* rounds of cutting, 0..DEPTH_MAX */
+    double size_frac;       /* starting triangle's share of the screen, 0..1 */
+    int    seed_type;       /* starting triangle: TYPE_ACUTE or TYPE_OBTUSE */
+    int    theme;           /* which color palette, 0..N_THEMES-1 */
+    int    paused;          /* nonzero while paused */
 } Scene;
 
 static void scene_reset(Scene *s)
@@ -486,9 +359,7 @@ static void scene_draw(const GridCtx *g, const Scene *s, double fps)
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -503,9 +374,7 @@ static void screen_init(int theme)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;

@@ -1,186 +1,21 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 11_delaunay.c — Delaunay triangulation of random points (Bowyer-Watson)
+ * 11_delaunay.c — connect scattered dots into nice, well-shaped triangles.
  *
- * DEMO: N random points are scattered across the screen and triangulated
- *       with the Bowyer-Watson incremental algorithm. The cursor selects
- *       one input point and highlights every triangle incident to it;
- *       ',' / '.' cycle the cursor through the points list. Press 'r' to
- *       reseed with new random points.
+ * Drop N random points on the screen and join them into triangles with the
+ * Bowyer-Watson method, which avoids skinny slivers and favours fat, even
+ * triangles. Move the cursor with ',' / '.' to pick a point and light up the
+ * triangles around it; 'r' scatters fresh points.
  *
- * Study alongside: 01_equilateral.c — regular triangle tiling. This file
- *                  is the IRREGULAR counterpart: any point cloud can be
- *                  turned into a triangulation that maximises the minimum
- *                  interior angle.
- *                  geometry/delaunay_triangulation.c — fuller reference
- *                  with circumcircle visualisation and step-by-step
- *                  insertion.
- *                  ../README.md — GridCtx primitive (this file builds a
- *                  mesh from a point set).
+ * Sister files: 01_equilateral.c is the tidy regular-grid cousin; this is the
+ * messy free-form version. geometry/delaunay_triangulation.c shows the same
+ * idea in more detail, including the circles it draws through each triangle.
  *
- * Section map:
- *   §1 config   — N points, screen margins, EWMA constant
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 5 pairs: edge / point / cursor / HUD / hint
- *   §4 formula  — GridCtx + ctx_init + orient2d + circumcircle predicate
- *   §5 mesh     — Bowyer-Watson insertion + super-triangle cleanup
- *   §5b cursor  — Cursor { int point_idx } + cursor_advance / cursor_draw
- *   §5c draw    — slope_char + Bresenham line_draw
- *   §6 scene    — hud_draw + scene_draw (seed_random + render)
- *   §7 screen   — ncurses init / cleanup
- *   §8 app      — signals, main loop
- *
- * Keys:  ,/. cursor   r reseed   t theme   p pause
- *        +/- N points   q/ESC quit
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids/11_delaunay.c \
- *       -o 11_delaunay -lncurses -lm
+ * References: Bowyer & Watson, both "Computing... tessellation" (1981);
+ * de Berg et al., "Computational Geometry" (3e), §9; and Shewchuk's "Robust
+ * Adaptive Floating-Point Geometric Predicates" (1996) for the inside-circle
+ * test done with bullet-proof precision.
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Bowyer-Watson (1981). Incremental Delaunay:
- *                    1. Start with a "super-triangle" containing every
- *                       input point.
- *                    2. For each input point P:
- *                       a. Find every triangle whose circumcircle
- *                          contains P ("bad" triangles).
- *                       b. The bad triangles form a star-shaped polygon
- *                          (a "hole"); delete them.
- *                       c. Connect P to every boundary edge of the hole.
- *                    3. Remove every triangle that still touches a super-
- *                       triangle vertex; the rest is the Delaunay
- *                       triangulation of the actual input points.
- *
- * Data-structure : GridCtx carries screen extent and the input point
- *                  count. A separate static mesh (g_pts, g_tris) holds
- *                  the actual points and triangles — building a Delaunay
- *                  mesh requires global state (the in-circle predicate
- *                  consults all triangles), which is the documented
- *                  exception to "no malloc in hot path" (here static
- *                  arrays, sized at compile time).
- *
- * Formula        : Empty-circumcircle predicate (in_circumcircle):
- *                    For triangle ABC (CCW) and point P:
- *                      | A.x−P.x  A.y−P.y  (A.x²+A.y²−P.x²−P.y²) |
- *                      | B.x−P.x  B.y−P.y  (B.x²+B.y²−P.x²−P.y²) | > 0
- *                      | C.x−P.x  C.y−P.y  (C.x²+C.y²−P.x²−P.y²) |
- *                    holds iff P is strictly inside the circumcircle of ABC.
- *                  Orientation predicate (orient2d):
- *                    sgn((B−A) × (C−A)) — positive ⇔ CCW.
- *
- * Edge chars     : Each leaf triangle draws its 3 edges via Bresenham.
- *                  Slope→character classification (same as 07-10).
- *                  Points draw as '*' in PAIR_POINT.
- *
- * Movement       : ',' / '.' cycle the cursor through the input points
- *                  list (N_SUPER..g_n_pts-1). The selected point is drawn
- *                  with '@' in PAIR_CURSOR; every triangle that contains
- *                  the selected point as a vertex is highlighted bold.
- *                  'r' reseeds with new random points.
- *
- * References     :
- *   Bowyer, "Computing Dirichlet Tessellations" (1981)
- *   Watson, "Computing the n-dimensional Delaunay tessellation..." (1981)
- *   de Berg et al., "Computational Geometry" (3e), §9
- *   InCircle predicate — Shewchuk, "Robust Adaptive Floating-Point
- *                        Geometric Predicates" (1996)
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Given a scattered set of points, draw triangle edges between them so
- * that no triangle has any other point inside its circumscribed circle.
- * That single property — "empty circumcircle" — uniquely determines the
- * triangulation (up to ties on cocircular point sets), and equivalently
- * MAXIMISES the minimum interior angle across the whole mesh. Thin
- * sliver triangles are punished; well-shaped triangles are rewarded.
- *
- * Bowyer-Watson achieves this incrementally. Start with a giant triangle
- * that contains every input point. Insert points one by one. After each
- * insertion, repair any triangles that violate the empty-circumcircle
- * property by deleting them and re-triangulating the resulting hole
- * around the new point.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine each triangle has a circle drawn through its three vertices —
- * the CIRCUMCIRCLE. A triangulation is "Delaunay" if every triangle's
- * circumcircle has no points inside it (no other input points, that is).
- * When you add a new point P, some existing circumcircles will end up
- * containing P. Those triangles are "bad" and must die. Together they
- * form a star-shaped polygon (a hole). Re-fill the hole by drawing
- * edges from P to each boundary edge of the hole — voila, P is part of
- * the new Delaunay triangulation.
- *
- * The "super-triangle" is just a scaffold: a giant triangle containing
- * everything. Every real point sits inside it, so the algorithm always
- * has SOME triangle to work with. After insertion is done, we delete
- * every triangle that still touches a super-triangle vertex.
- *
- * DRAWING METHOD  (one-shot pipeline)
- * ──────────────
- *  1. Pick N points; reseed at random within screen margins.
- *  2. Install super-triangle (3 vertices, 1 triangle).
- *  3. For each input point P:  mesh_insert(P).
- *  4. mesh_strip_super(): mark every triangle touching a super vertex as
- *     invalid.
- *  5. Draw every valid triangle's 3 edges with Bresenham + slope_char.
- *     Bold-highlight every triangle incident to the cursor point.
- *  6. Draw every input point as '*'; the cursor point as '@'.
- *  7. ',' / '.' move the cursor index through the input points.
- *
- * KEY FORMULAS
- * ────────────
- *  Signed area (× 2) — also called orient2d:
- *    orient2d(A, B, C) = (B.x − A.x)·(C.y − A.y) − (B.y − A.y)·(C.x − A.x)
- *    sign +  ⇒ CCW
- *    sign −  ⇒ CW
- *    sign 0  ⇒ collinear
- *
- *  In-circle predicate:
- *    For triangle ABC (CCW) and point P:
- *      let ax = A.x − P.x, ay = A.y − P.y, a² = ax² + ay²
- *      similarly bx, by, b², cx, cy, c²
- *      det = a² (bx·cy − cx·by) − b² (ax·cy − cx·ay) + c² (ax·by − bx·ay)
- *      det > 0  ⇔  P inside circumcircle of ABC
- *
- *  Boundary edge of the hole: edge (a, b) shared by exactly one bad
- *  triangle (i.e., not also an edge of another bad triangle).
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • The super-triangle MUST contain every input point or insertion fails.
- *    We make it 50× the larger screen dimension — way larger than any
- *    real input could need.
- *  • Co-circular points (4+ points on the same circle) leave the empty-
- *    circumcircle predicate ambiguous. Bowyer-Watson breaks ties
- *    arbitrarily, which is correct — both possible triangulations are
- *    valid Delaunay.
- *  • Floating-point precision: the in_circumcircle determinant can be
- *    tiny near borderline cases. We use an epsilon of 1e-9. For exact
- *    robustness, Shewchuk's adaptive predicates would be the upgrade.
- *  • CCW orientation must hold for the in-circle test. We force CCW by
- *    swapping vertices in tri_add() when orient2d is negative.
- *  • N=80 gives ~150 triangles — interactive at 60 fps.
- *  • Screen resize: re-seed entirely (the random points need to be
- *    re-placed within the new bounds anyway).
- *
- * HOW TO VERIFY
- * ─────────────
- *  Visual check: NO triangle should look "needle thin" or have a tiny
- *  angle. The Delaunay property guarantees the smallest angle is as
- *  large as possible.
- *
- *  Programmatic check: for each triangle (A, B, C), iterate over all
- *  other input points P and confirm in_circumcircle(A, B, C, P) == 0.
- *  (Not done in this demo, but easy to add.)
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -197,9 +32,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 
@@ -210,8 +43,9 @@
 #define N_POINTS_MIN      6
 #define N_POINTS_MAX     80
 
-/* Super-triangle — 100× larger than the screen so every input lands inside.
- * Indices 0..2 in the points array are reserved for the super vertices. */
+/* We kick things off with one enormous triangle that swallows the whole
+ * screen, so every real point lands inside something. Its 3 corners take the
+ * first 3 slots in the points array. */
 #define N_SUPER          3
 #define MAX_POINTS      (N_POINTS_MAX + N_SUPER)
 #define MAX_TRIS        (MAX_POINTS * 4)
@@ -220,7 +54,7 @@
 #define MARGIN_FRAC      0.08
 #define N_THEMES         3
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How quickly the on-screen fps number settles — small value = smooth. */
 #define FPS_EWMA_ALPHA 0.05
 
 #define PAIR_EDGE   1
@@ -229,9 +63,7 @@
 #define PAIR_HUD    4
 #define PAIR_HINT   5
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -248,9 +80,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static const short THEME_FG[N_THEMES][2] = {
     /* edge,  point */
@@ -278,26 +108,29 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — GridCtx + orient2d + in_circumcircle                      */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 formula — GridCtx + orient2d + in_circumcircle ── */
 
+/* A single 2-D point, in sub-cell pixel units. */
 typedef struct { double x, y; } Pt;
+
+/* One triangle: its three corners as indices into the points array, plus a
+ * flag we flip off when the triangle gets deleted (cheaper than shuffling
+ * the array). valid == 0 means "ignore me". */
 typedef struct { int v[3]; int valid; } Tri;
 
 /*
- * GridCtx — geometry + scene parameters for the Delaunay mesh.
+ * GridCtx — the few screen numbers the drawing helpers need to share.
  *
- * Mirrors the canonical GridCtx (rect_grids/01_uniform_rect.c) but
- * carries the Delaunay-specific n_pts. The persistent mesh itself
- * (g_pts, g_tris) lives in §5 statics — keeping that out of GridCtx
- * preserves GridCtx as a thin geometry descriptor.
+ * It only describes the canvas (size, cell dimensions, where the centre is)
+ * plus how many real points we asked for. The actual mesh of points and
+ * triangles lives in the §5 globals, deliberately kept out of here so this
+ * stays a small, plain description of the screen.
  */
 typedef struct {
-    int rows, cols;
-    int cw, ch;
-    int ox, oy;          /* screen origin (centre) — used by some helpers */
-    int n_pts;           /* input point count (excludes the 3 super verts) */
+    int rows, cols;      /* terminal size, in characters */
+    int cw, ch;          /* sub-cell width / height (pixels per character) */
+    int ox, oy;          /* screen centre in pixels — handy for some helpers */
+    int n_pts;           /* how many real points (not counting the 3 big-triangle corners) */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols, int n_pts)
@@ -310,10 +143,10 @@ static void ctx_init(GridCtx *g, int rows, int cols, int n_pts)
 }
 
 /*
- * orient2d — twice the signed area of triangle ABC. Positive ⇔ CCW.
- *
- * THE FORMULA:
- *    (B.x − A.x)·(C.y − A.y) − (B.y − A.y)·(C.x − A.x)
+ * Tells us which way the corners A, B, C wind: a positive result means
+ * counter-clockwise, negative means clockwise, zero means they sit in a line.
+ * The inside-circle test below only works on counter-clockwise triangles, so
+ * we lean on this to keep them all turning the same way.
  */
 static double orient2d(Pt A, Pt B, Pt C)
 {
@@ -321,16 +154,11 @@ static double orient2d(Pt A, Pt B, Pt C)
 }
 
 /*
- * in_circumcircle — non-zero if P is strictly inside the circumcircle
- * of triangle ABC. Assumes ABC is CCW (caller responsibility).
- *
- * THE FORMULA (3×3 determinant):
- *
- *   det = | A.x−P.x  A.y−P.y  (A.x²+A.y²−P.x²−P.y²) |
- *         | B.x−P.x  B.y−P.y  (B.x²+B.y²−P.x²−P.y²) |
- *         | C.x−P.x  C.y−P.y  (C.x²+C.y²−P.x²−P.y²) |
- *
- *   det > 0  ⇔  P inside circumcircle of CCW triangle ABC
+ * Imagine the one circle that passes through all three corners of triangle ABC.
+ * Does point P fall inside that circle? Returns non-zero if it does. This is the
+ * whole idea behind "Delaunay": a triangle only gets to survive if no other
+ * point sits inside its circle. ABC must wind counter-clockwise for the test
+ * below to give the right answer.
  */
 static int in_circumcircle(Pt A, Pt B, Pt C, Pt P)
 {
@@ -346,10 +174,11 @@ static int in_circumcircle(Pt A, Pt B, Pt C, Pt P)
     return det > 1e-9;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  mesh — Bowyer-Watson                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 mesh — Bowyer-Watson ── */
 
+/* The one shared mesh: all the points, and all the triangles built from them.
+ * It's global because the inside-circle test has to consult every triangle,
+ * and that's the project's documented exception to "no big shared state". */
 static Pt   g_pts[MAX_POINTS];
 static int  g_n_pts;
 static Tri  g_tris[MAX_TRIS];
@@ -358,8 +187,8 @@ static int  g_n_tris;
 static void mesh_clear(void) { g_n_pts = 0; g_n_tris = 0; }
 
 /*
- * tri_add — append a triangle, force CCW orientation by swapping if needed.
- * The in_circumcircle predicate requires CCW.
+ * Add a triangle, flipping two corners if needed so it always winds
+ * counter-clockwise — the inside-circle test refuses to work otherwise.
  */
 static void tri_add(int v0, int v1, int v2)
 {
@@ -371,8 +200,8 @@ static void tri_add(int v0, int v1, int v2)
 }
 
 /*
- * mesh_seed_super — install a giant super-triangle as points 0..2 and the
- * only triangle. The super-triangle contains every screen pixel.
+ * Lay down the starting scaffold: one huge triangle (corners 0..2) big enough
+ * to cover the whole screen, so every real point we add later lands inside it.
  */
 static void mesh_seed_super(double pw, double ph)
 {
@@ -386,16 +215,11 @@ static void mesh_seed_super(double pw, double ph)
 }
 
 /*
- * mesh_insert — Bowyer-Watson incremental insertion of a single point.
- *
- * Steps:
- *   1. Append P to the points array.
- *   2. Mark every triangle whose circumcircle contains P as bad
- *      (set valid=0; record index in bad[]).
- *   3. Walk bad triangles' edges; an edge is on the boundary if it
- *      appears in EXACTLY ONE bad triangle (not shared with another
- *      bad one).
- *   4. Spawn a new triangle for each boundary edge, connecting it to P.
+ * Drop one new point P into the mesh and re-stitch the triangles around it.
+ * The trick (Bowyer-Watson): any triangle whose circle swallows P is now
+ * wrong, so we delete all of them. That leaves a hole; the edges around the
+ * rim of that hole are the ones that belonged to exactly one deleted triangle.
+ * Fan those rim edges out to P to fill the hole back in with fresh triangles.
  */
 static void mesh_insert(Pt P)
 {
@@ -450,8 +274,9 @@ static void mesh_insert(Pt P)
 }
 
 /*
- * mesh_strip_super — invalidate every triangle that touches a super-tri
- * vertex (index < N_SUPER).
+ * Throw away the scaffolding: any triangle still clinging to a corner of the
+ * giant starter triangle (the first N_SUPER points) is just leftover frame,
+ * not a real result, so drop it.
  */
 static void mesh_strip_super(void)
 {
@@ -470,17 +295,17 @@ static int count_valid_tris(void)
     return n;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5b  cursor — selection index into the input points list                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5b cursor — which input point is currently picked ── */
 
 /*
- * Cursor — index into g_pts[N_SUPER..g_n_pts-1].
+ * Cursor — remembers which scattered point is currently picked.
  *
- * Aperiodic / random meshes have no natural "neighbour" relation in cell
- * space, so we cycle through the points list with ',' / '.' instead of
- * arrow-key cell-stepping. The selected point is drawn '@' and every
- * triangle incident to it is bold-highlighted.
+ * The points land at random, so there's no tidy left/right/up/down grid to
+ * step through. Instead we just walk down the list with ',' / '.'. The picked
+ * point is drawn as '@', and every triangle touching it lights up bold.
+ *
+ * point_idx is a slot in the points array, skipping the first N_SUPER slots
+ * (those belong to the giant starter triangle, not to real points).
  */
 typedef struct { int point_idx; } Cursor;
 
@@ -498,7 +323,7 @@ static void cursor_advance(Cursor *cur, int dir)
     cur->point_idx = N_SUPER + rel;
 }
 
-/* True if triangle ti has the cursor point as one of its vertices. */
+/* True if the picked point is one of triangle ti's three corners. */
 static int tri_has_point(int ti, int point_idx)
 {
     if (point_idx < 0) return 0;
@@ -507,9 +332,7 @@ static int tri_has_point(int ti, int point_idx)
         || g_tris[ti].v[2] == point_idx;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5c draw — slope_char + Bresenham line                                  */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5c draw — pick a line glyph, then draw the line ── */
 
 static char slope_char(double dx, double dy)
 {
@@ -543,10 +366,8 @@ static void line_draw(const GridCtx *g, double px0, double py0,
 }
 
 /*
- * ctx_draw_bg — render every valid mesh edge.
- *
- * Triangles incident to the cursor point are drawn with PAIR_CURSOR + bold;
- * the rest with PAIR_EDGE.
+ * Draw the whole web of triangle edges. Triangles touching the picked point
+ * are highlighted; everything else uses the plain edge colour.
  */
 static void ctx_draw_bg(const GridCtx *g, const Cursor *cur)
 {
@@ -588,9 +409,7 @@ static void cursor_draw(const GridCtx *g, const Cursor *cur)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 scene ── */
 
 typedef struct {
     int          n_pts;
@@ -660,9 +479,7 @@ static void scene_draw(const GridCtx *g, const Scene *s, const Cursor *cur, doub
     doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 
@@ -677,9 +494,7 @@ static void screen_init(int theme)
     atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 app ── */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;

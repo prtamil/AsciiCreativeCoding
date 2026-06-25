@@ -1,148 +1,16 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 01_direct.c — cursor-based direct object placement on all 14 grid types
+ * 01_direct.c — drop objects onto any of 14 grid styles with a movable cursor.
  *
- * DEMO: Navigate a cursor with arrow keys; press SPACE to toggle an object
- *       at the current cell. Switch between all 14 grid backgrounds with
- *       keys 1-9 and a-e. Shows how a single ObjectPool works across every
- *       grid type — rect, staggered, diamond, isometric, ruled, dot, origin.
+ * Move the cursor with the arrows, press SPACE to drop or pick up an object at
+ * that cell, and step through all 14 grid backgrounds with a/e. The same object
+ * list works on every grid: each grid just hands us one formula for turning a
+ * (row,col) cell into a screen position, and one drawer for its background.
  *
- * Study alongside: grids/rect_grids/01_uniform_rect.c (grid formulas),
- *                  02_patterns.c (pattern-fill placement)
- *
- * Section map:
- *   §1 config   — per-mode geometry constants
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 6 pairs: grid, active cell, cursor, object, HUD, hint
- *   §4 gridctx  — GridCtx struct, per-mode geom helpers (ctx_geom_*),
- *                 cursor↔screen, per-mode bg drawers (bg_draw_*)
- *   §5 pool     — Pool: place, remove, toggle, query, clear
- *   §6 cursor   — Cursor struct, move, reset
- *   §7 scene    — hud_draw + scene_draw
- *   §8 screen   — ncurses init/cleanup
- *   §9 app      — signals, main loop
- *
- * Keys:  arrows:move  spc:toggle  C:clear  r:reset  q/ESC:quit
- *        a:prev-grid  e:next-grid
- *
- * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra grids/rect_grids_placement/01_direct.c \
- *       -o 01_direct -lncurses
+ * Sister files: grids/rect_grids/01_uniform_rect.c (where the grid formulas
+ * come from), 02_patterns.c (filling whole patterns instead of one cell).
+ * Object-list trick borrowed from gameprogrammingpatterns.com/object-pool.html.
  */
-
-/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
- *
- * Algorithm      : Direct placement using a movable cursor.  The cursor
- *                  holds (row, col) in GRID space.  SPACE toggles an object
- *                  at that grid address.  Objects are rendered by converting
- *                  grid (r,c) back to screen (sr,sc) using the same formula
- *                  that draws the grid background.
- *
- * Data-structure : ObjectPool — flat array of (r,c,glyph,alive) records.
- *                  Removal swaps the dead slot with the last item (O(1)).
- *                  Capacity MAX_OBJ=256 is far more than fits on a screen.
- *
- * GridContext    : A single struct carries the geometry of whichever of the
- *                  14 grid modes is active.  Switching grids (keys 1-9, a-f)
- *                  re-initialises GridCtx and resets the cursor.  The pool
- *                  is NOT cleared on switch — objects persist across modes
- *                  (they may appear off-screen until you switch back).
- *
- * Rendering      : Two-pass: (1) draw grid background, (2) draw objects,
- *                  (3) draw cursor highlight.  The cursor draws over any
- *                  object at that cell so the player can see where they are.
- *
- * References     :
- *   Object pool pattern — gameprogrammingpatterns.com/object-pool.html
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Every one of the 14 grid types provides TWO things to the placement layer:
- *   (a) a drawing function that fills the terminal with its background lines
- *   (b) a formula that converts grid (r,c) → screen (sr,sc) — the TOP-LEFT
- *       corner of the cell (for rect grids) or the cell's centre (rotated).
- *
- * The placement layer sits ON TOP and knows nothing about the grid formula
- * internals: it only calls ctx_to_screen() to position glyphs.  This is the
- * same separation as a graphics pipeline: geometry lives in one layer, the
- * raster lives in another.
- *
- * HOW TO THINK ABOUT COORDINATES
- * ────────────────────────────────
- * Two coordinate spaces are in play simultaneously:
- *
- *   GRID space   — (r,c) integers.  The cursor and objects live here.
- *                  Rect grids:    r∈[0,max_r], c∈[0,max_c]
- *                  Rotated grids: r,c ∈ [-RANGE, RANGE] (centred origin)
- *
- *   SCREEN space — (sr,sc) characters.  ncurses lives here.
- *                  Rect:    sr=r*CH, sc=c*CW  (top-left of cell)
- *                  Rotated: sr=oy+(c+r)*IH, sc=ox+(c-r)*IW  (cell centre)
- *
- * The formula ctx_to_screen() is the ONLY place where grid→screen conversion
- * happens.  It is the single seam between the two coordinate systems.
- *
- * OBJECT POOL MECHANICS
- * ──────────────────────
- * Objects are stored in a flat array.  The "alive" flag marks live entries.
- * toggle(r,c): search for existing object at (r,c); if found, kill it (swap
- * with last, decrement count); if not found, append a new entry.
- * This gives O(n) toggle (scanning the pool), O(1) removal.  With n≤256
- * and the pool scanned once per frame anyway, O(n) is acceptable.
- *
- * SWITCHING GRIDS
- * ───────────────
- * Pressing 1-9 / a-f re-initialises GridCtx (new bounds, new formula) and
- * clamps the cursor to the new bounds.  The pool is NOT cleared: objects
- * placed in one grid mode persist when you switch.  They remain at their
- * stored (r,c) values; they may appear off-screen if the new mode uses a
- * smaller grid or different origin.  Press C to clear the pool.
- *
- * KEY FORMULAS
- * ────────────
- * ctx_to_screen — the single seam between grid and screen coordinates:
- *
- *   Rect (default): sr = r × ch,  sc = c × cw
- *   Brick-H:        sr = r × ch,  sc = c × cw + (r%2) × (cw/2)
- *   Brick-V:        sr = r × ch + (c%2) × (ch/2),  sc = c × cw
- *   Ruled:          sr = r × RL_LS,  sc = c
- *   Diamond:        sc = ox + (c − r) × DM_IW
- *                   sr = oy + (c + r) × DM_IH
- *   ISO:            sc = ox + (c − r) × IS_IW
- *                   sr = oy + (c + r) × IS_IH
- *
- * Diamond/ISO rotation derivation:
- *   The grid axes are rotated 45°.  c+r increases downward; c−r increases
- *   rightward.  Scaling by the half-cell size:
- *     sc = ox + (c−r) × IW    →  right as c increases, left as r increases
- *     sr = oy + (c+r) × IH    →  down as c+r increases
- *   Adjacent grid cells are separated by (±IW, ±IH) on screen, forming
- *   the diamond/rhombus pattern.
- *
- * Grid bounds (cursor clamping):
- *   Rect:    max_r = (rows−2)/ch,   max_c = (cols−1)/cw
- *   Rotated: min_r=−range, max_r=+range,  min_c=−range, max_c=+range
- *   Ruled:   max_r = (rows−1)/RL_LS − 1,  max_c = cols−1
- *
- * HOW TO VERIFY
- * ─────────────
- * Terminal 80×24 → rows=24, cols=80.
- *
- * Uniform (U_CW=8, U_CH=4):
- *   max_r=(24−2)/4=5, max_c=(80−1)/8=9  →  6×10 grid
- *   ctx_to_screen(r=2, c=3): sr=2×4=8, sc=3×8=24  ✓
- *   pool_draw offsets by +1 inside cell: object at sr+1=9, sc+1=25  ✓
- *
- * Diamond (DM_IW=4, DM_IH=2, ox=40, oy=12):
- *   ctx_to_screen(r=1, c=2): sc=40+(2−1)×4=44, sr=12+(2+1)×2=18  ✓
- *   ctx_to_screen(r=0, c=0): sc=40, sr=12  (origin at centre)  ✓
- *   ctx_to_screen(r=−1, c=1): sc=40+(1+1)×4=48, sr=12+(1−1)×2=12  ✓
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
@@ -154,17 +22,16 @@
 #include <string.h>
 #include <time.h>
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §1  config                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §1 config ── */
 
 #define TARGET_FPS  30
-#define MAX_OBJ    256       /* object pool capacity */
+#define MAX_OBJ    256       /* most objects we can hold at once */
 
-/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+/* How much the fps number leans on the latest frame vs. the running average.
+   Small value = a steady reading that doesn't jitter every frame. */
 #define FPS_EWMA_ALPHA  0.05
 
-/* Geometry for each grid mode (kept here so CONCEPTS block can reference) */
+/* Cell sizes for each grid style, all in one place so they're easy to tweak. */
 #define U_CW  8              /* GM_UNIFORM cell width  */
 #define U_CH  4              /* GM_UNIFORM cell height */
 #define SQ_CS 3              /* GM_SQUARE  cell step   */
@@ -195,7 +62,7 @@
 #define OR_CW 10             /* GM_ORIGIN cell width   */
 #define OR_CH 4              /* GM_ORIGIN cell height  */
 
-/* color pair IDs */
+/* color slots */
 #define PAIR_GRID    1
 #define PAIR_ACTIVE  2
 #define PAIR_CURSOR  3
@@ -203,9 +70,7 @@
 #define PAIR_HUD     5   /* status bar (yellow)  */
 #define PAIR_HINT    6   /* key-hint footer (cyan) */
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §2  clock                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -220,9 +85,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §3 color ── */
 
 static void color_init(void)
 {
@@ -235,13 +98,11 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,    -1);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  gridctx                                                             */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §4 gridctx ── */
 
-/*
- * GridMode — one value per grid type, matching the 14 source files.
- */
+/* GridMode — which of the 14 grid styles we're showing right now. The order
+   here matches the 14 sibling source files, and GM_COUNT (last) doubles as the
+   count, so a/e can wrap around with a simple modulo. */
 typedef enum {
     GM_UNIFORM=0, GM_SQUARE, GM_FINE, GM_COARSE,
     GM_HIER, GM_BRICK_H, GM_BRICK_V, GM_DIAMOND,
@@ -257,13 +118,21 @@ static const char *const gm_name[GM_COUNT] = {
     "13 dot","14 origin"
 };
 
-/*
- * GridCtx — geometry for the current grid mode.
- * cw/ch: cell dimensions (rect grids).
- * ox/oy: screen-space origin (rotated grids, set to centre of terminal).
- * range: ±range is the grid coordinate range for rotated grids.
- * min/max r,c: cursor bounds in grid space.
- */
+/* GridCtx — everything we need to know about the grid that's on screen now.
+   Rebuilt from scratch each time you switch grids (see ctx_init). Holding it in
+   one struct means the rest of the code never asks "which grid is this?" — it
+   just reads these fields.
+
+   mode         which of the 14 styles this is.
+   rows, cols   terminal size in characters, grabbed at init.
+   cw, ch       cell width and height in characters (the rectangular grids).
+   ox, oy       where cell (0,0) lands on screen. The diamond/iso grids put
+                their origin at the middle of the terminal so they fan out
+                from the centre; the rectangular grids leave these at 0.
+   range        for the centred diamond/iso grids, cells run from -range..+range
+                on each axis. Unused by the others.
+   min/max r,c  how far the cursor is allowed to roam, in cell coordinates.
+                Computed once per grid so cursor_move can just clamp. */
 typedef struct {
     GridMode mode;
     int rows, cols;
@@ -273,8 +142,8 @@ typedef struct {
     int min_r, max_r, min_c, max_c;
 } GridCtx;
 
-/* Per-mode geometry setters — one tiny function per GridMode so each name
- * states the mode it configures.  The dispatcher below routes to one. */
+/* One tiny setter per grid style, just filling in that style's cell size.
+   Split out so each style is easy to find and tweak on its own. */
 
 static void ctx_geom_uniform (GridCtx *g) { g->cw = U_CW;    g->ch = U_CH;  }
 static void ctx_geom_square  (GridCtx *g) { g->cw = SQ_CS*2; g->ch = SQ_CS; }
@@ -283,18 +152,19 @@ static void ctx_geom_coarse  (GridCtx *g) { g->cw = CO_CW;   g->ch = CO_CH; }
 static void ctx_geom_hier    (GridCtx *g) { g->cw = HI_CW;   g->ch = HI_CH; }
 static void ctx_geom_brick_h (GridCtx *g) { g->cw = BH_CW;   g->ch = BH_CH; }
 static void ctx_geom_brick_v (GridCtx *g) { g->cw = BV_CW;   g->ch = BV_CH; }
-/* rotated grids carry an extra `range` for the centred ±range bounds */
+/* the diamond/iso grids also set how far out their centred cells go */
 static void ctx_geom_diamond (GridCtx *g) { g->cw = DM_IW; g->ch = DM_IH; g->range = DM_RNG; }
 static void ctx_geom_iso     (GridCtx *g) { g->cw = IS_IW; g->ch = IS_IH; g->range = IS_RNG; }
 static void ctx_geom_cross   (GridCtx *g) { g->cw = CR_CW;   g->ch = CR_CH; }
 static void ctx_geom_check   (GridCtx *g) { g->cw = CK_CW;   g->ch = CK_CH; }
-/* ruled has only horizontal lines — no column step */
+/* ruled is just horizontal lines, so there's no column width to set */
 static void ctx_geom_ruled   (GridCtx *g) { g->ch = RL_LS; }
 static void ctx_geom_dot     (GridCtx *g) { g->cw = DT_CW;   g->ch = DT_CH; }
 static void ctx_geom_origin  (GridCtx *g) { g->cw = OR_CW;   g->ch = OR_CH; }
 
-/* Bounds depend on coordinate system, not just cell size: rotated grids use
- * a centred ±range; ruled grids count whole lines, not cells. */
+/* Work out how far the cursor may travel. It's not just "screen size / cell
+   size": the diamond/iso grids count outward from a centre, and the ruled grid
+   counts whole lines instead of cells, so each gets its own rule. */
 static void ctx_set_bounds(GridCtx *g, GridMode m, int rows, int cols)
 {
     if (m == GM_DIAMOND || m == GM_ISO) {
@@ -309,8 +179,9 @@ static void ctx_set_bounds(GridCtx *g, GridMode m, int rows, int cols)
     }
 }
 
-/* Dispatcher: routes all 14 GridMode values to their per-mode geometry
- * setter, then computes coordinate bounds once. */
+/* Set up a fresh grid: pick the matching size setter, then nail down the
+   origin and the cursor's roaming limits. Called on startup, on resize, and
+   every time you switch grids. */
 static void ctx_init(GridCtx *g, GridMode m, int rows, int cols)
 {
     memset(g, 0, sizeof *g);
@@ -337,11 +208,12 @@ static void ctx_init(GridCtx *g, GridMode m, int rows, int cols)
     ctx_set_bounds(g, m, rows, cols);
 }
 
-/*
- * ctx_to_screen — convert grid (r,c) to screen (sr,sc).
- * Returns the top-left character of the cell for rect grids,
- * or the cell centre for rotated grids.
- */
+/* The one place a cell (r,c) becomes a screen spot (sr,sc). Every grid style
+   has its own way of laying cells out, so this is where they differ. For the
+   rectangular grids it returns the cell's top-left corner; for the slanted
+   diamond/iso grids it returns the cell's centre. Keeping all the layout math
+   here means objects and the cursor never have to know which grid they're on —
+   they just ask this. */
 static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
     switch (g->mode) {
@@ -372,18 +244,15 @@ static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
     }
 }
 
-/* safe_mod — always non-negative, needed for diagonal line conditions */
+/* Remainder that's never negative. Plain % can come back negative for negative
+   inputs (which the centred grids have), and that would break the line tests. */
 static int safe_mod(int a, int b) { return ((a % b) + b) % b; }
 
-/* ── per-mode background drawers ───────────────────────────────────────── *
- *
- * Each draws a single grid style.  Hot paths intentionally — kept in their
- * own function so a reader can study one style at a time without the
- * ctx_draw_bg dispatcher dwarfing them.
- *
- * ─────────────────────────────────────────────────────────────────────── */
+/* Background drawers — one per grid style. Each paints the grid lines for its
+   style. Split into separate functions so you can read one style at a time. */
 
-/* Plain rect lattice; GM_ORIGIN overlays a highlighted central cross. */
+/* Plain rectangular grid. The "origin" style also paints a bold cross through
+   the centre to mark where (0,0) sits. */
 static void bg_draw_rect_family(const GridCtx *g)
 {
     int rows = g->rows, cols = g->cols;
@@ -401,7 +270,8 @@ static void bg_draw_rect_family(const GridCtx *g)
     }
 }
 
-/* Three-tier lattice (major / semi / minor); glyph encodes the tier. */
+/* A grid with three line weights — heavy, medium, light — so it reads like
+   graph paper. The character drawn tells you which weight a line is. */
 static void bg_draw_hier(const GridCtx *g)
 {
     int rows = g->rows, cols = g->cols;
@@ -425,7 +295,8 @@ static void bg_draw_hier(const GridCtx *g)
     }
 }
 
-/* Brick courses offset every other row by half a brick width. */
+/* Brick wall: every other row is nudged sideways by half a brick so the seams
+   don't line up, like a real wall. */
 static void bg_draw_brick_h(const GridCtx *g)
 {
     int rows = g->rows, cols = g->cols, cw = g->cw, ch = g->ch;
@@ -442,7 +313,8 @@ static void bg_draw_brick_h(const GridCtx *g)
     }
 }
 
-/* Vertical brick courses — bricks staggered by half-height per column. */
+/* The same brick idea turned on its side: every other column is nudged up or
+   down by half a brick. */
 static void bg_draw_brick_v(const GridCtx *g)
 {
     int rows = g->rows, cols = g->cols, cw = g->cw, ch = g->ch;
@@ -459,7 +331,8 @@ static void bg_draw_brick_v(const GridCtx *g)
     }
 }
 
-/* Two diagonal line families intersect on a 45°-rotated lattice. */
+/* Diamond grid: two sets of slanted lines crossing to make diamonds, the same
+   square grid tilted 45 degrees. */
 static void bg_draw_diamond(const GridCtx *g)
 {
     int rows = g->rows, cols = g->cols, ox = g->ox, oy = g->oy;
@@ -476,7 +349,8 @@ static void bg_draw_diamond(const GridCtx *g)
     }
 }
 
-/* Same diagonal scheme as diamond but with a wider (2:1) cell aspect. */
+/* Isometric grid: same diamond trick, but the cells are stretched wide (2:1)
+   to give that game-map "viewed from an angle" look. */
 static void bg_draw_iso(const GridCtx *g)
 {
     int rows = g->rows, cols = g->cols, ox = g->ox, oy = g->oy;
@@ -493,7 +367,7 @@ static void bg_draw_iso(const GridCtx *g)
     }
 }
 
-/* Rect lattice with two extra diagonal families overlaid (axes + X). */
+/* A plain grid with diagonals laid over it too, so every cell has an X in it. */
 static void bg_draw_cross(const GridCtx *g)
 {
     int rows = g->rows, cols = g->cols, cw = g->cw, ch = g->ch;
@@ -517,7 +391,7 @@ static void bg_draw_cross(const GridCtx *g)
     }
 }
 
-/* Lines plus filled "black" squares on alternating cells (like a chessboard). */
+/* Grid lines plus filled-in squares on every other cell, like a chessboard. */
 static void bg_draw_check(const GridCtx *g)
 {
     int rows = g->rows, cols = g->cols, cw = g->cw, ch = g->ch;
@@ -536,7 +410,7 @@ static void bg_draw_check(const GridCtx *g)
     }
 }
 
-/* Horizontal rules only — no column structure (row-based grid). */
+/* Just horizontal lines, like ruled notebook paper — no columns. */
 static void bg_draw_ruled(const GridCtx *g)
 {
     int rows = g->rows, cols = g->cols, ch = g->ch;
@@ -548,7 +422,7 @@ static void bg_draw_ruled(const GridCtx *g)
     }
 }
 
-/* Sparse marker at every grid intersection — no connecting lines. */
+/* Just a dot where each grid corner would be — the lines are left to the eye. */
 static void bg_draw_dot(const GridCtx *g)
 {
     int rows = g->rows, cols = g->cols, cw = g->cw, ch = g->ch;
@@ -562,12 +436,8 @@ static void bg_draw_dot(const GridCtx *g)
     }
 }
 
-/*
- * ctx_draw_bg — dispatcher.
- * Routes all 14 GridMode values to a per-mode bg_draw_*() helper.
- * The five rect-family modes (uniform/square/fine/coarse/origin) share
- * one drawer because they differ only in cell size (and the origin overlay).
- */
+/* Draw whichever grid is active by handing off to its drawer. The five plain
+   rectangular styles share one drawer since they only differ in cell size. */
 static void ctx_draw_bg(const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_GRID));
@@ -588,11 +458,16 @@ static void ctx_draw_bg(const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_GRID));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §5 pool ── */
 
+/* Obj — one placed object. r,c is its cell on the grid; glyph is the character
+   we draw for it; alive says whether this slot is in use. */
 typedef struct { int r, c; char glyph; bool alive; } Obj;
+
+/* Pool — every object we've placed, kept in one fixed array so we never
+   allocate while running. items[0..count-1] are the live ones; the rest is
+   spare room. Removing an object fills its gap with the last one, so the live
+   entries always stay packed at the front. */
 typedef struct { Obj items[MAX_OBJ]; int count; } Pool;
 
 static int pool_find(const Pool *p, int r, int c)
@@ -632,7 +507,9 @@ static void pool_draw(const Pool *p, const GridCtx *g)
         if (!p->items[i].alive) continue;
         int sr, sc;
         ctx_to_screen(g, p->items[i].r, p->items[i].c, &sr, &sc);
-        /* place object one row/col inside the cell for rect grids */
+        /* nudge inside the cell so the object sits in the open space, not on
+           top of the grid lines. The slanted grids draw at the centre already,
+           so they skip this. */
         if (g->mode != GM_DIAMOND && g->mode != GM_ISO && g->mode != GM_RULED) {
             sr += (g->ch > 1 ? 1 : 0);
             sc += (g->cw > 1 ? 1 : 0);
@@ -643,10 +520,10 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_OBJ) | A_BOLD);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §6 cursor ── */
 
+/* Cursor — where you're pointing right now, as a cell (row, col). SPACE drops
+   or removes an object at this spot. */
 typedef struct { int r, c; } Cursor;
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
@@ -669,15 +546,15 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD | A_REVERSE);
 
     if (g->mode == GM_DIAMOND || g->mode == GM_ISO) {
-        /* highlight the single centre character */
+        /* slanted grids have no boxy cell to fill, so just mark the centre */
         if (sr >= 0 && sr < g->rows-1 && sc >= 0 && sc < g->cols)
             mvaddch(sr, sc, (chtype)'@');
     } else if (g->mode == GM_RULED) {
-        /* highlight one character wide on the ruled line */
+        /* one line, no columns, so mark a single spot on it */
         if (sr >= 0 && sr < g->rows-1 && sc >= 0 && sc < g->cols)
             mvaddch(sr, sc, (chtype)'@');
     } else {
-        /* fill interior of cell with reverse-video spaces */
+        /* light up the whole cell so it's obvious which one you're on */
         for (int dr2 = 1; dr2 < g->ch && sr+dr2 < g->rows-1; dr2++)
             for (int dc2 = 1; dc2 < g->cw && sc+dc2 < g->cols; dc2++)
                 mvaddch(sr+dr2, sc+dc2, (chtype)' ');
@@ -686,11 +563,10 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD | A_REVERSE);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §7 scene ── */
 
-/* Bright bold yellow fps readout (top-right) + bold cyan key hints (bottom). */
+/* The overlay text: fps and grid info up top, the key reminders along the
+   bottom. Kept bright and bold so it stays readable over any grid. */
 static void hud_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
                      double fps)
 {
@@ -719,9 +595,7 @@ static void scene_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
     wnoutrefresh(stdscr); doupdate();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  screen                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §8 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(void)
@@ -732,9 +606,7 @@ static void screen_init(void)
     color_init(); atexit(screen_cleanup);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  app                                                                 */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/* ── §9 app ── */
 
 static volatile sig_atomic_t g_running=1, g_need_resize=0;
 static void on_signal(int s)

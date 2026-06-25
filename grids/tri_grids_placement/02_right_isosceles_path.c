@@ -24,7 +24,7 @@
 #include <string.h>
 #include <time.h>
 
-/* ── §1 config — sizes, colors, and other knobs ── */
+/* ── §1 config ── */
 
 #define TARGET_FPS 60
 #define CELL_W 2
@@ -47,7 +47,7 @@
 #define PAIR_HUD    6
 #define PAIR_HINT   7
 
-/* ── §2 clock — read the time and sleep to pace frames ── */
+/* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
@@ -62,7 +62,7 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&r, NULL);
 }
 
-/* ── §3 color — themes and the color slots we draw with ── */
+/* ── §3 color ── */
 
 static const short THEME_FG[N_THEMES][3] = {
     {  75,  82, 196 }, {  39, 226, 207 }, { 207,  82,  39 }, {  15,  82, 196 },
@@ -89,24 +89,25 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 gridctx — the grid itself, plus the math that maps points to triangles ── */
+/* ── §4 tri mapping & lattice ── */
 
-/* Everything the program needs to know about the current grid and the two
- * markers on it. One of these lives for the whole run; the keypress handlers
- * and the drawing code all read and tweak it. */
+/* GridCtx — the right-triangle grid for one frame, plus the two path markers.
+ * Positions are sub-pixels first, then divided down to character cells, so the
+ * square size can change smoothly. Centred on (ox,oy) so markers stay put on
+ * resize. */
 typedef struct {
-    int    rows, cols;        /* screen size in terminal cells */
-    double tri_size;          /* width of one grid square in pixels; bigger = zoom in */
-    int    cell_w, cell_h;    /* how many pixels one terminal cell stands for (chars are tall) */
-    int    ox, oy;            /* screen cell the grid's origin sits at, so it stays centered */
-    double border_w;          /* how close to a triangle's edge a point must be to draw a line */
-    int    theme;             /* which color theme is active (0..N_THEMES-1) */
-    int    paused;            /* unused toggle kept for the 'p' key */
+    int    rows, cols;        /* terminal size in character cells */
+    double tri_size;          /* grid square side length, in sub-pixels */
+    int    cell_w, cell_h;    /* sub-pixels per character column / row */
+    int    ox, oy;            /* grid (0,0) on screen; re-centred each frame */
+    double border_w;          /* a cell is on an edge if it's within this of one */
+    int    theme;             /* colour scheme, 0..N_THEMES-1 */
+    int    paused;            /* 1 while paused ('p') */
 
-    /* The START marker: which triangle it sits in. up=1 is the upper triangle
-     * of a square, up=0 the lower one. has_start says whether it's been placed. */
+    /* START marker: which triangle it sits in. up=1 upper triangle of a square,
+     * up=0 lower. has_start says whether it's been placed. */
     int    sCol, sRow, sUp;
-    /* The END marker, same layout as START. */
+    /* END marker, same layout as START. */
     int    eCol, eRow, eUp;
     int    has_start, has_end;
 } GridCtx;
@@ -135,12 +136,11 @@ static void ctx_resize(GridCtx *g, int rows, int cols)
     g->ox = cols / 2; g->oy = (rows - 1) / 2;
 }
 
-/* Given a point in pixels, work out which triangle it falls in. The square is
- * (col, row); whether you're above or below the '\' diagonal decides the half
- * (up). fa/fb are how far into the square you are, handed back so the caller
- * can tell how close to an edge you are. This is the one bit of math the grid
- * drawing and the path finder both rely on, so they always agree. */
-static void pixel_to_tri(double px, double py, double size,
+/* recipe step 1 (reverse) — a pixel -> which triangle (col,row,up) + where
+ * inside (fa,fb). The square is (col,row); the '\' diagonal splits it: fa >= fb
+ * is the upper (△) half, else the lower (▽) half. fa/fb are handed back so the
+ * caller can tell how close to an edge you are. */
+static void screen_to_tri(double px, double py, double size,
                          int *col, int *row, int *up,
                          double *fa, double *fb)
 {
@@ -152,6 +152,8 @@ static void pixel_to_tri(double px, double py, double size,
     *up = (*fa >= *fb) ? 1 : 0;
 }
 
+/* the pixel at a triangle's centre (1/3 in from the corners). This is where the
+ * cursor/marker is drawn so it lands cleanly inside. */
 static void tri_centroid_pixel(int col, int row, int up, double size,
                                double *cx_pix, double *cy_pix)
 {
@@ -160,7 +162,9 @@ static void tri_centroid_pixel(int col, int row, int up, double size,
     *cx_pix = a * size; *cy_pix = b * size;
 }
 
-static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
+/* a triangle's address -> the character cell to draw on. Truncates so the mark
+ * sits inside the triangle, never on an edge. */
+static void tri_to_screen(const GridCtx *g, int col, int row, int up,
                           int *scol, int *srow)
 {
     double cx_pix, cy_pix;
@@ -169,7 +173,10 @@ static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
     *srow = g->oy + (int)(cy_pix / g->cell_h);
 }
 
-static char tri_edge_char(int up, double fa, double fb, double *out_min)
+/* the line char for a point by nearest of the triangle's 3 sides: '|', '\', '_'.
+ * out_min returns the distance to that side, so the caller skips open-space
+ * cells (only draws when it's below border_w). */
+static char edge_glyph(int up, double fa, double fb, double *out_min)
 {
     double l1, l2, l3; char ch1, ch2, ch3;
     if (up == 1) {
@@ -188,7 +195,9 @@ static char tri_edge_char(int up, double fa, double fb, double *out_min)
     return ch;
 }
 
-static void ctx_draw_bg(const GridCtx *g)
+/* recipe step 2 — draw the grid: every cell -> its triangle -> a line char only
+ * on the edge cells (interiors stay blank). Nothing stored; redrawn each frame. */
+static void draw_lattice(const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_BORDER));
     for (int row = 0; row < g->rows - 1; row++) {
@@ -196,8 +205,8 @@ static void ctx_draw_bg(const GridCtx *g)
             double px = (double)(col - g->ox) * g->cell_w;
             double py = (double)(row - g->oy) * g->cell_h;
             int tC, tR, tU; double fa, fb, m;
-            pixel_to_tri(px, py, g->tri_size, &tC, &tR, &tU, &fa, &fb);
-            char ch = tri_edge_char(tU, fa, fb, &m);
+            screen_to_tri(px, py, g->tri_size, &tC, &tR, &tU, &fa, &fb);
+            char ch = edge_glyph(tU, fa, fb, &m);
             if (m >= g->border_w) continue;
             mvaddch(row, col, (chtype)(unsigned char)ch);
         }
@@ -207,12 +216,14 @@ static void ctx_draw_bg(const GridCtx *g)
 
 /* ── §5 pool — the list of triangles that make up the path ── */
 
-/* One triangle on the path: which square (col, row), which half (up), the
- * character to draw, and whether it's in use. */
+/* One triangle on the path, pinned by address (col,row,up) not screen spot.
+ *   up    — which half (1 = △ upper, 0 = ▽ lower)
+ *   glyph — the character to draw
+ *   alive — true if this slot holds a real entry */
 typedef struct { int col, row, up; char glyph; bool alive; } Obj;
 
-/* The whole path as a plain fixed-size array — no malloc, just fill from the
- * front. count is how many slots are used; entries past it are ignored. */
+/* The whole path: a plain fixed-size array plus a count of slots in use. No
+ * growing, no allocation — full at MAX_OBJ; live ones packed at the front. */
 typedef struct { Obj items[MAX_OBJ]; int count; } Pool;
 
 static int pool_find(const Pool *p, int col, int row, int up)
@@ -241,7 +252,7 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     for (int i = 0; i < p->count; i++) {
         if (!p->items[i].alive) continue;
         int sc, sr;
-        ctx_to_screen(g, p->items[i].col, p->items[i].row, p->items[i].up,
+        tri_to_screen(g, p->items[i].col, p->items[i].row, p->items[i].up,
                       &sc, &sr);
         if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1)
             mvaddch(sr, sc, (chtype)(unsigned char)p->items[i].glyph);
@@ -251,14 +262,15 @@ static void pool_draw(const Pool *p, const GridCtx *g)
 
 /* ── §6 cursor — the '@' you move, and the S/E markers ── */
 
-/* The '@' you steer: which square (col, row) and which half of it (up). */
+/* Where the '@' currently is: the address of one triangle — same three numbers
+ * a marker uses (col, row, and up = which half of the square). */
 typedef struct { int col, row, up; } Cursor;
 
-/* How one arrow press moves the cursor. Moving off a triangle usually just
- * flips to its neighbor inside the same square, but sometimes you step into
- * the next square — so the move depends on which half you're standing in.
- * Indexed [direction][current up], giving {dcol, drow, new up}.
- * Directions: 0=left 1=right 2=up 3=down. */
+/* One arrow press isn't a simple ±1 on a triangle grid: stepping off a triangle
+ * usually flips to its neighbour in the same square, but sometimes steps into
+ * the next square — so the move depends on which half you're standing in. Look
+ * up by [arrow][current up] to get {dcol, drow, new up}.
+ *   arrows: 0=LEFT 1=RIGHT 2=UP 3=DOWN     half: 0=▽ (lower)  1=△ (upper) */
 static const int TRI_DIR[4][2][3] = {
     { { -1,  0,  1 }, {  0,  0,  0 } },
     { {  0,  0,  1 }, { +1,  0,  0 } },
@@ -281,7 +293,7 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dcol, int drow, int d
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sc, sr;
-    ctx_to_screen(g, cur->col, cur->row, cur->up, &sc, &sr);
+    tri_to_screen(g, cur->col, cur->row, cur->up, &sc, &sr);
     if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
         attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
         mvaddch(sr, sc, '@');
@@ -293,7 +305,7 @@ static void marker_draw(const GridCtx *g, int col, int row, int up,
                         char glyph, int pair)
 {
     int sc, sr;
-    ctx_to_screen(g, col, row, up, &sc, &sr);
+    tri_to_screen(g, col, row, up, &sc, &sr);
     if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
         attron(COLOR_PAIR(pair) | A_BOLD);
         mvaddch(sr, sc, (chtype)(unsigned char)glyph);
@@ -301,9 +313,13 @@ static void marker_draw(const GridCtx *g, int col, int row, int up,
     }
 }
 
-/* ── §7 path — find every triangle the S→E line touches ── */
+/* ── §7 path — lay objects along the S→E line between two triangles ── */
 
-static void path_compute(Pool *p, const GridCtx *g)
+/* the distinct placement step of this file: walk the straight pixel line from
+ * START's centroid to END's centroid in small steps, and place a marker in
+ * every triangle that line passes through. Step is 1/4 of a square so no
+ * triangle is skipped. */
+static void path_lay(Pool *p, const GridCtx *g)
 {
     pool_clear(p);
     if (!g->has_start || !g->has_end) return;
@@ -319,7 +335,7 @@ static void path_compute(Pool *p, const GridCtx *g)
         double t = (double)i / (double)n;
         double px = sx + t * dx, py = sy + t * dy;
         int tC, tR, tU; double fa, fb;
-        pixel_to_tri(px, py, g->tri_size, &tC, &tR, &tU, &fa, &fb);
+        screen_to_tri(px, py, g->tri_size, &tC, &tR, &tU, &fa, &fb);
         pool_place(p, tC, tR, tU, '*');
     }
 }
@@ -348,7 +364,7 @@ static void hud_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
 static void scene_draw(const GridCtx *g, const Pool *p, const Cursor *cur, double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_lattice(g);
     pool_draw(p, g);
     if (g->has_start) marker_draw(g, g->sCol, g->sRow, g->sUp, 'S', PAIR_START);
     if (g->has_end)   marker_draw(g, g->eCol, g->eRow, g->eUp, 'E', PAIR_END);
@@ -403,18 +419,18 @@ int main(void)
                           color_init(g.theme); break;
                 case ' ': g.has_start = 0; g.has_end = 0; pool_clear(&path); break;
                 case 's': g.sCol = cur.col; g.sRow = cur.row; g.sUp = cur.up;
-                          g.has_start = 1; path_compute(&path, &g); break;
+                          g.has_start = 1; path_lay(&path, &g); break;
                 case 'e': g.eCol = cur.col; g.eRow = cur.row; g.eUp = cur.up;
-                          g.has_end = 1; path_compute(&path, &g); break;
+                          g.has_end = 1; path_lay(&path, &g); break;
                 case 't': g.theme = (g.theme + 1) % N_THEMES; color_init(g.theme); break;
                 case KEY_LEFT:  t = TRI_DIR[0][cur.up]; cursor_move(&cur, &g, t[0], t[1], t[2]); break;
                 case KEY_RIGHT: t = TRI_DIR[1][cur.up]; cursor_move(&cur, &g, t[0], t[1], t[2]); break;
                 case KEY_UP:    t = TRI_DIR[2][cur.up]; cursor_move(&cur, &g, t[0], t[1], t[2]); break;
                 case KEY_DOWN:  t = TRI_DIR[3][cur.up]; cursor_move(&cur, &g, t[0], t[1], t[2]); break;
                 case '+': case '=':
-                    if (g.tri_size < TRI_SIZE_MAX) { g.tri_size += TRI_SIZE_STEP; path_compute(&path, &g); } break;
+                    if (g.tri_size < TRI_SIZE_MAX) { g.tri_size += TRI_SIZE_STEP; path_lay(&path, &g); } break;
                 case '-':
-                    if (g.tri_size > TRI_SIZE_MIN) { g.tri_size -= TRI_SIZE_STEP; path_compute(&path, &g); } break;
+                    if (g.tri_size > TRI_SIZE_MIN) { g.tri_size -= TRI_SIZE_STEP; path_lay(&path, &g); } break;
             }
         }
         int64_t now = clock_ns();

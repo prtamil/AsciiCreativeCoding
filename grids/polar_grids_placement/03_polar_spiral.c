@@ -121,7 +121,7 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 gridctx ── */
+/* ── §4 polar mapping ── */
 
 /*
  * Everything we need to map between screen cells and polar (radius, angle)
@@ -148,7 +148,8 @@ static void ctx_init(GridCtx *g, int mode, int rows, int cols)
     g->max_ring = (int)(half_diag_px / 20.0);
 }
 
-static void cell_to_polar(int col, int row, int ox, int oy,
+/* a screen cell -> its distance and angle from the centre */
+static void screen_to_polar(int col, int row, int ox, int oy,
                            double *r_px, double *theta)
 {
     double dx = (double)(col - ox) * CELL_W;
@@ -157,6 +158,7 @@ static void cell_to_polar(int col, int row, int ox, int oy,
     *theta = atan2(dy, dx);
 }
 
+/* the reverse — a distance and angle -> the screen cell that lands there */
 static void polar_to_screen(double r, double theta, int ox, int oy,
                               int *col, int *row)
 {
@@ -164,9 +166,7 @@ static void polar_to_screen(double r, double theta, int ox, int oy,
     *row = oy + (int)round(r * sin(theta) / CELL_H);
 }
 
-/* Pick a slash/dash/pipe that points roughly along the angle, so the grid
- * lines look like they're flowing in the right direction. */
-static char angle_char(double theta)
+static char line_glyph(double theta)
 {
     double a = fmod(theta + 2.0*M_PI, M_PI);
     if (a < M_PI/8.0 || a >= 7.0*M_PI/8.0) return '-';
@@ -230,7 +230,7 @@ typedef struct {
 
 static void cursor_sync_polar(Cursor *c, const GridCtx *g)
 {
-    cell_to_polar(c->col, c->row, g->ox, g->oy, &c->r, &c->theta);
+    screen_to_polar(c->col, c->row, g->ox, g->oy, &c->r, &c->theta);
 }
 
 static void cursor_reset(Cursor *c, const GridCtx *g)
@@ -276,13 +276,13 @@ static void bg_rings_spokes_draw(const GridCtx *g)
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
             double r, th;
-            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            screen_to_polar(col, row, g->ox, g->oy, &r, &th);
             double rp   = fmod(r, sp);
             bool   on_r = rp < rw || rp > sp - rw;
             double tn   = fmod(th + two_pi, two_pi);
             double sp2  = fmod(tn, sa);
             if (on_r || (r > 3.0 && (sp2 < sw || sp2 > sa - sw)))
-                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+                mvaddch(row, col, (chtype)(unsigned char)line_glyph(th));
         }
     }
 }
@@ -297,7 +297,7 @@ static void bg_log_polar_draw(const GridCtx *g)
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
             double r, th;
-            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            screen_to_polar(col, row, g->ox, g->oy, &r, &th);
             bool on_r = false;
             if (r > rmin) {
                 double u  = log(r / rmin) / ls;
@@ -307,7 +307,7 @@ static void bg_log_polar_draw(const GridCtx *g)
             double tn  = fmod(th + two_pi, two_pi);
             double sp2 = fmod(tn, sa);
             if (on_r || (r > 3.0 && (sp2 < sw || sp2 > sa - sw)))
-                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+                mvaddch(row, col, (chtype)(unsigned char)line_glyph(th));
         }
     }
 }
@@ -322,12 +322,12 @@ static void bg_archimedean_draw(const GridCtx *g)
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
             double r, th;
-            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            screen_to_polar(col, row, g->ox, g->oy, &r, &th);
             if (r < rmin) continue;
             double tn = fmod(th + two_pi, two_pi);
             double ph = fmod(2.0 * (tn - r / a) + 2.0 * two_pi, two_pi);
             if (ph < sw || ph > two_pi - sw)
-                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+                mvaddch(row, col, (chtype)(unsigned char)line_glyph(th));
         }
     }
 }
@@ -343,13 +343,13 @@ static void bg_log_spiral_draw(const GridCtx *g)
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
             double r, th;
-            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            screen_to_polar(col, row, g->ox, g->oy, &r, &th);
             if (r < rmin) continue;
             double tn = fmod(th + two_pi, two_pi);
             double tp = log(r / rmin) / growth;
             double ph = fmod(2.0 * (tn - tp) + 2.0 * two_pi, two_pi);
             if (ph < sw || ph > two_pi - sw)
-                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+                mvaddch(row, col, (chtype)(unsigned char)line_glyph(th));
         }
     }
 }
@@ -389,14 +389,14 @@ static void bg_equal_area_draw(const GridCtx *g)
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
             double r, th;
-            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            screen_to_polar(col, row, g->ox, g->oy, &r, &th);
             if (r < 3.0) continue;
             double kf  = (r * r) / rusq;
             double fr  = kf - floor(kf);
             double tn  = fmod(th + two_pi, two_pi);
             double sp2 = fmod(tn, sa);
             if (fr < rwf || fr > 1.0 - rwf || sp2 < sw || sp2 > sa - sw)
-                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+                mvaddch(row, col, (chtype)(unsigned char)line_glyph(th));
         }
     }
 }
@@ -415,7 +415,7 @@ static void bg_elliptic_draw(const GridCtx *g)
             double et = atan2(dy/B, dx/A);
             double fr = (er / sp) - floor(er / sp);
             if (fr < rwu || fr > 1.0 - rwu)
-                mvaddch(row, col, (chtype)(unsigned char)angle_char(et));
+                mvaddch(row, col, (chtype)(unsigned char)line_glyph(et));
         }
     }
 }
@@ -438,12 +438,13 @@ static void draw_polar_bg(const GridCtx *g)
 
 /* ── §8 spiral ── */
 
-/*
- * Stamp an Archimedean spiral into the pool. Sweep the angle from the start
- * around n_turns times; at each tiny step the radius grows by a fixed amount,
- * so the arms stay evenly spaced. We drop a dot wherever the curve lands.
- * (Archimedean spiral: en.wikipedia.org/wiki/Archimedean_spiral)
- */
+/* PLACEMENT STRATEGY: spiral trail from the cursor. Step radius and angle
+ * together along the spiral's law — one curls the angle forward, the other
+ * grows the radius to match — and stamp a dot at each step. Walking the curve,
+ * never scanning the screen. */
+
+/* Archimedean: radius grows by a fixed amount per step, so arms stay evenly
+ * spaced. (en.wikipedia.org/wiki/Archimedean_spiral) */
 static void spiral_place_archim(Pool *pool, double r0, double theta0,
                                  double pitch, int n_turns, double density,
                                  const GridCtx *g)
@@ -459,12 +460,8 @@ static void spiral_place_archim(Pool *pool, double r0, double theta0,
     }
 }
 
-/*
- * Stamp a logarithmic spiral into the pool. Same sweep, but here the radius
- * grows by a percentage of its current size each step, so the arms spread
- * wider and wider — the nautilus-shell look.
- * (Logarithmic spiral: en.wikipedia.org/wiki/Logarithmic_spiral)
- */
+/* Logarithmic: radius grows by a percentage of itself per step, so arms spread
+ * wider and wider — the nautilus look. (en.wikipedia.org/wiki/Logarithmic_spiral) */
 static void spiral_place_log(Pool *pool, double r0, double theta0,
                                double growth, int n_turns, double density,
                                const GridCtx *g)

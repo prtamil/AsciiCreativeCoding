@@ -73,19 +73,14 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula — turning a cell (row, col) into a spot on the screen ── */
+/* ── §4 rect mapping & lattice ── */
 
-/*
- * GridCtx — everything we need to know to lay the grid out on this terminal.
- *
- * One of these is built when the program starts and rebuilt on every resize.
- * The width is always the height times ASPECT_RATIO, which is the whole point
- * of this file: that's what keeps the cells looking square.
- */
+/* GridCtx — the grid for one frame. Same as 01_uniform_rect.c, but the cell is
+ * a square box: cw = ch * ASPECT_RATIO cancels the character's tall aspect. */
 typedef struct {
-    int rows, cols;      /* size of the terminal, in characters                */
-    int cw, ch;          /* one cell's width and height in characters (cw = ch * ASPECT_RATIO) */
-    int max_r, max_c;    /* the highest cell the cursor can sit on without falling off the edge */
+    int rows, cols;      /* terminal size in characters */
+    int cw, ch;          /* box width and height; cw = ch * ASPECT_RATIO (square) */
+    int max_r, max_c;    /* furthest cell the cursor can reach */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols)
@@ -96,14 +91,15 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->max_c = cols / CELL_W - 1;
 }
 
-/* Finds the top-left corner of a cell: step over by one cell per row/column. */
-static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
+/* recipe step 1 — cell (r,c) -> its top-left corner on screen */
+static void cell_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
     *sr = r * g->ch;
     *sc = c * g->cw;
 }
 
-static char ctx_grid_char(const GridCtx *g, int sr, int sc)
+/* a screen spot is on a line when its row/column divides into the box size */
+static char grid_glyph_at(const GridCtx *g, int sr, int sc)
 {
     bool h = (sr % g->ch == 0);
     bool v = (sc % g->cw == 0);
@@ -113,12 +109,13 @@ static char ctx_grid_char(const GridCtx *g, int sr, int sc)
     return ' ';
 }
 
-static void ctx_draw_bg(const GridCtx *g)
+/* recipe step 2 — draw the grid by asking grid_glyph_at at every screen spot */
+static void draw_lattice(const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_GRID));
     for (int sr = 0; sr < g->rows - 1; sr++) {
         for (int sc = 0; sc < g->cols; sc++) {
-            char ch = ctx_grid_char(g, sr, sc);
+            char ch = grid_glyph_at(g, sr, sc);
             if (ch != ' ')
                 mvaddch(sr, sc, (chtype)(unsigned char)ch);
         }
@@ -128,7 +125,8 @@ static void ctx_draw_bg(const GridCtx *g)
 
 /* ── §5 cursor ── */
 
-/* Which cell the '@' is sitting on, in grid coordinates (row, column). */
+/* Cursor — which box the '@' sits in, as (r,c). Pair with a GridCtx and run
+ * through cell_to_screen to place it. */
 typedef struct { int r, c; } Cursor;
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
@@ -137,6 +135,7 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->c = g->max_c / 2;
 }
 
+/* recipe step 3 — move the cursor, clamped so it never steps off the grid */
 static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
 {
     int nr = cur->r + dr, nc = cur->c + dc;
@@ -147,7 +146,7 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc;
-    ctx_to_screen(g, cur->r, cur->c, &sr, &sc);
+    cell_to_screen(g, cur->r, cur->c, &sr, &sc);
 
     attron(COLOR_PAIR(PAIR_ACTIVE));
     for (int dr = 1; dr < g->ch; dr++)
@@ -182,7 +181,7 @@ static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
 static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_lattice(g);
     cursor_draw(cur, g);
     hud_draw(g, cur, fps);
     wnoutrefresh(stdscr);

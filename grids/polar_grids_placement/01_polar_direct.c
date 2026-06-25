@@ -130,27 +130,15 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 gridctx ── */
+/* ── §4 polar mapping ── */
 
-/*
- * GridCtx — everything we need to know about the round grid right now: which
- * background is showing and where its centre sits on screen.  Rebuilt whenever
- * the user switches grids or the terminal is resized.
- *
- *   mode      — which background is active, 0..6 (see BG_NAMES).
- *   rows,cols — current terminal size; remembered so a resize can re-centre.
- *   cw,ch     — pixels per cell across and down; used to keep circles round.
- *   ox,oy     — the centre of the screen, the point everything is measured from.
- *   max_ring,
- *   max_spoke — rough "how many rings/spokes fit" counts, only shown in the HUD.
- *               The cursor itself is kept on-screen by clamping, not by these.
- */
+/* GridCtx — the round grid for one frame. Rebuilt on a grid switch or resize. */
 typedef struct {
-    int mode;
-    int rows, cols;
-    int cw, ch;
-    int ox, oy;
-    int max_ring, max_spoke;
+    int mode;              /* which background, 0..6 (see BG_NAMES) */
+    int rows, cols;        /* terminal size in character cells */
+    int cw, ch;            /* pixels per cell across/down — keeps circles round */
+    int ox, oy;            /* screen centre; everything is measured from here */
+    int max_ring, max_spoke; /* rough counts, HUD only; cursor is kept on by clamping */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int mode, int rows, int cols)
@@ -166,11 +154,8 @@ static void ctx_init(GridCtx *g, int mode, int rows, int cols)
     g->max_ring = (int)(half_diag_px / BG_RING_SP);
 }
 
-/*
- * cell_to_polar — given a cell on screen, find how far it is from the centre
- * and which direction it points (its distance r and angle theta).
- */
-static void cell_to_polar(int col, int row, int ox, int oy,
+/* a screen cell -> its distance and angle from the centre */
+static void screen_to_polar(int col, int row, int ox, int oy,
                            double *r_px, double *theta)
 {
     double dx = (double)(col - ox) * CELL_W;
@@ -179,10 +164,7 @@ static void cell_to_polar(int col, int row, int ox, int oy,
     *theta = atan2(dy, dx);
 }
 
-/*
- * polar_to_screen — the reverse: take a distance and angle and find which
- * cell on screen lands there.
- */
+/* the reverse — a distance and angle -> the screen cell that lands there */
 static void polar_to_screen(double r, double theta, int ox, int oy,
                               int *col, int *row)
 {
@@ -190,7 +172,7 @@ static void polar_to_screen(double r, double theta, int ox, int oy,
     *row = oy + (int)round(r * sin(theta) / CELL_H);
 }
 
-static char angle_char(double theta)
+static char line_glyph(double theta)
 {
     double a = fmod(theta + 2.0*M_PI, M_PI);
     if (a < M_PI/8.0 || a >= 7.0*M_PI/8.0) return '-';
@@ -452,7 +434,7 @@ static void cursor_move_elliptic(Cursor *c, const GridCtx *g, int key)
     if (c->row >= g->rows-1) c->row = g->rows-2;
     if (c->col < 0)          c->col = 0;
     if (c->col >= g->cols)   c->col = g->cols-1;
-    cell_to_polar(c->col, c->row, g->ox, g->oy, &c->r, &c->theta);
+    screen_to_polar(c->col, c->row, g->ox, g->oy, &c->r, &c->theta);
     if (c->r < R_POLAR_MIN) c->r = R_POLAR_MIN;
 }
 
@@ -496,14 +478,14 @@ static void bg_rings_spokes_draw(const GridCtx *g)
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
             double r, th;
-            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            screen_to_polar(col, row, g->ox, g->oy, &r, &th);
             double rp     = fmod(r, sp);
             bool   on_r   = rp < rw || rp > sp - rw;
             double tn     = fmod(th + two_pi, two_pi);
             double sp2    = fmod(tn, sa);
             bool   on_s   = r > 3.0 && (sp2 < sw || sp2 > sa - sw);
             if (on_r || on_s)
-                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+                mvaddch(row, col, (chtype)(unsigned char)line_glyph(th));
         }
     }
 }
@@ -518,7 +500,7 @@ static void bg_log_polar_draw(const GridCtx *g)
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
             double r, th;
-            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            screen_to_polar(col, row, g->ox, g->oy, &r, &th);
             bool on_r = false;
             if (r > rmin) {
                 double u  = log(r / rmin) / ls;
@@ -529,7 +511,7 @@ static void bg_log_polar_draw(const GridCtx *g)
             double sp2 = fmod(tn, sa);
             bool   on_s = r > 3.0 && (sp2 < sw || sp2 > sa - sw);
             if (on_r || on_s)
-                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+                mvaddch(row, col, (chtype)(unsigned char)line_glyph(th));
         }
     }
 }
@@ -544,13 +526,13 @@ static void bg_archimedean_draw(const GridCtx *g)
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
             double r, th;
-            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            screen_to_polar(col, row, g->ox, g->oy, &r, &th);
             if (r < rmin) continue;
             double tn  = fmod(th + two_pi, two_pi);
             double raw = 2.0 * (tn - r / a);
             double ph  = fmod(raw + 2.0 * two_pi, two_pi);
             if (ph < sw || ph > two_pi - sw)
-                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+                mvaddch(row, col, (chtype)(unsigned char)line_glyph(th));
         }
     }
 }
@@ -565,14 +547,14 @@ static void bg_log_spiral_draw(const GridCtx *g)
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
             double r, th;
-            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            screen_to_polar(col, row, g->ox, g->oy, &r, &th);
             if (r < rmin) continue;
             double tn  = fmod(th + two_pi, two_pi);
             double tp  = log(r / rmin) / growth;
             double raw = 2.0 * (tn - tp);
             double ph  = fmod(raw + 2.0 * two_pi, two_pi);
             if (ph < sw || ph > two_pi - sw)
-                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+                mvaddch(row, col, (chtype)(unsigned char)line_glyph(th));
         }
     }
 }
@@ -609,7 +591,7 @@ static void bg_equal_area_draw(const GridCtx *g)
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
             double r, th;
-            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            screen_to_polar(col, row, g->ox, g->oy, &r, &th);
             if (r < 3.0) continue;
             double kf  = (r * r) / rusq;
             double fr  = kf - floor(kf);
@@ -618,7 +600,7 @@ static void bg_equal_area_draw(const GridCtx *g)
             double sp2 = fmod(tn, sa);
             bool   on_s = sp2 < sw || sp2 > sa - sw;
             if (on_r || on_s)
-                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+                mvaddch(row, col, (chtype)(unsigned char)line_glyph(th));
         }
     }
 }
@@ -637,7 +619,7 @@ static void bg_elliptic_draw(const GridCtx *g)
             double et = atan2(dy/B, dx/A);
             double u  = er / sp, fr = u - floor(u);
             if (fr < rwu || fr > 1.0 - rwu)
-                mvaddch(row, col, (chtype)(unsigned char)angle_char(et));
+                mvaddch(row, col, (chtype)(unsigned char)line_glyph(et));
         }
     }
 }

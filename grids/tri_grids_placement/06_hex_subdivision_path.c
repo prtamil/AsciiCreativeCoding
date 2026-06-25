@@ -108,27 +108,25 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 gridctx ── */
+/* ── §4 hex mapping & lattice ── */
 
-/*
- * Everything we need to turn hex coordinates into screen positions and back.
- * Built once at startup and rebuilt on resize or when the hexes change size.
- */
+/* GridCtx — the hex grid for one frame plus the user's live size knob. Each hex
+ * is cut into 6 pie-slice wedges; positions are in sub-pixels, divided down to
+ * character cells so hex size can change smoothly. Centred on (ox,oy). */
 typedef struct {
-    int    rows, cols;            /* terminal size, in characters */
-    int    cw, ch;               /* width and height of one character cell, in sub-pixels */
-    double hex_size;             /* radius of a hex, in pixels — bigger means fewer, larger hexes */
+    int    rows, cols;            /* terminal size, in character cells */
+    int    cell_w, cell_h;        /* sub-pixels per character column / row */
+    double hex_size;             /* hex radius, in sub-pixels */
     int    ox, oy;               /* screen cell that hex (0,0) sits on */
     int    max_q, max_r;         /* how far the cursor may roam from the centre */
-    /* border_w: how thick the hex outline is, as a fraction of a hex.
-     * radius_t_frac: how close a point must be to a diagonal to count as on it. */
-    double border_w, radius_t_frac;
+    double border_w;             /* hex outline thickness, fraction of a hex */
+    double radius_t_frac;        /* how close a point must be to a diagonal to be on it */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols, double hex_size)
 {
     g->rows = rows; g->cols = cols;
-    g->cw = CELL_W; g->ch = CELL_H;
+    g->cell_w = CELL_W; g->cell_h = CELL_H;
     g->hex_size = hex_size;
     g->ox = cols / 2;
     g->oy = (rows - 1) / 2;
@@ -138,6 +136,7 @@ static void ctx_init(GridCtx *g, int rows, int cols, double hex_size)
     g->radius_t_frac = RADIUS_T_FRAC;
 }
 
+/* nearest line glyph for an angle (used for the curved hex outline) */
 static char angle_char(double theta)
 {
     double t = fmod(theta, M_PI);
@@ -149,6 +148,7 @@ static char angle_char(double theta)
     return '-';
 }
 
+/* which of a hex's 6 pie-slices a local offset (dx,dy) points into, 0..5 */
 static int sector_of(double dx, double dy)
 {
     double ang = atan2(dy, dx);
@@ -157,7 +157,9 @@ static int sector_of(double dx, double dy)
     return s;
 }
 
-static void pixel_to_hex(double px, double py, double size,
+/* recipe step 1 (reverse) — a pixel -> which hex (Q,R), via fractional cube
+ * coords rounded to the nearest cell. dist = how far inside (for the outline). */
+static void screen_to_hex(double px, double py, double size,
                          int *Q, int *R, double *dist)
 {
     double sq3 = sqrt(3.0), sq3_3 = sq3 / 3.0;
@@ -180,6 +182,7 @@ static void pixel_to_hex(double px, double py, double size,
     *dist = d;
 }
 
+/* recipe step 1 (forward) — the pixel at a hex's centre */
 static void hex_centre_pixel(int Q, int R, double size,
                               double *cx, double *cy)
 {
@@ -188,6 +191,8 @@ static void hex_centre_pixel(int Q, int R, double size,
     *cy = size * (sq3*0.5 * (double)Q + sq3 * (double)R);
 }
 
+/* the pixel at a wedge's centre: out from the hex centre toward its sector.
+ * This is where the cursor/marker draws so it lands cleanly inside the slice. */
 static void wedge_centroid_pixel(int Q, int R, int sector, double size,
                                  double *cx_pix, double *cy_pix)
 {
@@ -199,16 +204,19 @@ static void wedge_centroid_pixel(int Q, int R, int sector, double size,
     *cy_pix = cy + r * sin(ang);
 }
 
-static void ctx_to_screen(const GridCtx *g, int q, int r, int sector,
+/* a wedge's address -> the character cell to draw it on */
+static void hex_to_screen(const GridCtx *g, int q, int r, int sector,
                           int *scol, int *srow)
 {
     double cx, cy;
     wedge_centroid_pixel(q, r, sector, g->hex_size, &cx, &cy);
-    *scol = g->ox + (int)(cx / g->cw);
-    *srow = g->oy + (int)(cy / g->ch);
+    *scol = g->ox + (int)(cx / g->cell_w);
+    *srow = g->oy + (int)(cy / g->cell_h);
 }
 
-static void ctx_draw_bg(const GridCtx *g)
+/* recipe step 2 — draw the grid: every cell -> its hex -> the curved outline on
+ * border cells, the 3 inner diagonals near the spokes. Redrawn each frame. */
+static void draw_lattice(const GridCtx *g)
 {
     double sq3 = sqrt(3.0), sq3_2 = sq3 * 0.5;
     double limit_inner = 0.5 - g->border_w;
@@ -216,10 +224,10 @@ static void ctx_draw_bg(const GridCtx *g)
 
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
-            double px = (double)(col - g->ox) * g->cw;
-            double py = (double)(row - g->oy) * g->ch;
+            double px = (double)(col - g->ox) * g->cell_w;
+            double py = (double)(row - g->oy) * g->cell_h;
             int Q, R; double dist;
-            pixel_to_hex(px, py, g->hex_size, &Q, &R, &dist);
+            screen_to_hex(px, py, g->hex_size, &Q, &R, &dist);
             double cx, cy;
             hex_centre_pixel(Q, R, g->hex_size, &cx, &cy);
             double dxp = px - cx, dyp = py - cy;
@@ -286,7 +294,7 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     for (int i = 0; i < p->count; i++) {
         if (!p->items[i].alive) continue;
         int sc, sr;
-        ctx_to_screen(g, p->items[i].q, p->items[i].r, p->items[i].sector,
+        hex_to_screen(g, p->items[i].q, p->items[i].r, p->items[i].sector,
                       &sc, &sr);
         if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1)
             mvaddch(sr, sc, (chtype)(unsigned char)p->items[i].glyph);
@@ -342,7 +350,7 @@ static void cursor_rotate_sector(Cursor *cur, int delta)
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sc, sr;
-    ctx_to_screen(g, cur->q, cur->r, cur->sector, &sc, &sr);
+    hex_to_screen(g, cur->q, cur->r, cur->sector, &sc, &sr);
     if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
         attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
         mvaddch(sr, sc, '@');
@@ -350,14 +358,14 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ── §7 mode — path state machine + line walk ── */
+/* ── §7 path — lay wedges along the start->end line ── */
 
 /*
  * Walk the straight line from the start wedge to the end wedge in small steps,
- * and at each step note which wedge that point lands in. Re-run whenever the
- * endpoints or the hex size change.
+ * placing the wedge each step lands in. Re-run whenever the endpoints or the
+ * hex size change.
  */
-static void path_compute(Pool *pool, const Cursor *cur, const GridCtx *g)
+static void path_lay(Pool *pool, const Cursor *cur, const GridCtx *g)
 {
     pool_clear(pool);
     if (!cur->has_start || !cur->has_end) return;
@@ -376,18 +384,19 @@ static void path_compute(Pool *pool, const Cursor *cur, const GridCtx *g)
         double t = (double)i / (double)n;
         double px = sx + t * dx, py = sy + t * dy;
         int Q, R; double dd;
-        pixel_to_hex(px, py, g->hex_size, &Q, &R, &dd);
+        screen_to_hex(px, py, g->hex_size, &Q, &R, &dd);
         double cx, cy; hex_centre_pixel(Q, R, g->hex_size, &cx, &cy);
         int s = sector_of(px - cx, py - cy);
         pool_place(pool, Q, R, s, '*');
     }
 }
 
+/* draw one endpoint marker ('S'/'E') in its own colour pair */
 static void marker_draw(const GridCtx *g, int q, int r, int s,
                         char glyph, int pair)
 {
     int sc, sr;
-    ctx_to_screen(g, q, r, s, &sc, &sr);
+    hex_to_screen(g, q, r, s, &sc, &sr);
     if (sc < 0 || sc >= g->cols || sr < 0 || sr >= g->rows - 1) return;
     attron(COLOR_PAIR(pair) | A_BOLD);
     mvaddch(sr, sc, glyph);
@@ -419,7 +428,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, const Pool *p,
                        double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_lattice(g);
     pool_draw(p, g);
     if (cur->has_start)
         marker_draw(g, cur->sQ, cur->sR, cur->sSec, 'S', PAIR_START);
@@ -489,12 +498,12 @@ int main(void)
                 case 's':
                     cur.sQ = cur.q; cur.sR = cur.r; cur.sSec = cur.sector;
                     cur.has_start = 1;
-                    path_compute(&path, &cur, &g);
+                    path_lay(&path, &cur, &g);
                     break;
                 case 'e':
                     cur.eQ = cur.q; cur.eR = cur.r; cur.eSec = cur.sector;
                     cur.has_end = 1;
-                    path_compute(&path, &cur, &g);
+                    path_lay(&path, &cur, &g);
                     break;
                 case 't':
                     cur.theme = (cur.theme + 1) % N_THEMES;
@@ -509,12 +518,12 @@ int main(void)
                 case '+': case '=':
                     if (g.hex_size < HEX_SIZE_MAX) {
                         g.hex_size += HEX_SIZE_STEP;
-                        path_compute(&path, &cur, &g);
+                        path_lay(&path, &cur, &g);
                     } break;
                 case '-':
                     if (g.hex_size > HEX_SIZE_MIN) {
                         g.hex_size -= HEX_SIZE_STEP;
-                        path_compute(&path, &cur, &g);
+                        path_lay(&path, &cur, &g);
                     } break;
             }
         }

@@ -97,7 +97,7 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 gridctx ── */
+/* ── §4 grid mapping & backgrounds ── */
 
 /* The 14 grid styles you can stamp onto. GM_COUNT is the total, used for the
  * a/e cycle and for sizing name arrays — keep it last. */
@@ -196,7 +196,7 @@ static void ctx_init(GridCtx *g, GridMode m, int rows, int cols)
 /* Turn a grid coordinate (row,col) into the screen spot to draw it. This is
  * the one place that knows each style's layout, so objects placed in one grid
  * reappear in the right spot when you switch to another. */
-static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
+static void cell_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
     switch (g->mode) {
     case GM_DIAMOND: *sc=g->ox+(c-r)*DM_IW; *sr=g->oy+(c+r)*DM_IH; break;
@@ -347,7 +347,7 @@ static void bg_draw_dot(const GridCtx *g)
 
 /* Draw whichever grid is active. The five rectangular styles share one drawer;
  * the rest get their own. */
-static void ctx_draw_bg(const GridCtx *g)
+static void draw_grid(const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_GRID));
     switch (g->mode) {
@@ -401,7 +401,7 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     attron(COLOR_PAIR(PAIR_OBJ)|A_BOLD);
     for (int i=0; i<p->count; i++) {
         if (!p->items[i].alive) continue;
-        int sr,sc; ctx_to_screen(g,p->items[i].r,p->items[i].c,&sr,&sc);
+        int sr,sc; cell_to_screen(g,p->items[i].r,p->items[i].c,&sr,&sc);
         if (g->mode!=GM_DIAMOND && g->mode!=GM_ISO && g->mode!=GM_RULED) {
             sr+=(g->ch>1?1:0); sc+=(g->cw>1?1:0);
         }
@@ -436,8 +436,9 @@ static bool pat_test(PatMode pat, int dr, int dc, int N)
     return false;
 }
 
-/* Walk every spot the shape covers and drop an object there. Anything that falls
- * off the grid is quietly ignored. */
+/* PLACEMENT STRATEGY: stamp a pattern of cells relative to the cursor. Scan the
+ * (2N+1)x(2N+1) offset box around (cr,cc); pat_test picks which offsets belong to
+ * the shape; place an object at each. Off-grid cells are quietly skipped. */
 static void pattern_stamp(Pool *p, const GridCtx *g, int cr, int cc,
                            PatMode pat, int N, char glyph)
 {
@@ -458,7 +459,7 @@ static void preview_draw(const GridCtx *g, int cr, int cc, PatMode pat, int N)
         if (!pat_test(pat,dr,dc,N)) continue;
         int r=cr+dr, c=cc+dc;
         if (r<g->min_r||r>g->max_r||c<g->min_c||c>g->max_c) continue;
-        int sr,sc; ctx_to_screen(g,r,c,&sr,&sc);
+        int sr,sc; cell_to_screen(g,r,c,&sr,&sc);
         if (g->mode!=GM_DIAMOND && g->mode!=GM_ISO && g->mode!=GM_RULED)
             { sr+=(g->ch>1?1:0); sc+=(g->cw>1?1:0); }
         if (sr>=0&&sr<g->rows-1&&sc>=0&&sc<g->cols)
@@ -485,7 +486,7 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
 }
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
-    int sr,sc; ctx_to_screen(g,cur->r,cur->c,&sr,&sc);
+    int sr,sc; cell_to_screen(g,cur->r,cur->c,&sr,&sc);
     attron(COLOR_PAIR(PAIR_CURSOR)|A_BOLD);
     if (sr>=0&&sr<g->rows-1&&sc>=0&&sc<g->cols)
         mvaddch(sr,sc,(chtype)'@');
@@ -517,7 +518,7 @@ static void scene_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
                        PatMode pat, int N, double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_grid(g);
     pool_draw(p,g);
     preview_draw(g,cur->r,cur->c,pat,N);
     cursor_draw(cur,g);

@@ -109,7 +109,7 @@ static void color_init(int theme)
  * simple. */
 typedef struct {
     int    rows, cols;        /* terminal size in characters */
-    int    cw, ch;            /* how many sub-pixels wide/tall one character is */
+    int    cell_w, cell_h;    /* how many sub-pixels wide/tall one character is */
     double tri_size;          /* edge length of one triangle, in sub-pixels */
     int    ox, oy;            /* where grid (0,0) lands on screen — roughly centre */
     int    max_col, max_row;  /* how far the cursor may roam from the origin */
@@ -118,7 +118,7 @@ typedef struct {
 static void ctx_init(GridCtx *g, int rows, int cols, double tri_size)
 {
     g->rows = rows; g->cols = cols;
-    g->cw = CELL_W; g->ch = CELL_H;
+    g->cell_w = CELL_W; g->cell_h = CELL_H;
     g->tri_size = tri_size;
     g->ox = cols / 2;
     g->oy = (rows - 1) / 2;
@@ -126,7 +126,7 @@ static void ctx_init(GridCtx *g, int rows, int cols, double tri_size)
     g->max_row = rows / 2;
 }
 
-static void pixel_to_tri(double px, double py, double size,
+static void screen_to_tri(double px, double py, double size,
                          int *col, int *row, int *up,
                          double *fa, double *fb)
 {
@@ -149,13 +149,13 @@ static void tri_centroid_pixel(int col, int row, int up, double size,
     *cx = (a + 0.5 * b) * size;
     *cy = b * h;
 }
-static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
+static void tri_to_screen(const GridCtx *g, int col, int row, int up,
                           int *scol, int *srow)
 {
     double cx, cy;
     tri_centroid_pixel(col, row, up, g->tri_size, &cx, &cy);
-    *scol = g->ox + (int)(cx / g->cw);
-    *srow = g->oy + (int)(cy / g->ch);
+    *scol = g->ox + (int)(cx / g->cell_w);
+    *srow = g->oy + (int)(cy / g->cell_h);
 }
 
 static int palette_index(int col, int row, int up)
@@ -165,15 +165,15 @@ static int palette_index(int col, int row, int up)
     return k;
 }
 
-static void ctx_draw_bg(const GridCtx *g)
+static void draw_lattice(const GridCtx *g)
 {
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
-            double px = (double)(col - g->ox) * g->cw;
-            double py = (double)(row - g->oy) * g->ch;
+            double px = (double)(col - g->ox) * g->cell_w;
+            double py = (double)(row - g->oy) * g->cell_h;
             int    tC, tR, tU;
             double fa, fb;
-            pixel_to_tri(px, py, g->tri_size, &tC, &tR, &tU, &fa, &fb);
+            screen_to_tri(px, py, g->tri_size, &tC, &tR, &tU, &fa, &fb);
             int pair = PAIR_FILL_BASE + palette_index(tC, tR, tU);
             attron(COLOR_PAIR(pair));
             mvaddch(row, col, ' ');
@@ -243,7 +243,7 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dir)
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sc, sr;
-    ctx_to_screen(g, cur->col, cur->row, cur->up, &sc, &sr);
+    tri_to_screen(g, cur->col, cur->row, cur->up, &sc, &sr);
     if (sc < 0 || sc >= g->cols || sr < 0 || sr >= g->rows - 1) return;
     int pair = PAIR_FILL_BASE + palette_index(cur->col, cur->row, cur->up);
     attron(COLOR_PAIR(pair) | A_BOLD | A_REVERSE);
@@ -298,7 +298,7 @@ static void scatter_draw(const Pool *p, const Cursor *cur, const GridCtx *g)
     for (int i = 0; i < p->count; i++) {
         if (!p->items[i].alive) continue;
         int sc, sr;
-        ctx_to_screen(g, p->items[i].col, p->items[i].row, p->items[i].up,
+        tri_to_screen(g, p->items[i].col, p->items[i].row, p->items[i].up,
                       &sc, &sr);
         if (sc < 0 || sc >= g->cols || sr < 0 || sr >= g->rows - 1) continue;
         int dist = triangle_distance(p->items[i].col, p->items[i].row, p->items[i].up,
@@ -335,7 +335,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, const Pool *p,
                        double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_lattice(g);
     scatter_draw(p, cur, g);
     cursor_draw(cur, g);
     hud_draw(g, cur, p, fps);

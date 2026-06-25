@@ -65,24 +65,16 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula — where the ruled lines fall ── */
+/* ── §4 rect mapping & lattice ── */
 
-/*
- * GridCtx — everything we need to place the lines and keep the cursor on screen.
- *
- * The two axes are deliberately lopsided: up/down is stepped, left/right is free.
- * So we keep a line_step (rows between lines) for the stepped axis but nothing
- * similar for the free axis — the cursor can land on any column.
- *
- *   rows, cols  — current terminal size, in characters.
- *   line_step   — screen rows from one ruled line to the next.
- *   max_line    — highest line index the cursor may sit on (0-based).
- *   max_col     — rightmost column the cursor may sit on (cols - 1).
- */
+/* GridCtx — the grid for one frame. Only horizontal rules exist, spaced
+ * line_step rows apart. The two axes are deliberately lopsided: up/down is
+ * stepped by whole lines, left/right is free, so we carry max_line (a line
+ * index) but max_col (a raw screen column the cursor may land on). */
 typedef struct {
-    int rows, cols;
-    int line_step;
-    int max_line, max_col;
+    int rows, cols;        /* terminal size in characters */
+    int line_step;         /* screen rows from one ruled line to the next */
+    int max_line, max_col; /* furthest line / column the cursor can reach */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols)
@@ -93,18 +85,24 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->max_col  = cols - 1;
 }
 
-/* Is this screen row one of the ruled lines? Every line_step-th row is. */
-static char ctx_grid_char(const GridCtx *g, int sr, int sc)
+/* recipe step 1 — line index -> the screen row it rules */
+static int cell_to_screen(const GridCtx *g, int line)
+{
+    return line * g->line_step;
+}
+
+/* which glyph belongs at a screen spot: every line_step-th row is a rule. */
+static char grid_glyph_at(const GridCtx *g, int sr, int sc)
 {
     (void)sc;
     return (sr % g->line_step == 0) ? '-' : ' ';
 }
 
-/* Draw all the ruled lines, painting the one the cursor is on in its own color. */
-static void ctx_draw_bg(const GridCtx *g, int active_line)
+/* recipe step 2 — draw every ruled line, the cursor's own line highlighted */
+static void draw_lattice(const GridCtx *g, int active_line)
 {
     for (int sr = 0; sr < g->rows - 1; sr++) {
-        if (ctx_grid_char(g, sr, 0) != '-') continue;
+        if (grid_glyph_at(g, sr, 0) != '-') continue;
         int line = sr / g->line_step;
         int pair = (line == active_line) ? PAIR_ACTIVE : PAIR_LINE;
         attron(COLOR_PAIR(pair));
@@ -116,12 +114,9 @@ static void ctx_draw_bg(const GridCtx *g, int active_line)
 
 /* ── §5 cursor ── */
 
-/*
- * Cursor — the @ marker, tracked as two separate numbers because its two
- * axes behave differently:
- *   line — which ruled line it's on (a whole-number index, 0 = top line).
- *   col  — its left/right spot, measured straight in screen columns.
- */
+/* Cursor — the @ marker. Its two axes behave differently:
+ *   line — stepped axis: which ruled line, a whole index (0 = top line).
+ *   col  — free axis: a raw screen column it may slide to anywhere. */
 typedef struct {
     int line;
     int col;
@@ -133,19 +128,20 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->col  = g->cols / 2;
 }
 
-/* Move the cursor: up/down hops a whole line, left/right slides by COL_STEP.
- * A move that would leave the screen is simply ignored. */
+/* recipe step 3 — move the cursor, clamped to the screen:
+ * the stepped axis hops one whole line, the free axis slides by COL_STEP. */
 static void cursor_move(Cursor *cur, const GridCtx *g, int dline, int dcol)
 {
-    int nl = cur->line + dline;
-    int nc = cur->col  + dcol * COL_STEP;
-    if (nl >= 0 && nl <= g->max_line) cur->line = nl;
-    if (nc >= 0 && nc <= g->max_col)  cur->col  = nc;
+    int stepped = cur->line + dline;
+    int free    = cur->col  + dcol * COL_STEP;
+    if (stepped >= 0 && stepped <= g->max_line) cur->line = stepped;
+    if (free    >= 0 && free    <= g->max_col)  cur->col  = free;
 }
 
+/* drop '@' on the cursor's ruled line at its free column */
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
-    int sr = cur->line * g->line_step;
+    int sr = cell_to_screen(g, cur->line);
     attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
     mvaddch(sr, cur->col, (chtype)'@');
     attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
@@ -158,7 +154,7 @@ static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
     char buf[80];
     snprintf(buf, sizeof buf,
         " %.1f fps  line=%d  col=%d  screen(%d,%d) ",
-        fps, cur->line, cur->col, cur->line * g->line_step, cur->col);
+        fps, cur->line, cur->col, cell_to_screen(g, cur->line), cur->col);
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
     mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
@@ -173,7 +169,7 @@ static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
 static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
 {
     erase();
-    ctx_draw_bg(g, cur->line);
+    draw_lattice(g, cur->line);
     cursor_draw(cur, g);
     hud_draw(g, cur, fps);
     wnoutrefresh(stdscr); doupdate();

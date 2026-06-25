@@ -2,18 +2,13 @@
 /*
  * 06_brick_stagger.c — a grid laid out like bricks in a wall.
  *
- * Same as a plain rectangular grid, but every other row is nudged right by
- * half a cell so the cells overlap their neighbours like brickwork. Arrow
- * keys move the '@' around so you can see how the stagger shifts the lines.
+ * Same as 01_uniform_rect.c, but odd rows slide right by half a cell so cells
+ * overlap their neighbours like brickwork. Horizontal lines never move; only
+ * the vertical lines shift, and only on odd rows. That one nudge is the whole
+ * difference from a plain grid.
  *
- * Compare with: 01_uniform_rect.c (no stagger) and 07_half_brick_vert.c.
+ * Sister files: 01_uniform_rect.c (no stagger), 07_half_brick_vert.c.
  * Brick bond patterns: en.wikipedia.org/wiki/Brick#Bonds
- * Same offset trick, applied to hex grids: redblobgames.com/grids/hexagons
- *
- * The whole idea: horizontal lines never move — they stretch all the way
- * across at the same rows as always. Only the vertical lines shift, and only
- * on odd rows, where they slide right by half a cell. That single nudge is
- * the entire difference from a plain grid.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -29,31 +24,33 @@
 /* ── §1 config ── */
 
 #define TARGET_FPS  30
-#define CELL_W      10   /* width of a cell, in characters; must be even so half splits cleanly */
-#define CELL_H       4   /* height of a cell, in rows */
-#define HALF_W      (CELL_W / 2)   /* how far odd rows slide right: half a cell */
 
-/* Higher = the fps number jumps more; lower = it glides. Just for the readout. */
-#define FPS_EWMA_ALPHA  0.05
+#define CELL_W  10    /* box size in characters; CELL_W must be even so half splits cleanly */
+#define CELL_H   4
 
-/* Color pair IDs */
-#define PAIR_GRID    1   /* grid lines                   */
-#define PAIR_ACTIVE  2   /* highlighted cell fill        */
-#define PAIR_CURSOR  3   /* bright '@'                   */
-#define PAIR_HUD     4   /* status bar (yellow)          */
-#define PAIR_HINT    5   /* key-hint footer (cyan)       */
+#define HALF_W  (CELL_W / 2)   /* how far odd rows slide right: half a cell */
+
+#define FPS_EWMA_ALPHA  0.05   /* small = steadier on-screen fps number */
+
+#define PAIR_GRID    1   /* grid lines */
+#define PAIR_ACTIVE  2   /* fill of the box you're in */
+#define PAIR_CURSOR  3   /* the '@' */
+#define PAIR_HUD     4
+#define PAIR_HINT    5
 
 /* ── §2 clock ── */
 
 static int64_t clock_ns(void)
 {
-    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
     return (int64_t)t.tv_sec * 1000000000LL + t.tv_nsec;
 }
+
 static void clock_sleep_ns(int64_t ns)
 {
     if (ns <= 0) return;
-    struct timespec r = { .tv_sec = (time_t)(ns / 1000000000LL),
+    struct timespec r = { .tv_sec  = (time_t)(ns / 1000000000LL),
                           .tv_nsec = (long)(ns % 1000000000LL) };
     nanosleep(&r, NULL);
 }
@@ -62,7 +59,8 @@ static void clock_sleep_ns(int64_t ns)
 
 static void color_init(void)
 {
-    start_color(); use_default_colors();
+    start_color();
+    use_default_colors();
     init_pair(PAIR_GRID,   COLORS >= 256 ? 214 : COLOR_RED,    -1);
     init_pair(PAIR_ACTIVE, COLORS >= 256 ? 196 : COLOR_RED,    -1);
     init_pair(PAIR_CURSOR, COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
@@ -70,27 +68,16 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula — turning a cell (row,col) into a spot on screen ── */
+/* ── §4 rect mapping & lattice ── */
 
-/*
- * GridCtx — everything we need to know about the grid's size and layout.
- *
- * Filled in once at startup (and again on resize), then handed read-only to
- * the drawing code. We stash the cell size and stagger here instead of using
- * the #defines directly, so the math below reads off one struct.
- *
- *   rows, cols   — how big the terminal is right now, in characters.
- *   cw, ch       — width and height of one cell, in characters.
- *   half_w       — how far odd rows slide right; always cw / 2.
- *   max_r, max_c — the last row/column whose cell still fits on screen.
- *                  max_c leaves room for the stagger so odd rows don't run
- *                  off the right edge.
- */
+/* GridCtx — the grid for one frame: terminal size, box size, the stagger, and
+ * how far the cursor may roam. max_c leaves a half-cell of slack on the right
+ * so odd rows don't run off the visible edge. */
 typedef struct {
-    int rows, cols;
-    int cw, ch;
-    int half_w;
-    int max_r, max_c;
+    int rows, cols;      /* terminal size in characters */
+    int cw, ch;          /* box width and height in characters */
+    int half_w;          /* odd-row shift; always cw / 2 */
+    int max_r, max_c;    /* furthest cell the cursor can reach */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols)
@@ -99,35 +86,28 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->cw = CELL_W; g->ch = CELL_H;
     g->half_w = HALF_W;
     g->max_r = (rows - 1) / CELL_H - 1;
-    /* Odd rows lean half a cell to the right, so leave that much slack on the
-     * right or the cursor could walk off the visible edge. */
     g->max_c = (cols - HALF_W) / CELL_W - 1;
 }
 
-/*
- * Where does cell (r,c) sit on screen? This one nudge — adding half a cell on
- * odd rows — is the whole brick effect; everything else matches a plain grid.
- */
-static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
+/* recipe step 1 — cell (r,c) -> its top-left corner on screen.
+ * Odd rows add half a cell of horizontal shift — the whole brick effect. */
+static void cell_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
+    int stagger = (r % 2) * g->half_w;
     *sr = r * g->ch;
-    *sc = c * g->cw + (r % 2) * g->half_w;
+    *sc = c * g->cw + stagger;
 }
 
-/*
- * Pick the line character to draw at one screen spot: '+', '-', '|', or blank.
- * Horizontal lines sit at the same rows everywhere. Vertical lines, though,
- * depend on which row band we're in — on odd rows they're slid right by half
- * a cell to match the bricks above and below.
- */
-static char ctx_grid_char(const GridCtx *g, int sr, int sc)
+/* which glyph belongs at a screen spot. Horizontal lines sit at the same rows
+ * everywhere; vertical lines slide right by half a cell on odd row bands. */
+static char grid_glyph_at(const GridCtx *g, int sr, int sc)
 {
     bool h = (sr % g->ch == 0);
 
-    int row_idx = sr / g->ch;             /* which row band this line falls in */
-    bool v = (row_idx % 2 == 0)
-             ? (sc % g->cw == 0)             /* even row: lines line up normally */
-             : (sc % g->cw == g->half_w);    /* odd row: lines shifted half a cell */
+    int row_band = sr / g->ch;
+    bool v = (row_band % 2 == 0)
+             ? (sc % g->cw == 0)            /* even band: lines line up normally */
+             : (sc % g->cw == g->half_w);   /* odd band: lines shifted half a cell */
 
     if (h && v) return '+';
     if (h)      return '-';
@@ -135,21 +115,23 @@ static char ctx_grid_char(const GridCtx *g, int sr, int sc)
     return ' ';
 }
 
-static void ctx_draw_bg(const GridCtx *g)
+/* recipe step 2 — draw the grid by asking grid_glyph_at at every screen spot */
+static void draw_lattice(const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_GRID));
-    for (int sr = 0; sr < g->rows - 1; sr++)
+    for (int sr = 0; sr < g->rows - 1; sr++) {
         for (int sc = 0; sc < g->cols; sc++) {
-            char ch = ctx_grid_char(g, sr, sc);
+            char ch = grid_glyph_at(g, sr, sc);
             if (ch != ' ')
                 mvaddch(sr, sc, (chtype)(unsigned char)ch);
         }
+    }
     attroff(COLOR_PAIR(PAIR_GRID));
 }
 
 /* ── §5 cursor ── */
 
-/* Cursor — which cell the '@' is sitting in, as a (row, col) pair. */
+/* Cursor — which box the user is in, as (r,c) from the top-left box (0,0). */
 typedef struct { int r, c; } Cursor;
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
@@ -158,6 +140,7 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->c = g->max_c / 2;
 }
 
+/* recipe step 3 — move the cursor, clamped so it never steps off the grid */
 static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
 {
     int nr = cur->r + dr, nc = cur->c + dc;
@@ -165,10 +148,11 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
     if (nc >= 0 && nc <= g->max_c) cur->c = nc;
 }
 
+/* highlight the cursor's box: dot the interior, then drop '@' in the middle */
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc;
-    ctx_to_screen(g, cur->r, cur->c, &sr, &sc);
+    cell_to_screen(g, cur->r, cur->c, &sr, &sc);
 
     attron(COLOR_PAIR(PAIR_ACTIVE));
     for (int dr = 1; dr < g->ch; dr++)
@@ -185,7 +169,7 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
 {
-    int sr, sc; ctx_to_screen(g, cur->r, cur->c, &sr, &sc);
+    int sr, sc; cell_to_screen(g, cur->r, cur->c, &sr, &sc);
     char buf[80];
     snprintf(buf, sizeof buf,
         " %.1f fps  cell(%d,%d)  screen_col=%d  stagger=%d ",
@@ -204,7 +188,7 @@ static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
 static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_lattice(g);
     cursor_draw(cur, g);
     hud_draw(g, cur, fps);
     wnoutrefresh(stdscr);
@@ -214,17 +198,23 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
 /* ── §7 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
+
 static void screen_init(void)
 {
     initscr(); cbreak(); noecho();
-    keypad(stdscr, TRUE); nodelay(stdscr, TRUE);
-    curs_set(0); typeahead(-1);
-    color_init(); atexit(screen_cleanup);
+    keypad(stdscr, TRUE);
+    nodelay(stdscr, TRUE);
+    curs_set(0);
+    typeahead(-1);
+    color_init();
+    atexit(screen_cleanup);
 }
 
 /* ── §8 app ── */
 
-static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
+static volatile sig_atomic_t g_running     = 1;
+static volatile sig_atomic_t g_need_resize = 0;
+
 static void on_signal(int s)
 {
     if (s == SIGINT || s == SIGTERM) g_running     = 0;

@@ -1,18 +1,17 @@
 /*
- * 07_trihexagonal.c — a hex grid and a triangle grid drawn on top of each other.
+ * 07_trihexagonal.c — a flat-top hex grid and a triangle grid drawn on top of
+ * each other, so their corners coincide: the trihexagonal (star-of-David) tiling.
  *
- * Lay a flat-top hexagon grid (cyan) and a triangle grid (green) so their
- * corners land on the same spots. Together they make the trihexagonal tiling,
- * the star-of-David / snowflake pattern. Toggle each grid with h/t and steer an
- * '@' cursor through the hexes with the arrow keys.
+ * The hex layer reuses the §4 vocabulary of 01_flat_top.c verbatim. The triangle
+ * layer is the one genuinely different step (see tri_line_distance / draw_triangles):
+ * three families of parallel lines at 60°, spaced to share the hexes' corners.
  *
- * Sister files: hex_grids/01_flat_top.c (the hex drawing), 05_triangular.c
- * (the triangle drawing). Trihexagonal tiling: en.wikipedia.org/wiki/Trihexagonal_tiling
+ * Sister files: 01_flat_top.c (hex math), 05_triangular.c (triangle math).
+ * Trihexagonal tiling: en.wikipedia.org/wiki/Trihexagonal_tiling
  */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
-#include <ncurses.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -20,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <ncurses.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -27,31 +27,23 @@
 
 /* ── §1 config ── */
 
-/* Each terminal cell is split into this many tiny units so the math has room
-   to work; we draw in those units, not whole characters. */
 #define CELL_W              2
 #define CELL_H              4
 
-/* How long a hex side is, in those tiny units. The triangles use the same
-   length so the two grids share corners. */
 #define HEX_SIZE_DEFAULT   14.0
 #define HEX_SIZE_MIN        6.0
 #define HEX_SIZE_MAX       40.0
 #define HEX_SIZE_STEP       2.0
 
-/* How thick the grid lines look, for both grids. */
-#define BORDER_W_DEFAULT    0.10
+#define BORDER_W_DEFAULT    0.10   /* line thickness, shared by both grids */
 #define BORDER_W_MIN        0.03
 #define BORDER_W_MAX        0.35
 #define BORDER_W_STEP       0.02
 
-#define TICK_NS            16666667LL    /* one frame at ~60 frames per second */
+#define TICK_NS            16666667LL
 
-/* How much each new frame nudges the on-screen fps number; small means the
-   readout glides instead of jumping around. */
-#define FPS_EWMA_ALPHA      0.05
+#define FPS_EWMA_ALPHA      0.05   /* small = steadier on-screen fps number */
 
-/* Color slots */
 #define PAIR_HEX     1   /* cyan  — hex grid lines */
 #define PAIR_TRI     2   /* green — triangle grid lines */
 #define PAIR_CURSOR  3   /* the cursor hex and the '@' */
@@ -70,8 +62,7 @@ static int64_t clock_ns(void)
 static void clock_sleep_ns(int64_t ns)
 {
     if (ns <= 0) return;
-    struct timespec ts = { .tv_sec  = (time_t)(ns / 1000000000LL),
-                           .tv_nsec = (long)(ns % 1000000000LL) };
+    struct timespec ts = { ns / 1000000000LL, ns % 1000000000LL };
     nanosleep(&ts, NULL);
 }
 
@@ -88,144 +79,132 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula — the hex grid and the triangle grid ── */
+/* ── §4 hex mapping & lattice ── */
 
-/*
- * GridCtx — everything the drawing code needs: the size and placement of the
- * tiling, and how far the cursor is allowed to wander.
- *
- * The cursor lives in hex coordinates (q, r), the same scheme as 01_flat_top:
- * q steps roughly east, r steps roughly south-east. The two on/off toggles and
- * the line thickness sit here because the background painter reads them to
- * decide what to draw.
- */
+/* GridCtx — the whole tiling for one frame. The (q,r)=(0,0) hex sits at screen
+ * centre; the triangle grid shares the same size so their corners coincide. The
+ * two on/off toggles live here because the lattice painter reads them. */
 typedef struct {
-    /* size of the terminal, in characters */
-    int rows, cols;
-
-    /* hex side length, plus how many tiny units make up one character cell */
-    double hex_size;
-    int    cell_w, cell_h;
-
-    /* the character cell the tiling is centred on */
-    int ox, oy;
-
-    /* how far the cursor may roam, in hex steps each way from centre (generous —
-       it's just a leash, not a tight box) */
-    int max_q, max_r;
-
-    /* look-and-feel knobs */
-    double border_w;       /* line thickness, shared by both grids */
-    bool   show_hex;       /* is the hex grid switched on? */
-    bool   show_tri;       /* is the triangle grid switched on? */
+    int    rows, cols;      /* terminal size in character cells */
+    double hex_size;        /* centre-to-corner distance, pixels; bigger = fewer hexes */
+    double border_w;        /* outline band width, 0..0.5; how near an edge counts as edge */
+    int    cell_w, cell_h;  /* pixels per char cell (2 vs 4) — undoes the cell's tall aspect */
+    int    ox, oy;          /* screen-centre cell; the (0,0) hex lives here */
+    int    max_q, max_r;    /* cursor leash, in hex steps each way from centre */
+    bool   show_hex;        /* is the hex grid switched on? */
+    bool   show_tri;        /* is the triangle grid switched on? */
 } GridCtx;
 
-/* Work out the placement and cursor leash from the terminal size and hex size.
-   Re-run this on startup and after every resize. */
 static void ctx_init(GridCtx *g, int rows, int cols,
                      double hex_size, double border_w,
                      bool show_hex, bool show_tri)
 {
-    g->rows = rows; g->cols = cols;
+    g->rows   = rows;
+    g->cols   = cols;
     g->hex_size = hex_size;
-    g->cell_w = CELL_W; g->cell_h = CELL_H;
-    g->ox = cols / 2;
-    g->oy = (rows - 1) / 2;
     g->border_w = border_w;
+    g->cell_w = CELL_W;
+    g->cell_h = CELL_H;
+    g->ox     = cols / 2;
+    g->oy     = (rows - 1) / 2;
     g->show_hex = show_hex;
     g->show_tri = show_tri;
-
-    /* Let the cursor reach any hex that fits on screen, plus a little slack. */
     g->max_q = (int)((cols * CELL_W) / (1.5 * hex_size)) + 2;
     g->max_r = (int)((rows * CELL_H) / (sqrt(3.0) * hex_size)) + 2;
 }
 
-/* Find the character cell at the centre of hex (q, r). Stepping q moves you
-   east, stepping r moves you south-east; the same hex-to-screen math as
-   01_flat_top. Rounding down lands the '@' inside the hex, not on a wall. */
-static void ctx_to_screen(const GridCtx *g, int q, int r, int *sr, int *sc)
+/* one hex's centre in pixels, measured from the grid centre (flat-top layout) */
+static void hex_center_pixel(double size, int q, int r, double *cx, double *cy)
 {
-    double sq3   = sqrt(3.0);
-    double sq3_2 = sq3 * 0.5;
-    double cx_pix = g->hex_size * 1.5      * (double)q;
-    double cy_pix = g->hex_size * (sq3_2   * (double)q + sq3 * (double)r);
-    *sc = g->ox + (int)(cx_pix / g->cell_w);
-    *sr = g->oy + (int)(cy_pix / g->cell_h);
+    *cx = size * 1.5 * (double)q;
+    *cy = size * (sqrt(3.0) * 0.5 * (double)q + sqrt(3.0) * (double)r);
 }
 
-/* Pick the dash/slash/pipe character that best matches the slope of a line at
-   this angle, so the wall looks like it points the right way. (Same trick as
-   01_flat_top, explained there.) */
-static char angle_char(double theta)
+/* recipe step 1 — hex address (q,r) -> the screen cell at its centre */
+static void axial_to_screen(const GridCtx *g, int q, int r, int *sr, int *sc)
+{
+    double cx, cy;
+    hex_center_pixel(g->hex_size, q, r, &cx, &cy);
+    *sc = g->ox + (int)(cx / g->cell_w);
+    *sr = g->oy + (int)(cy / g->cell_h);
+}
+
+/* the reverse — a pixel offset from grid centre -> fractional hex (q,r,s).
+ * s = -q-r, so the three coordinates always sum to zero. */
+static void screen_to_axial_frac(const GridCtx *g, double px, double py,
+                                 double *fq, double *fr, double *fs)
+{
+    *fq = (2.0 / 3.0 * px) / g->hex_size;
+    *fr = (-1.0 / 3.0 * px + sqrt(3.0) / 3.0 * py) / g->hex_size;
+    *fs = -*fq - *fr;
+}
+
+/* snap fractional (q,r,s) to the nearest real hex. Rounding each on its own can
+ * push their sum off zero, so we re-derive whichever we rounded most. */
+static void cube_round(double fq, double fr, double fs, int *q, int *r)
+{
+    int rq = (int)round(fq), rr = (int)round(fr), rs = (int)round(fs);
+    double dq = fabs((double)rq - fq);
+    double dr = fabs((double)rr - fr);
+    double ds = fabs((double)rs - fs);
+    if      (dq > dr && dq > ds) rq = -rr - rs;
+    else if (dr > ds)            rr = -rq - rs;
+    *q = rq; *r = rr;
+}
+
+/* how near a hex edge a fractional point is: 0 at the centre, 0.5 at an edge */
+static double hex_edge_distance(double fq, double fr, double fs, int q, int r)
+{
+    double dq = fabs(fq - (double)q);
+    double dr = fabs(fr - (double)r);
+    double ds = fabs(fs - (double)(-q - r));
+    double d = dq;
+    if (dr > d) d = dr;
+    if (ds > d) d = ds;
+    return d;
+}
+
+/* the ASCII glyph whose slant lies along an edge at angle theta: '-' flattish,
+ * '|' steep, '/' and '\' between. Folded into [0,pi) since glyphs look the same
+ * flipped 180°. */
+static char edge_glyph(double theta)
 {
     double t = fmod(theta, M_PI);
     if (t < 0.0) t += M_PI;
-    if      (t < M_PI / 8.0)         return '-';
+    if      (t < M_PI / 8.0)        return '-';
     else if (t < 3.0 * M_PI / 8.0)  return '\\';
     else if (t < 5.0 * M_PI / 8.0)  return '|';
     else if (t < 7.0 * M_PI / 8.0)  return '/';
-    else                              return '-';
+    else                            return '-';
 }
 
-/* How close a point is to the nearest triangle grid line: 0 means right on a
-   line, 0.5 means as far from any line as you can get. (Same as 05_triangular.) */
-static double edge_frac(double v)
+/* recipe step 2a — the cyan hex grid, identical to 01_flat_top: for every cell,
+ * find its hex and how near an edge it sits; near an edge -> an outline glyph.
+ * The cursor's hex is drawn in its own colour. Runs first, so the triangle pass
+ * overpaints it at crossings. */
+static void draw_lattice(const GridCtx *g, int cur_q, int cur_r)
 {
-    double t = fmod(v, 1.0);
-    if (t < 0.0) t += 1.0;
-    return t < 0.5 ? t : 1.0 - t;
-}
-
-/*
- * Draw the cyan hexagon walls — the first of the two grids. For each character
- * cell we ask "which hex are you in, and are you near its edge?" and draw a wall
- * piece if so. The hex the cursor sits in is drawn in the cursor color instead.
- * (The hex-finding math is the same as 01_flat_top.)
- *
- * This runs before the triangle grid, so wherever the two grids cross, the
- * triangle lines painted next will cover these cells.
- */
-static void hex_layer(const GridCtx *g, int cur_q, int cur_r)
-{
-    double sq3   = sqrt(3.0);
-    double sq3_3 = sq3 / 3.0;
-    double sq3_2 = sq3 * 0.5;
     double limit = 0.5 - g->border_w;
-    double size  = g->hex_size;
 
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
             double px = (double)(col - g->ox) * g->cell_w;
             double py = (double)(row - g->oy) * g->cell_h;
 
-            double fq = (2.0/3.0 * px) / size;
-            double fr = (-1.0/3.0 * px + sq3_3 * py) / size;
-            double fs = -fq - fr;
+            double fq, fr, fs;
+            screen_to_axial_frac(g, px, py, &fq, &fr, &fs);
+            int q, r;
+            cube_round(fq, fr, fs, &q, &r);
 
-            int rq = (int)round(fq), rr = (int)round(fr), rs = (int)round(fs);
-            double dq = fabs((double)rq - fq);
-            double dr = fabs((double)rr - fr);
-            double ds = fabs((double)rs - fs);
-            if      (dq > dr && dq > ds) rq = -rr - rs;
-            else if (dr > ds)             rr = -rq - rs;
-            int Q = rq, R = rr;
+            if (hex_edge_distance(fq, fr, fs, q, r) < limit) continue;  /* inside the hex */
 
-            double fQ = (double)Q, fR = (double)R, fS = (double)(-Q - R);
-            double dist = fabs(fq - fQ);
-            double d2   = fabs(fr - fR);
-            double d3   = fabs(fs - fS);
-            if (d2 > dist) dist = d2;
-            if (d3 > dist) dist = d3;
-            if (dist < limit) continue;
+            double cx, cy;
+            hex_center_pixel(g->hex_size, q, r, &cx, &cy);
+            char ch = edge_glyph(atan2(py - cy, px - cx) + M_PI / 2.0);
 
-            double cx = size * 1.5 * fQ;
-            double cy = size * (sq3_2 * fQ + sq3 * fR);
-            double theta = atan2(py - cy, px - cx);
-            char ch = angle_char(theta + M_PI / 2.0);
-
-            int on_cur = (Q == cur_q && R == cur_r);
-            int attr   = on_cur ? (COLOR_PAIR(PAIR_CURSOR) | A_BOLD)
-                                : (COLOR_PAIR(PAIR_HEX)    | A_BOLD);
+            int attr = (q == cur_q && r == cur_r)
+                       ? (COLOR_PAIR(PAIR_CURSOR) | A_BOLD)
+                       : (COLOR_PAIR(PAIR_HEX)    | A_BOLD);
             attron(attr);
             mvaddch(row, col, (chtype)(unsigned char)ch);
             attroff(attr);
@@ -233,20 +212,24 @@ static void hex_layer(const GridCtx *g, int cur_q, int cur_r)
     }
 }
 
-/*
- * Draw the green triangle grid — the second of the two grids. The triangle grid
- * is just three sets of parallel lines crossing at 60 degrees: one flat, one
- * tilted one way, one tilted the other. For each cell we measure how close it is
- * to the nearest line in each set, and if it's close enough to any of them we
- * draw a wall sloped to match that set. Using the same size as the hexes makes
- * the corners line up.
- *
- * Painted after the hexes, so at crossings the green triangle lines sit on top.
- */
-static void tri_layer(const GridCtx *g)
+/* how near a triangle-grid line a coordinate is: 0 right on a line, 0.5 furthest
+ * from any line. Each line family is one such coordinate; near any of them = a
+ * wall. */
+static double tri_line_distance(double n)
 {
-    /* spacing between neighbouring triangle lines */
-    double h   = g->hex_size * sqrt(3.0) * 0.5;
+    double t = fmod(n, 1.0);
+    if (t < 0.0) t += 1.0;
+    return t < 0.5 ? t : 1.0 - t;
+}
+
+/* recipe step 2b — the distinct trihexagonal step: the green triangle grid, three
+ * families of parallel lines at 60° (one flat, two tilted). The spacing h = the
+ * hexes' apothem, so the triangle corners land on the hex corners. For each cell
+ * we take the smallest distance to the three families; near enough -> a wall
+ * sloped to match. Painted after the hexes, so it sits on top at crossings. */
+static void draw_triangles(const GridCtx *g)
+{
+    double h   = g->hex_size * sqrt(3.0) * 0.5;   /* line spacing = hex apothem */
     double sq3 = sqrt(3.0);
 
     attron(COLOR_PAIR(PAIR_TRI) | A_BOLD);
@@ -255,55 +238,42 @@ static void tri_layer(const GridCtx *g)
             double px = (double)(col - g->ox) * g->cell_w;
             double py = (double)(row - g->oy) * g->cell_h;
 
-            double n1 = py / h;
-            double n2 = (sq3 * px + py) / h;
-            double n3 = (-sq3 * px + py) / h;
+            double d_flat = tri_line_distance(py / h);
+            double d_up   = tri_line_distance(( sq3 * px + py) / h);
+            double d_down = tri_line_distance((-sq3 * px + py) / h);
 
-            double d1 = edge_frac(n1);
-            double d2 = edge_frac(n2);
-            double d3 = edge_frac(n3);
-
-            double dmin = d1;
+            double dmin = d_flat;
             char   ch   = '-';
-            if (d2 < dmin) { dmin = d2; ch = '/';  }
-            if (d3 < dmin) { dmin = d3; ch = '\\'; }
+            if (d_up   < dmin) { dmin = d_up;   ch = '/';  }
+            if (d_down < dmin) { dmin = d_down; ch = '\\'; }
 
-            if (dmin < g->border_w) {
+            if (dmin < g->border_w)
                 mvaddch(row, col, (chtype)(unsigned char)ch);
-            }
         }
     }
     attroff(COLOR_PAIR(PAIR_TRI) | A_BOLD);
 }
 
-/* Paint the whole background: hexes first, then triangles, each only if it's
-   switched on. Only the hex pass cares about the cursor — the triangles are
-   just decoration you can't walk on. */
-static void ctx_draw_bg(const GridCtx *g, int cur_q, int cur_r)
+/* paint both grids, each only if switched on; hexes first so triangles overpaint */
+static void draw_grid(const GridCtx *g, int cur_q, int cur_r)
 {
-    if (g->show_hex) hex_layer(g, cur_q, cur_r);
-    if (g->show_tri) tri_layer(g);
+    if (g->show_hex) draw_lattice(g, cur_q, cur_r);
+    if (g->show_tri) draw_triangles(g);
 }
 
 /* ── §5 cursor ── */
 
-/*
- * Cursor — which hex the '@' is sitting in, held as a (q, r) hex address.
- * It only travels the hex grid; the triangles are scenery. How far it can go
- * is stored over in GridCtx (max_q, max_r).
- */
+/* Cursor — which hex is selected, named by its (q,r). It only travels the hex
+ * grid; the triangles are scenery. The leash is in GridCtx (max_q, max_r). */
 typedef struct { int q, r; } Cursor;
 
-/*
- * HEX_DIR — what one arrow-key press adds to (q, r), one row per direction:
- * up, down, left, right. Up/down nudge r; left/right nudge q. (Same table as
- * 01_flat_top.)
- */
+/* what each arrow key adds to (q,r) to step onto a neighbouring hex; same four
+ * steps as sister grids 01, 06. */
 static const int HEX_DIR[4][2] = {
-    { 0, -1 },   /* UP    */
-    { 0, +1 },   /* DOWN  */
-    {-1,  0 },   /* LEFT  */
-    {+1,  0 },   /* RIGHT */
+    { 0, -1 },   /* up    */
+    { 0, +1 },   /* down  */
+    {-1,  0 },   /* left  */
+    {+1,  0 },   /* right */
 };
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
@@ -313,7 +283,7 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->r = 0;
 }
 
-/* Move the cursor by one step, but don't let it stray past its leash. */
+/* recipe step 3 — move the cursor by one hex, clamped to the leash. */
 static void cursor_move(Cursor *cur, const GridCtx *g, int dq, int dr)
 {
     int nq = cur->q + dq;
@@ -322,13 +292,11 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dq, int dr)
     if (nr >= -g->max_r && nr <= g->max_r) cur->r = nr;
 }
 
-/* Stamp the '@' at the centre of the cursor's hex. Drawn last so it's always on
-   top; since both grids only draw walls, the hex centre is empty and the '@'
-   shows cleanly no matter which grids are on. */
+/* drop the '@' on the selected hex; called after the grid so it lands on top */
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc;
-    ctx_to_screen(g, cur->q, cur->r, &sr, &sc);
+    axial_to_screen(g, cur->q, cur->r, &sr, &sc);
     if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
         attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
         mvaddch(sr, sc, '@');
@@ -338,7 +306,6 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
 
 /* ── §6 scene ── */
 
-/* The status readout (top-right) and the key hints (bottom). */
 static void hud_draw(const GridCtx *g, const Cursor *cur,
                      int paused, double fps)
 {
@@ -363,7 +330,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur,
                        int paused, double fps)
 {
     erase();
-    ctx_draw_bg(g, cur->q, cur->r);
+    draw_grid(g, cur->q, cur->r);
     cursor_draw(cur, g);
     hud_draw(g, cur, paused, fps);
     wnoutrefresh(stdscr);
@@ -419,6 +386,7 @@ int main(void)
     while (g_running) {
         if (g_need_resize) {
             g_need_resize = 0;
+            /* endwin/refresh is how ncurses picks up the new terminal size */
             endwin(); refresh();
             ctx_init(&g, LINES, COLS, hex_size, border_w,
                      show_hex, show_tri);
@@ -467,10 +435,8 @@ int main(void)
         }
 
         int64_t now = clock_ns(), dt = now - prev; prev = now;
-        if (dt > 0) {
-            fps = fps * (1.0 - FPS_EWMA_ALPHA)
-                + (1e9 / (double)dt) * FPS_EWMA_ALPHA;
-        }
+        if (dt > 0)
+            fps = fps * (1.0 - FPS_EWMA_ALPHA) + (1e9 / (double)dt) * FPS_EWMA_ALPHA;
 
         scene_draw(&g, &cur, paused, fps);
         clock_sleep_ns(TICK_NS - (clock_ns() - now));

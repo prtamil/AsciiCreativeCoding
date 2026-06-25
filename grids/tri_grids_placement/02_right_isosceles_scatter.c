@@ -94,7 +94,7 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 gridctx — the triangle grid ── */
+/* ── §4 tri mapping & lattice ── */
 
 /* Everything the grid needs to know to draw itself and to turn a triangle's
  * grid address into a spot on the screen. One of these lives for the whole
@@ -133,11 +133,11 @@ static void ctx_resize(GridCtx *g, int rows, int cols)
     g->ox = cols / 2; g->oy = (rows - 1) / 2;
 }
 
-/* Given a point, find which triangle it falls in. We scale into grid units,
- * the whole part names the square, the leftover fraction (fa, fb) says where
- * inside it — and whichever side of the diagonal that lands on tells us upper
- * or lower triangle. */
-static void pixel_to_tri(double px, double py, double size,
+/* recipe step 1 (reverse) — a pixel -> which triangle (col,row,up) + where
+ * inside (fa,fb). Right-isosceles: scale by size, the integer part names the
+ * square, the fraction (fa,fb) locates the point; fa >= fb is the upper-right
+ * (△) half, else the lower-left (▽) half. */
+static void screen_to_tri(double px, double py, double size,
                          int *col, int *row, int *up,
                          double *fa, double *fb)
 {
@@ -157,7 +157,7 @@ static void tri_centroid_pixel(int col, int row, int up, double size,
     *cx_pix = a * size; *cy_pix = b * size;
 }
 
-static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
+static void tri_to_screen(const GridCtx *g, int col, int row, int up,
                           int *scol, int *srow)
 {
     double cx, cy;
@@ -166,11 +166,10 @@ static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
     *srow = g->oy + (int)(cy / g->cell_h);
 }
 
-/* Picks the line character to draw a point as, by seeing which of the
- * triangle's three edges it sits closest to ('|', '_' or '\\'), and reports
- * that nearest-edge distance so the caller can skip points sitting in open
- * space. */
-static char tri_edge_char(int up, double fa, double fb, double *out_min)
+/* the line char for a point by nearest of the triangle's 3 sides ('|','_','\\').
+ * out_min returns the distance to that side, so the caller skips open-space
+ * cells (only draws when it's below border_w). */
+static char edge_glyph(int up, double fa, double fb, double *out_min)
 {
     double l1, l2, l3; char ch1, ch2, ch3;
     if (up == 1) { l1 = 1.0-fa; ch1='|'; l2 = fa-fb; ch2='\\'; l3 = fb;     ch3='_'; }
@@ -182,7 +181,9 @@ static char tri_edge_char(int up, double fa, double fb, double *out_min)
     return ch;
 }
 
-static void ctx_draw_bg(const GridCtx *g)
+/* recipe step 2 — draw the grid: every cell -> its triangle -> a line char only
+ * on the edge cells (interiors stay blank). Nothing stored; redrawn each frame. */
+static void draw_lattice(const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_BORDER));
     for (int row = 0; row < g->rows - 1; row++) {
@@ -190,8 +191,8 @@ static void ctx_draw_bg(const GridCtx *g)
             double px = (double)(col - g->ox) * g->cell_w;
             double py = (double)(row - g->oy) * g->cell_h;
             int tC, tR, tU; double fa, fb, m;
-            pixel_to_tri(px, py, g->tri_size, &tC, &tR, &tU, &fa, &fb);
-            char ch = tri_edge_char(tU, fa, fb, &m);
+            screen_to_tri(px, py, g->tri_size, &tC, &tR, &tU, &fa, &fb);
+            char ch = edge_glyph(tU, fa, fb, &m);
             if (m >= g->border_w) continue;
             mvaddch(row, col, (chtype)(unsigned char)ch);
         }
@@ -271,7 +272,7 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dcol, int drow, int d
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sc, sr;
-    ctx_to_screen(g, cur->col, cur->row, cur->up, &sc, &sr);
+    tri_to_screen(g, cur->col, cur->row, cur->up, &sc, &sr);
     if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
         attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
         mvaddch(sr, sc, '@');
@@ -281,6 +282,9 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
 
 /* ── §7 scatter ── */
 
+/* the placement step — sprinkle `density` triangles onto RANDOM addresses in a
+ * square window of radius scatter_radius around the cursor. Reseed the RNG with
+ * the clock so each call lays down a fresh, unrepeatable cloud. */
 static void scatter_seed(Pool *sp, const GridCtx *g, const Cursor *cur)
 {
     sp->count = 0;
@@ -302,7 +306,7 @@ static void scatter_draw(const Pool *sp, const GridCtx *g, const Cursor *cur)
     int max_d = g->scatter_radius * 2;
     for (int i = 0; i < sp->count; i++) {
         int sc, sr;
-        ctx_to_screen(g, sp->items[i].col, sp->items[i].row, sp->items[i].up,
+        tri_to_screen(g, sp->items[i].col, sp->items[i].row, sp->items[i].up,
                       &sc, &sr);
         if (sc < 0 || sc >= g->cols || sr < 0 || sr >= g->rows - 1) continue;
         int dist = triangle_distance(sp->items[i].col, sp->items[i].row, sp->items[i].up,
@@ -339,7 +343,7 @@ static void scene_draw(const GridCtx *g, const Pool *sp, const Cursor *cur,
                        double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_lattice(g);
     scatter_draw(sp, g, cur);
     cursor_draw(cur, g);
     hud_draw(g, sp, cur, fps);

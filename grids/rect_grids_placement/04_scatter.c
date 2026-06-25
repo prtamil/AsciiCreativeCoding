@@ -114,7 +114,7 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 gridctx ── */
+/* ── §4 grid mapping & backgrounds ── */
 
 /* Which of the 14 background grid styles is on screen. GM_COUNT is the total,
  * handy for wrapping when you cycle styles. */
@@ -214,7 +214,7 @@ static void ctx_init(GridCtx *g, GridMode m, int rows, int cols)
 
 /* Turn a grid cell (r,c) into a screen spot (sr,sc). Each style lays its cells
  * out differently, so this is the one place that knows the geometry. */
-static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
+static void cell_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
     switch (g->mode) {
     case GM_DIAMOND: *sc=g->ox+(c-r)*DM_IW; *sr=g->oy+(c+r)*DM_IH; break;
@@ -360,7 +360,7 @@ static void bg_draw_dot(const GridCtx *g)
 
 /* Draw the background for whichever style is active. The five plain box
  * styles all look the same, so they share one drawer. */
-static void ctx_draw_bg(const GridCtx *g)
+static void draw_grid(const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_GRID));
     switch (g->mode) {
@@ -410,7 +410,7 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     attron(COLOR_PAIR(PAIR_OBJ)|A_BOLD);
     for (int i=0; i<p->count; i++) {
         if (!p->items[i].alive) continue;
-        int sr,sc; ctx_to_screen(g,p->items[i].r,p->items[i].c,&sr,&sc);
+        int sr,sc; cell_to_screen(g,p->items[i].r,p->items[i].c,&sr,&sc);
         /* nudge into the cell's interior so the object doesn't sit on a line;
          * the rotated and ruled grids have no interior, so skip them */
         if (g->mode!=GM_DIAMOND&&g->mode!=GM_ISO&&g->mode!=GM_RULED)
@@ -421,7 +421,12 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_OBJ)|A_BOLD);
 }
 
-/* ── §6 scatter ── */
+/* ── §6 scatter (this file's distinct step) ── */
+
+/* Placement = pick random cells inside the grid bounds and drop objects on
+ * them. Four strategies differ only in how they choose / accept a pick:
+ * scatter_random (no rule), scatter_mindist (spacing + tries rule),
+ * scatter_flood (BFS rings), scatter_gradient (per-cell dice). */
 
 /* King-move distance between two cells: the bigger of the row gap and column
  * gap. Cheap, and it treats a "circle" as a square — fitting for a grid. */
@@ -543,7 +548,7 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
 }
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
-    int sr,sc; ctx_to_screen(g,cur->r,cur->c,&sr,&sc);
+    int sr,sc; cell_to_screen(g,cur->r,cur->c,&sr,&sc);
     if (g->mode!=GM_DIAMOND&&g->mode!=GM_ISO&&g->mode!=GM_RULED)
         { sr+=(g->ch>1?1:0); sc+=(g->cw>1?1:0); }
     attron(COLOR_PAIR(PAIR_CURSOR)|A_BOLD);
@@ -576,7 +581,7 @@ static void scene_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
                        double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_grid(g);
     pool_draw(p,g);
     cursor_draw(cur,g);
     hud_draw(g, p, fps);

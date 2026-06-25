@@ -101,7 +101,7 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,  -1);
 }
 
-/* ── §4 formula — turn a (ring, sector) address into a screen spot, and back ── */
+/* ── §4 polar mapping & lattice ── */
 
 /*
  * GridCtx — everything we need to know to draw the grid and place the cursor:
@@ -146,11 +146,12 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->max_spoke = g->n_spokes - 1;
 }
 
-/* Find the screen spot at the middle of cell (ring, sector).  We aim for the
- * point that splits the cell into two equal-area halves, then convert that
- * pixel position into a row and column. */
-static void ctx_to_screen(const GridCtx *g, int ring, int spoke,
-                          int *sr, int *sc)
+/* recipe step 1 — a (ring, sector) cell -> the screen cell at its middle. The
+ * equal-area radius is √(ring+0.5)·r_unit (NOT (ring+0.5)·spacing): squaring
+ * the radius makes the bands evenly spaced, so √k packs the rings tighter as
+ * they go out and every band ends up the same area. */
+static void polar_to_screen(const GridCtx *g, int ring, int spoke,
+                            int *sr, int *sc)
 {
     double mid_radius = sqrt((double)ring + 0.5) * g->r_unit;
     double theta_mid  = ((double)spoke + 0.5) * (2.0 * M_PI / (double)g->n_spokes);
@@ -160,9 +161,19 @@ static void ctx_to_screen(const GridCtx *g, int ring, int spoke,
     *sr = g->oy + (int)round(cy / (double)g->cell_h);
 }
 
-/* Pick the line character that best points along a given angle:
- * -, \, |, or /.  Direction up vs down doesn't matter, only the slant. */
-static char angle_char(double theta)
+/* the reverse — a screen cell -> its distance and angle from the grid centre */
+static void screen_to_polar(const GridCtx *g, int col, int row,
+                            double *r_px, double *theta)
+{
+    double dx = (double)(col - g->ox) * g->cell_w;
+    double dy = (double)(row - g->oy) * g->cell_h;
+    *r_px  = sqrt(dx * dx + dy * dy);
+    *theta = atan2(dy, dx);
+}
+
+/* the line char matching a direction: '-' horizontal, '|' vertical, '/' '\' the
+ * diagonals. A line and its 180° flip look the same, so we fold into a half-turn. */
+static char line_glyph(double theta)
 {
     double a = fmod(theta + 2.0*M_PI, M_PI);
     if (a < M_PI/8.0 || a >= 7.0*M_PI/8.0) return '-';
@@ -171,9 +182,10 @@ static char angle_char(double theta)
     return '/';
 }
 
-/* Walk every cell on screen and decide if it lands on a ring, a sector line,
- * both, or nothing — then draw the matching character. */
-static void ctx_draw_bg(const GridCtx *g)
+/* recipe step 2 — draw the grid: each cell knows it's on *some* equal-area ring
+ * from its distance and on *some* sector from its angle, with no loop over
+ * rings/sectors. Ring + sector crossing -> '+', one of them -> a line char. */
+static void draw_lattice(const GridCtx *g)
 {
     double sector_angle = 2.0 * M_PI / (double)g->n_spokes;
     double r_unit_sq    = g->r_unit * g->r_unit;
@@ -181,16 +193,12 @@ static void ctx_draw_bg(const GridCtx *g)
     attron(COLOR_PAIR(PAIR_GRID));
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
-            double dx = (double)(col - g->ox) * g->cell_w;
-            double dy = (double)(row - g->oy) * g->cell_h;
-            double r_px = sqrt(dx*dx + dy*dy);
+            double r_px, theta;
+            screen_to_polar(g, col, row, &r_px, &theta);
             if (r_px < R_MIN) continue;
 
-            double theta = atan2(dy, dx);
-
-            /* Which ring are we near?  Squaring the distance turns the
-             * √k spacing into evenly-spaced numbers, so a cell sits on a
-             * ring when that number lands close to a whole number. */
+            /* Squaring the distance turns the √k ring spacing into evenly-spaced
+             * numbers, so a cell sits on a ring when k_float lands near a whole. */
             double k_float = (r_px * r_px) / r_unit_sq;
             double frac    = k_float - floor(k_float);
             bool on_ring = (frac < RING_W_F || frac > 1.0 - RING_W_F);
@@ -203,7 +211,7 @@ static void ctx_draw_bg(const GridCtx *g)
 
             if (!on_ring && !on_sector) continue;
 
-            char c = (on_ring && on_sector) ? '+' : angle_char(theta);
+            char c = (on_ring && on_sector) ? '+' : line_glyph(theta);
             mvaddch(row, col, (chtype)(unsigned char)c);
         }
     }
@@ -224,6 +232,7 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->spoke = 0;
 }
 
+/* recipe step 3 — move the cursor: in/out clamps at the edge, round wraps */
 static void cursor_move(Cursor *cur, const GridCtx *g, int d_ring, int d_spoke)
 {
     int nr = cur->ring + d_ring;
@@ -240,7 +249,7 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int d_ring, int d_spoke)
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc;
-    ctx_to_screen(g, cur->ring, cur->spoke, &sr, &sc);
+    polar_to_screen(g, cur->ring, cur->spoke, &sr, &sc);
     if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
         attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
         mvaddch(sr, sc, (chtype)'@');
@@ -272,7 +281,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, int theme,
                        bool paused, double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_lattice(g);
     cursor_draw(cur, g);
     hud_draw(g, cur, theme, paused, fps);
     wnoutrefresh(stdscr); doupdate();

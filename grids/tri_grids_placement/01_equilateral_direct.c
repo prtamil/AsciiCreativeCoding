@@ -101,40 +101,21 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 gridctx — the math that turns a triangle's address into a screen spot ── */
+/* ── §4 tri mapping & lattice ── */
 
-/*
- * GridCtx — everything we need to know to draw the grid and to figure out
- * where any triangle lands on screen. It's one bundle holding the window
- * size, how big the triangles are right now, where the grid's centre sits,
- * and the few knobs the user can twiddle (size, theme, current glyph).
- *
- * Why keep the size/border/theme in here instead of as plain globals: it
- * means the placement math takes a GridCtx and works the same way for the
- * sibling rect / hex / polar files (see ../README.md). One bundle, one rule.
- */
+/* GridCtx — the triangle grid for one frame, plus the user's live knobs.
+ * Positions are measured in sub-pixels first, then divided down to character
+ * cells, so triangle size can change smoothly. Centred on (ox,oy) so markers
+ * stay on their triangle across a resize. */
 typedef struct {
-    /* how big the terminal is, in character cells */
-    int    rows, cols;
-
-    /* triangle size and how many sub-pixels fit in one character cell.
-     * We measure positions in tiny sub-pixels first, then divide down to
-     * character cells, so triangles can be sized more smoothly than the
-     * chunky terminal grid would otherwise allow. */
+    int    rows, cols;      /* terminal size in character cells */
     double tri_size;        /* triangle side length, in sub-pixels */
     int    cell_w, cell_h;  /* sub-pixels per character column / row */
-
-    /* where the grid's (0,0) corner sits on screen — we re-centre this on
-     * the middle of the window every frame, which is what lets markers stay
-     * put on their triangle when the window resizes */
-    int    ox, oy;
-
-    /* user-twiddled knobs */
-    double border_w;        /* how thick the drawn triangle edges look (0..1ish);
-                             * a cell is part of an edge if it's within this of one */
-    int    theme;           /* which colour scheme, 0..N_THEMES-1 */
-    int    paused;          /* 1 while paused (the 'p' key) */
-    int    glyph_idx;       /* which marker character SPACE will drop next */
+    int    ox, oy;          /* grid (0,0) on screen; re-centred each frame */
+    double border_w;        /* a cell is on an edge if it's within this of one */
+    int    theme;           /* colour scheme, 0..N_THEMES-1 */
+    int    paused;          /* 1 while paused ('p') */
+    int    glyph_idx;       /* which marker char SPACE drops next */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols)
@@ -162,18 +143,10 @@ static void ctx_resize(GridCtx *g, int rows, int cols)
     g->oy   = (rows - 1) / 2;
 }
 
-/*
- * Given a point on screen, work out which triangle it falls in. We undo the
- * slanted grid to get whole-number col/row (which diamond-shaped cell), plus
- * the leftover fractions fa/fb saying how far into that cell we are. Each
- * diamond is two triangles; if the fractions add past 1 we're in the upper
- * (△) half, otherwise the lower (▽) half. The math is the inverse of the
- * forward formula below; the formulas are kept alongside for reference.
- *
- *   h = size · √3 / 2;  b = py/h;  a = px/size − 0.5·b
- *   col = ⌊a⌋, row = ⌊b⌋;  fa = a−col, fb = b−row;  up = (fa+fb ≥ 1)
- */
-static void pixel_to_tri(double px, double py, double size,
+/* recipe step 1 (reverse) — a pixel -> which triangle (col,row,up) + where
+ * inside (fa,fb). Undo the slant: a = px/size - b/2; fa+fb >= 1 means the up
+ * (△) half, else the down (▽) half. */
+static void screen_to_tri(double px, double py, double size,
                          int *col, int *row, int *up,
                          double *fa, double *fb)
 {
@@ -188,14 +161,8 @@ static void pixel_to_tri(double px, double py, double size,
     *up  = (*fa + *fb >= 1.0) ? 1 : 0;
 }
 
-/*
- * Find the pixel at the dead centre of a given triangle. A triangle's centre
- * sits one-third of the way in from its corners, so we nudge the address by
- * 1/3 (▽) or 2/3 (△) and run it through the slanted-grid formula. This is the
- * spot where we'll draw the cursor or a marker so it lands cleanly inside.
- *   ▽ centre at (col+1/3, row+1/3);  △ centre at (col+2/3, row+2/3)
- *   px = (a + 0.5·b)·size,  py = b·h
- */
+/* the pixel at a triangle's centre (1/3 in from the corners: ▽ at +1/3, △ at
+ * +2/3). This is where the cursor/marker is drawn so it lands cleanly inside. */
 static void tri_centroid_pixel(int col, int row, int up, double size,
                                double *cx_pix, double *cy_pix)
 {
@@ -206,12 +173,9 @@ static void tri_centroid_pixel(int col, int row, int up, double size,
     *cy_pix = b * h;
 }
 
-/*
- * Turn a triangle's address into the exact character cell to draw on. We
- * chop the fraction off (truncate, not round) on purpose — rounding can
- * nudge the mark onto a triangle edge, and we want it sitting inside.
- */
-static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
+/* a triangle's address -> the character cell to draw on. Truncates (not rounds)
+ * so the mark sits inside the triangle, never on an edge. */
+static void tri_to_screen(const GridCtx *g, int col, int row, int up,
                           int *scol, int *srow)
 {
     double cx_pix, cy_pix;
@@ -220,15 +184,10 @@ static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
     *srow = g->oy + (int)(cy_pix / g->cell_h);
 }
 
-/*
- * Decide which slash to draw for a cell near a triangle edge, and report how
- * close to an edge it is. We measure how near the point is to each of the
- * three sides (three numbers, one per side; small means close). Whichever
- * side is nearest picks the character: '/' '\' or '_' to trace that edge.
- * The caller only draws when the smallest number is below border_w — i.e.
- * the cell is actually sitting on an edge rather than out in open space.
- */
-static char tri_edge_char(int up, double fa, double fb, double *out_min)
+/* the line char for a point by nearest of the triangle's 3 sides: '/', '\', '_'.
+ * out_min returns the distance to that side, so the caller skips open-space
+ * cells (only draws when it's below border_w). */
+static char edge_glyph(int up, double fa, double fb, double *out_min)
 {
     double l1, l2, l3;
     char   ch1, ch2, ch3;
@@ -249,13 +208,9 @@ static char tri_edge_char(int up, double fa, double fb, double *out_min)
     return ch;
 }
 
-/*
- * Paint the whole triangle grid. We walk every character cell, ask which
- * triangle and edge it belongs to, and drop a slash only on the edge cells.
- * Nothing is stored between frames — the grid is just redrawn from scratch,
- * which is why it can follow any window size for free.
- */
-static void ctx_draw_bg(const GridCtx *g)
+/* recipe step 2 — draw the grid: every cell -> its triangle -> a slash only on
+ * the edge cells (interiors stay blank). Nothing stored; redrawn each frame. */
+static void draw_lattice(const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_BORDER));
     for (int row = 0; row < g->rows - 1; row++) {
@@ -264,8 +219,8 @@ static void ctx_draw_bg(const GridCtx *g)
             double py = (double)(row - g->oy) * g->cell_h;
             int    tC, tR, tU;
             double fa, fb, m;
-            pixel_to_tri(px, py, g->tri_size, &tC, &tR, &tU, &fa, &fb);
-            char ch = tri_edge_char(tU, fa, fb, &m);
+            screen_to_tri(px, py, g->tri_size, &tC, &tR, &tU, &fa, &fb);
+            char ch = edge_glyph(tU, fa, fb, &m);
             if (m >= g->border_w) continue;
             mvaddch(row, col, (chtype)(unsigned char)ch);
         }
@@ -327,7 +282,7 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     for (int i = 0; i < p->count; i++) {
         if (!p->items[i].alive) continue;
         int sc, sr;
-        ctx_to_screen(g, p->items[i].col, p->items[i].row, p->items[i].up,
+        tri_to_screen(g, p->items[i].col, p->items[i].row, p->items[i].up,
                       &sc, &sr);
         if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1)
             mvaddch(sr, sc, (chtype)(unsigned char)p->items[i].glyph);
@@ -379,7 +334,7 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dcol, int drow, int d
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sc, sr;
-    ctx_to_screen(g, cur->col, cur->row, cur->up, &sc, &sr);
+    tri_to_screen(g, cur->col, cur->row, cur->up, &sc, &sr);
     if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
         attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
         mvaddch(sr, sc, '@');
@@ -413,7 +368,7 @@ static void scene_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
                        double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_lattice(g);
     pool_draw(p, g);
     cursor_draw(cur, g);
     hud_draw(g, p, cur, fps);

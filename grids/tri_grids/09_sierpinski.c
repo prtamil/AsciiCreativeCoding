@@ -1,15 +1,16 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 09_sierpinski.c — the Sierpinski triangle, drawn by repeated splitting.
+ * 09_sierpinski.c — the Sierpinski triangle (gasket), by recursive subdivision.
  *
- * Take one big triangle, split it into three smaller corner triangles,
- * then split each of those the same way, and so on. The little middle
- * triangle at each step is thrown away, which leaves the famous hole-filled
- * "gasket" shape. +/- changes how many times we split (depth 0..9).
+ * THE RECIPE: seed one big triangle (§5 scene_seed), then split_into_corners
+ * connects the edge midpoints and keeps the THREE corner triangles while
+ * dropping the inverted middle; subdivide recurses that rule to `depth`. The
+ * missing middle, repeated at every scale, is the gasket's holes. +/- changes
+ * the depth (0..9).
  *
- * Sister files: 08_triforce.c keeps all four children at each split (a
- *   denser figure); 07_barycentric.c splits each triangle six ways. See
- *   ../README.md for the shared GridCtx idea.
+ * Sister: 01_equilateral.c (shared GridCtx centring); 08_triforce.c keeps all
+ *   four children at each split; 07_barycentric.c splits each triangle six ways.
+ * Ref: Sierpinski triangle  https://en.wikipedia.org/wiki/Sierpi%C5%84ski_triangle
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -101,17 +102,15 @@ static void color_init(int theme)
     init_pair(PAIR_HINT, COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula — triangle geometry + line drawing ── */
+/* ── §4 mapping — terminal geometry + line drawing ── */
 
-/*
- * GridCtx — everything we need to know to place and size the drawing on the
- * current terminal. Rebuilt every frame so a window resize is handled for free.
- * (07_barycentric.c has the original version of this struct.)
- */
+/* GridCtx — where the drawing sits on this frame's terminal. (ox,oy) is the
+ * screen centre in sub-pixels; rebuilt every frame so resize is handled free.
+ * Sister: 01_equilateral.c GridCtx (same centring trick, different fields). */
 typedef struct {
     int    rows, cols;   /* terminal size, in character cells               */
-    int    cw, ch;       /* sub-cell resolution: steps per cell, wide x tall */
-    int    ox, oy;       /* where the triangle is centred, in sub-cell units */
+    int    cw, ch;       /* sub-pixels per cell, wide x tall (CELL_W,CELL_H) */
+    int    ox, oy;       /* screen centre, in sub-pixel units               */
     int    depth;        /* how many times to split (0..9)                  */
     double size_frac;    /* how much of the screen the triangle fills (0..1) */
 } GridCtx;
@@ -157,9 +156,9 @@ static void line_draw(const GridCtx *g, double px0, double py0,
     attroff(attr);
 }
 
-/* ── §5 mesh — split each triangle into three corners ── */
+/* ── §5 fractal — split into 3 corners, drop the middle, recurse ── */
 
-/* One triangle: its three corners, as x/y positions in sub-cell units. */
+/* One triangle: its three corners, as x/y positions in sub-pixel units. */
 typedef struct { double x[3], y[3]; } Tri;
 
 static void tri_draw_edges(const GridCtx *g, Tri t, int depth)
@@ -171,14 +170,10 @@ static void tri_draw_edges(const GridCtx *g, Tri t, int depth)
     line_draw(g, t.x[2], t.y[2], t.x[0], t.y[0], attr);
 }
 
-/*
- * Split a triangle into its three corner triangles and recurse into each.
- * We never recurse into the middle one, so it stays empty — that missing
- * middle, repeated at every scale, is what makes the Sierpinski holes.
- */
-static void subdivide(const GridCtx *g, Tri t, int depth, int max_depth)
+/* The Sierpinski rule: connect the edge midpoints, keep the three corner
+ * triangles, discard the inverted middle one. Returns the 3 survivors. */
+static void split_into_corners(Tri t, Tri corner[3])
 {
-    if (depth == max_depth) { tri_draw_edges(g, t, depth); return; }
     double m01x = (t.x[0] + t.x[1]) * 0.5, m01y = (t.y[0] + t.y[1]) * 0.5;
     double m12x = (t.x[1] + t.x[2]) * 0.5, m12y = (t.y[1] + t.y[2]) * 0.5;
     double m20x = (t.x[2] + t.x[0]) * 0.5, m20y = (t.y[2] + t.y[0]) * 0.5;
@@ -186,10 +181,18 @@ static void subdivide(const GridCtx *g, Tri t, int depth, int max_depth)
     Tri c0 = { {t.x[0], m01x, m20x}, {t.y[0], m01y, m20y} };
     Tri c1 = { {m01x, t.x[1], m12x}, {m01y, t.y[1], m12y} };
     Tri c2 = { {m20x, m12x, t.x[2]}, {m20y, m12y, t.y[2]} };
+    corner[0] = c0; corner[1] = c1; corner[2] = c2;
+}
 
-    subdivide(g, c0, depth + 1, max_depth);
-    subdivide(g, c1, depth + 1, max_depth);
-    subdivide(g, c2, depth + 1, max_depth);
+/* Apply the rule down to max_depth. The dropped middle, repeated at every
+ * scale, is the hole pattern that makes the gasket. */
+static void subdivide(const GridCtx *g, Tri t, int depth, int max_depth)
+{
+    if (depth == max_depth) { tri_draw_edges(g, t, depth); return; }
+    Tri corner[3];
+    split_into_corners(t, corner);
+    for (int i = 0; i < 3; i++)
+        subdivide(g, corner[i], depth + 1, max_depth);
 }
 
 static Tri scene_seed(const GridCtx *g)

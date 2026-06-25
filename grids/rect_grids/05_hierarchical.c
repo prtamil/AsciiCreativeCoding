@@ -2,18 +2,12 @@
 /*
  * 05_hierarchical.c — a two-level grid, like graph paper.
  *
- * Bright thick lines mark off the big squares; faint thin lines fill in the
- * small ones between them. You steer a cursor one small cell at a time, and
- * the status bar tells you both which small cell you're in and which big
- * square it sits inside.
+ * Faint thin lines mark the small (minor) cells; bright bold lines mark the
+ * big (major) squares that group MAJOR_FACTOR minor cells on a side. Each
+ * screen spot is classified coarsest-first — major lines win over minor — so
+ * the bold style isn't stolen by the minor line that shares the same spot.
  *
- * Sister files: 01_uniform_rect.c (just one grid level), 04_coarse_sparse.c.
- *
- * The trick worth knowing: every big-square line also lands exactly on a
- * small-cell line, because the big step is a whole number of small steps.
- * So when we decide how to paint a spot, we ask "is this a big line?" first
- * and only fall back to "small line?" — otherwise the big lines would never
- * get their bold style.
+ * Sister files: 01_uniform_rect.c (one grid level), 04_coarse_sparse.c.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -30,29 +24,21 @@
 
 #define TARGET_FPS    30
 
-/* The small cell: the smallest square, and how far the cursor moves per key. */
-#define MINOR_W       4    /* cols per minor cell */
-#define MINOR_H       2    /* rows per minor cell */
+#define MINOR_W       4    /* minor cell size in characters; also one cursor step */
+#define MINOR_H       2
 
-/*
- * How many small cells fit across one big square. The big step is just this
- * many small steps, so a big line always sits on a small line too. Bump it
- * up for bigger squares (3 -> 3x3, 5 -> 5x5, ...).
- */
-#define MAJOR_FACTOR  4
-#define MAJOR_W       (MINOR_W * MAJOR_FACTOR)
-#define MAJOR_H       (MINOR_H * MAJOR_FACTOR)
+#define MAJOR_FACTOR  4              /* minor cells per major square (3->3x3, 5->5x5...) */
+#define MAJOR_W       (MINOR_W * MAJOR_FACTOR)   /* major step is a whole number of */
+#define MAJOR_H       (MINOR_H * MAJOR_FACTOR)   /* minor steps, so it lands on minor lines */
 
-/* Smooths the on-screen fps number so it doesn't jitter every frame. */
-#define FPS_EWMA_ALPHA  0.05
+#define FPS_EWMA_ALPHA  0.05   /* small = steadier on-screen fps number */
 
-/* Color pair IDs */
-#define PAIR_MINOR   1   /* faint thin lines (small grid)  */
+#define PAIR_MINOR   1   /* faint thin lines (small grid) */
 #define PAIR_MAJOR   2   /* bright thick lines (big grid)  */
 #define PAIR_ACTIVE  3   /* cell the cursor sits in        */
 #define PAIR_CURSOR  4   /* the '@' marker                 */
-#define PAIR_HUD     5   /* status bar (yellow)            */
-#define PAIR_HINT    6   /* key-hint footer (cyan)         */
+#define PAIR_HUD     5
+#define PAIR_HINT    6
 
 /* ── §2 clock ── */
 
@@ -82,66 +68,44 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula — turning a cell into a screen spot ── */
+/* ── §4 rect mapping & lattice ── */
 
-/*
- * Everything we need to know about the grid for one terminal size: how big
- * the squares are and how far the cursor is allowed to roam. Filled once at
- * startup (and again on resize), then read all over the place.
- */
+/* GridCtx — the grid for one frame: terminal size, both cell sizes, and how far
+ * the cursor may roam (the last whole minor cell that fits, bottom row free). */
 typedef struct {
-    /* How big the terminal is right now, in characters. */
-    int rows, cols;
-
-    /* Small-cell size in characters. This is also one cursor step. */
-    int cw, ch;
-
-    /* Big-square size in characters — always a whole number of small cells. */
-    int mw, mh;
-    int factor;                /* small cells per big square (MAJOR_FACTOR) */
-
-    /* Farthest the cursor can go: the last whole small cell that still fits.
-       We reserve the bottom row for the key-hint footer, hence rows-1. */
-    int max_r, max_c;
+    int rows, cols;      /* terminal size in characters */
+    int cw, ch;          /* minor cell width and height; also one cursor step */
+    int mw, mh;          /* major square width and height (a whole # of minor cells) */
+    int factor;          /* minor cells per major square (MAJOR_FACTOR) */
+    int max_r, max_c;    /* furthest minor cell the cursor can reach */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols)
 {
     g->rows = rows; g->cols = cols;
     g->cw = MINOR_W; g->ch = MINOR_H;
-    g->factor = MAJOR_FACTOR;
     g->mw = MAJOR_W; g->mh = MAJOR_H;
+    g->factor = MAJOR_FACTOR;
     g->max_r = (rows - 1) / MINOR_H - 1;
     g->max_c = cols / MINOR_W - 1;
 }
 
-/* Where does small cell (r,c) land on screen? Just scale by the cell size. */
-static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
+/* recipe step 1 — minor cell (r,c) -> its top-left corner on screen */
+static void cell_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
     *sr = r * g->ch;
     *sc = c * g->cw;
 }
 
-/*
- * What kind of grid spot is a screen position?
- *   LEVEL_NONE  — empty interior, draw nothing here.
- *   LEVEL_MINOR — sits on a thin small-grid line only.
- *   LEVEL_MAJOR — sits on a thick big-square line (which is also a small line).
- * The numbers are ordered so "more important" is bigger, but we never rely on
- * the arithmetic — we just compare against the names.
- */
-typedef enum { LEVEL_NONE=0, LEVEL_MINOR=1, LEVEL_MAJOR=2 } GridLevel;
+/* The two grid levels a screen spot can belong to, coarse to fine; NONE = interior.
+ * Compared by name, never by arithmetic. */
+typedef enum { LEVEL_NONE, LEVEL_MINOR, LEVEL_MAJOR } GridLevel;
 
-/*
- * Classify one screen spot. We must ask "big line?" before "small line?":
- * every big line also falls on a small line, so checking small first would
- * steal the big lines and they'd never get their bold look. is_h / is_v come
- * back saying whether the spot lies on a horizontal line, a vertical one, or
- * both (a crossing).
- */
-
-static GridLevel ctx_grid_level(const GridCtx *g, int sr, int sc,
-                                bool *is_h, bool *is_v)
+/* recipe step 2a — classify a screen spot, coarsest line first. A major line
+ * always shares its spot with a minor line, so testing major first keeps it
+ * from being misread as minor. is_h/is_v report which way(s) the line runs. */
+static GridLevel grid_level_at(const GridCtx *g, int sr, int sc,
+                               bool *is_h, bool *is_v)
 {
     bool mj_h = (sr % g->mh == 0);
     bool mj_v = (sc % g->mw == 0);
@@ -154,36 +118,40 @@ static GridLevel ctx_grid_level(const GridCtx *g, int sr, int sc,
     return LEVEL_NONE;
 }
 
-/* Paint the whole grid: big lines bright and bold, small lines faint. */
-static void ctx_draw_bg(const GridCtx *g)
+/* recipe step 2b — glyph for a classified spot: crossing '+', major run '=',
+ * minor run '-', vertical '|'. */
+static char grid_glyph_at(GridLevel lvl, bool is_h, bool is_v)
+{
+    if (is_h && is_v) return '+';
+    if (is_h)         return (lvl == LEVEL_MAJOR) ? '=' : '-';
+    if (is_v)         return '|';
+    return ' ';
+}
+
+/* recipe step 3 — draw the grid: major lines bright and bold, minor lines faint */
+static void draw_lattice(const GridCtx *g)
 {
     for (int sr = 0; sr < g->rows - 1; sr++) {
         for (int sc = 0; sc < g->cols; sc++) {
             bool is_h, is_v;
-            GridLevel lvl = ctx_grid_level(g, sr, sc, &is_h, &is_v);
+            GridLevel lvl = grid_level_at(g, sr, sc, &is_h, &is_v);
             if (lvl == LEVEL_NONE) continue;
 
-            char ch = ' ';
-            if (is_h && is_v) ch = '+';
-            else if (is_h)    ch = (lvl == LEVEL_MAJOR) ? '=' : '-';
-            else if (is_v)    ch = '|';
+            char ch = grid_glyph_at(lvl, is_h, is_v);
+            int pair = (lvl == LEVEL_MAJOR) ? PAIR_MAJOR : PAIR_MINOR;
+            attr_t attr = (lvl == LEVEL_MAJOR) ? A_BOLD : A_NORMAL;
 
-            if (lvl == LEVEL_MAJOR) {
-                attron(COLOR_PAIR(PAIR_MAJOR) | A_BOLD);
-                mvaddch(sr, sc, (chtype)(unsigned char)ch);
-                attroff(COLOR_PAIR(PAIR_MAJOR) | A_BOLD);
-            } else {
-                attron(COLOR_PAIR(PAIR_MINOR));
-                mvaddch(sr, sc, (chtype)(unsigned char)ch);
-                attroff(COLOR_PAIR(PAIR_MINOR));
-            }
+            attron(COLOR_PAIR(pair) | attr);
+            mvaddch(sr, sc, (chtype)(unsigned char)ch);
+            attroff(COLOR_PAIR(pair) | attr);
         }
     }
 }
 
 /* ── §5 cursor ── */
 
-/* Where the '@' is, counted in small cells from the top-left corner. */
+/* Cursor — which minor cell the user is in, as (r,c) from the top-left cell (0,0).
+ * Pair with a GridCtx and run through cell_to_screen for pixels. */
 typedef struct { int r, c; } Cursor;
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
@@ -192,6 +160,7 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->c = g->max_c / 2;
 }
 
+/* move the cursor one minor cell, clamped so it never steps off the grid */
 static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
 {
     int nr = cur->r + dr, nc = cur->c + dc;
@@ -199,10 +168,11 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
     if (nc >= 0 && nc <= g->max_c) cur->c = nc;
 }
 
+/* highlight the cursor's minor cell: blank its interior row, then drop '@' */
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc;
-    ctx_to_screen(g, cur->r, cur->c, &sr, &sc);
+    cell_to_screen(g, cur->r, cur->c, &sr, &sc);
 
     attron(COLOR_PAIR(PAIR_ACTIVE));
     for (int dc = 1; dc < g->cw; dc++)
@@ -218,8 +188,7 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
 {
-    /* Split the cursor's small-cell address into "which big square" and
-       "where inside that square" to show all three on the status bar. */
+    /* split the minor address into which major square + offset inside it */
     int maj_r = cur->r / g->factor, maj_c = cur->c / g->factor;
     int loc_r = cur->r % g->factor, loc_c = cur->c % g->factor;
     char buf[80];
@@ -240,7 +209,7 @@ static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
 static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_lattice(g);
     cursor_draw(cur, g);
     hud_draw(g, cur, fps);
     wnoutrefresh(stdscr);

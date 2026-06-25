@@ -1,14 +1,17 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 02_right_isosceles.c — a square grid where every square is cut in half
- * by one diagonal slash, giving two right-triangle halves per square.
- * A '@' cursor walks between the half-triangles with the arrow keys.
+ * 02_right_isosceles.c — square grid, each square cut by one '\' diagonal into
+ * two right-triangle halves; walk a '@' cursor across them. No triangles stored:
+ * for each screen cell we ask "which half-triangle is this?" and compute it (§4).
  *
- * Sister files: 01_equilateral.c (same draw + cursor idea, but a slanted
- * grid) and 03_double_diagonal.c (both diagonals, four triangles per cell).
+ * THE RECIPE: divide a pixel by cell_size to get grid steps; the whole parts say
+ * which square, the fractions (fa,fb) say where inside, and fa>=fb (above vs
+ * below the '\' diagonal) picks the upper-right vs lower-left half.
  *
- * Wikipedia: "Triangular tiling", "Tetrakis square tiling", and
- * "Barycentric coordinate system" cover the geometry used here.
+ * Sister: 01_equilateral.c (same per-cell trick, slanted grid),
+ *         03_double_diagonal.c (both diagonals, four triangles per cell).
+ * Refs: Tetrakis square tiling https://en.wikipedia.org/wiki/Tetrakis_square_tiling
+ *       Barycentric coords     https://en.wikipedia.org/wiki/Barycentric_coordinate_system
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -32,27 +35,25 @@
  * the triangles looking square instead of stretched. (01_equilateral.c §1
  * works through where these numbers come from.)
  */
-#define CELL_W 2
-#define CELL_H 4
+#define CELL_W 2     /* sub-pixels per cell (2 wide x 4 tall) — keeps squares */
+#define CELL_H 4     /* square, not stretched; see 01_equilateral.c §1 */
 
-#define CELL_SIZE_DEFAULT 16.0
+#define CELL_SIZE_DEFAULT 16.0   /* square side, sub-pixels; +/- tunes it */
 #define CELL_SIZE_MIN      6.0
 #define CELL_SIZE_MAX     40.0
 #define CELL_SIZE_STEP     2.0
 
-#define BORDER_W_DEFAULT 0.10
+#define BORDER_W_DEFAULT 0.10   /* how close to an edge counts as "on it"; [/] tunes it */
 #define BORDER_W_MIN     0.03
 #define BORDER_W_MAX     0.35
 #define BORDER_W_STEP    0.02
 
 #define N_THEMES 4
 
-/* How much each new frame nudges the on-screen FPS number. Small = steadier,
- * slower-to-react reading instead of a jittery one. */
-#define FPS_EWMA_ALPHA 0.05
+#define FPS_EWMA_ALPHA 0.05     /* small = steadier on-screen fps number */
 
-#define PAIR_BORDER 1
-#define PAIR_CURSOR 2
+#define PAIR_BORDER 1   /* triangle outlines */
+#define PAIR_CURSOR 2   /* the cursor's triangle + the '@' */
 #define PAIR_HUD    3
 #define PAIR_HINT   4
 
@@ -91,30 +92,19 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula — turning a screen position into "which triangle is here" ── */
+/* ── §4 tri mapping & lattice ── */
 
-/*
- * GridCtx — everything we need to know about the grid right now: how big
- * the terminal is, how large each square is, where the grid is centred, and
- * how thick to draw the triangle edges. The main loop tweaks the size and
- * border live, so this bundle is recomputed whenever those change or the
- * window resizes.
- */
+/* GridCtx — the triangle grid for one frame. Centred on screen, with the centre
+ * cell as origin (0,0). cell_size/border_w live here (not as constants) because
+ * +/- and [/] tune them live. The plane is infinite, so max_col/row are a rough
+ * on-screen reach, not hard limits. */
 typedef struct {
-    /* How many rows and columns of characters the terminal has. */
-    int rows, cols;
-
-    /* The square itself. */
-    double cell_size;      /* side of one square, in sub-pixels               */
-    double border_w;       /* how close to an edge counts as "on the edge"
-                              (0 = hairline, bigger = fatter border lines)    */
-    int    cw, ch;         /* sub-pixels per character — copies of CELL_W/H   */
-
-    /* Where pixel (0,0) lands on screen, so the grid sits centred. */
-    int    ox, oy;
-
-    /* Rough how-far-the-grid-reaches counts; just a hint, not a hard fence. */
-    int    max_col, max_row;
+    int    rows, cols;       /* terminal size in cells */
+    double cell_size;        /* square side length, sub-pixels */
+    double border_w;         /* how close to an edge still counts as on it */
+    int    cw, ch;           /* sub-pixels per cell (CELL_W, CELL_H) */
+    int    ox, oy;           /* centre cell = grid origin (0,0) */
+    int    max_col, max_row; /* rough on-screen reach, not a hard boundary */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols)
@@ -131,16 +121,12 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->max_row = (int)((double)rows * CELL_H / g->cell_size) + 1;
 }
 
-/*
- * Given a point on screen, work out which square it's in and which half of
- * that square. Dividing by the square size tells us the column/row; the
- * leftover fractions say where inside the square we landed. If we're more to
- * the right than down (fa >= fb) we're in the upper-right half, otherwise the
- * lower-left half — that's just asking which side of the '\' diagonal we're on.
- */
-static void ctx_pixel_to_tri(const GridCtx *g, double px, double py,
-                             int *col, int *row, int *up,
-                             double *fa, double *fb)
+/* recipe step 1 (reverse) — a pixel -> which half-triangle (col,row,up) it lands
+ * in, plus where inside it (fa,fb). Divide by cell_size: whole parts pick the
+ * square, fa>=fb (above the '\' diagonal) means the upper-right half. */
+static void screen_to_tri(const GridCtx *g, double px, double py,
+                          int *col, int *row, int *up,
+                          double *fa, double *fb)
 {
     double inv = 1.0 / g->cell_size;
     double a   = px * inv;
@@ -153,10 +139,7 @@ static void ctx_pixel_to_tri(const GridCtx *g, double px, double py,
     *up  = (*fa >= *fb) ? 1 : 0;
 }
 
-/*
- * Find the middle (centroid) of a triangle, in sub-pixels — the spot where
- * we drop the '@' so the cursor sits visually inside the right half.
- */
+/* the middle of a triangle, in pixels (forward: triangle -> point) */
 static void tri_centroid_pixel(int col, int row, int up, double size,
                                double *cx_pix, double *cy_pix)
 {
@@ -166,11 +149,9 @@ static void tri_centroid_pixel(int col, int row, int up, double size,
     *cy_pix = b * size;
 }
 
-/*
- * Which character cell on screen holds the middle of a given triangle —
- * used to place the cursor mark.
- */
-static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
+/* the terminal cell at a triangle's middle. Truncates (not rounds) on purpose,
+ * nudging '@' inside so it never lands on an outline char and hides. */
+static void tri_to_screen(const GridCtx *g, int col, int row, int up,
                           int *sr, int *sc)
 {
     double cx_pix, cy_pix;
@@ -179,14 +160,10 @@ static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
     *sr = g->oy + (int)(cy_pix / g->ch);
 }
 
-/*
- * Decide which border character a point should be, and how far it is from the
- * nearest edge. Each triangle has three edges; we measure the distance to all
- * three, and the closest one wins. The character names that edge: '|' for a
- * vertical side, '_' for a horizontal side, '\\' for the slanted diagonal.
- * The caller uses the returned distance to tell border pixels from interior.
- */
-static char tri_edge_char(int up, double fa, double fb, double *out_min)
+/* the line char for a point inside a triangle, by nearest edge: '|', '_', '\'.
+ * out_min returns the distance to that edge, so the caller can skip deep-inside
+ * points (no outline there). */
+static char edge_glyph(int up, double fa, double fb, double *out_min)
 {
     double l1, l2, l3;
     char   ch1, ch2, ch3;
@@ -207,13 +184,9 @@ static char tri_edge_char(int up, double fa, double fb, double *out_min)
     return ch;
 }
 
-/*
- * Draw the whole grid: walk every character cell, figure out which triangle
- * it falls in, and if it's close enough to an edge, print that edge's
- * character. The triangle the cursor is sitting on gets the highlight colour,
- * so we check for it in the same pass instead of a second loop.
- */
-static void ctx_draw_bg(const GridCtx *g, int cC, int cR, int cU)
+/* recipe step 2 — draw the grid: every cell -> its triangle -> an outline char
+ * (or nothing for interiors). The cursor's triangle is painted in its colour. */
+static void draw_lattice(const GridCtx *g, int cC, int cR, int cU)
 {
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
@@ -222,8 +195,8 @@ static void ctx_draw_bg(const GridCtx *g, int cC, int cR, int cU)
 
             int    tC, tR, tU;
             double fa, fb, m;
-            ctx_pixel_to_tri(g, px, py, &tC, &tR, &tU, &fa, &fb);
-            char ch = tri_edge_char(tU, fa, fb, &m);
+            screen_to_tri(g, px, py, &tC, &tR, &tU, &fa, &fb);
+            char ch = edge_glyph(tU, fa, fb, &m);
             if (m >= g->border_w) continue;
 
             int on_cur = (tC == cC && tR == cR && tU == cU);
@@ -238,23 +211,15 @@ static void ctx_draw_bg(const GridCtx *g, int cC, int cR, int cU)
 
 /* ── §5 cursor ── */
 
-/*
- * Cursor — where the '@' is right now: which square (col, row) and which
- * half of it (up: 0 = lower-left triangle, 1 = upper-right triangle).
- */
+/* Cursor — which half-triangle is selected: col/row pick the square, up its half
+ * (0 = lower-left, 1 = upper-right). Pair with a GridCtx and run through
+ * tri_to_screen. */
 typedef struct { int col, row, up; } Cursor;
 
-/*
- * TRI_DIR — the movement rulebook. Look up [direction][which half you're in]
- * and it tells you the new square and half: the first two numbers add to your
- * column and row, the third sets the new half.
- *
- * Directions are 0:LEFT 1:RIGHT 2:UP 3:DOWN; the inner pair is your current
- * half (0:lower-left, 1:upper-right). Most moves just step across the edge
- * facing that way. But a triangle doesn't have an edge in every direction —
- * e.g. the lower-left half has no flat top — so those presses instead flip you
- * to the other half of the same square, which lands you on the side you wanted.
- */
+/* move table: [arrow][current half] -> (d_col, d_row, new_up). When an arrow has
+ * no edge to cross (a half has no flat top, etc.), the entry just flips to the
+ * other half of the same square. arrows: 0=LEFT 1=RIGHT 2=UP 3=DOWN;
+ * halves: 0=lower-left, 1=upper-right. */
 static const int TRI_DIR[4][2][3] = {
     /* LEFT  */ { { -1,  0,  1 }, {  0,  0,  0 } },
     /* RIGHT */ { {  0,  0,  1 }, { +1,  0,  0 } },
@@ -270,6 +235,7 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->up  = 0;
 }
 
+/* recipe step 3 — step the cursor one triangle. No clamp; the plane is infinite. */
 static void cursor_move(Cursor *cur, const GridCtx *g, int dir)
 {
     (void)g;
@@ -279,10 +245,11 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dir)
     cur->up   = t[2];
 }
 
+/* put '@' in the cursor's triangle; after the grid so it lands on top */
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc;
-    ctx_to_screen(g, cur->col, cur->row, cur->up, &sr, &sc);
+    tri_to_screen(g, cur->col, cur->row, cur->up, &sr, &sc);
     if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
         attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
         mvaddch(sr, sc, '@');
@@ -315,7 +282,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, int theme,
                        int paused, double fps)
 {
     erase();
-    ctx_draw_bg(g, cur->col, cur->row, cur->up);
+    draw_lattice(g, cur->col, cur->row, cur->up);
     cursor_draw(cur, g);
     hud_draw(g, cur, theme, paused, fps);
     wnoutrefresh(stdscr);

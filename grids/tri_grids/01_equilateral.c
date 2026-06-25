@@ -1,63 +1,18 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 01_equilateral.c — fill the screen with equilateral triangles and walk a
- * cursor across them with the arrow keys. We never store the triangles; for
- * every screen cell we just ask "which triangle is this?" and compute the
- * answer. This is the root of the tri_grids series — the other files change
- * one piece of it.
+ * 01_equilateral.c — fill the screen with equilateral triangles, walk a cursor
+ * across them. No triangles are stored: for each screen cell we ask "which
+ * triangle is this?" and compute it (§4). Root of the tri_grids series.
  *
- * Sister file: grids/rect_grids/01_uniform_rect.c does the same per-cell trick
- * on a plain square grid. Here the grid is slanted, because triangles tile at
- * 60-degree angles instead of square corners.
+ * THE RECIPE: the plane is slim diamonds, each split into an up- and a down-
+ * triangle. screen_to_tri maps a pixel back — undo the 60° slant to get grid
+ * steps (a,b); the whole parts say which diamond, the fractions (fa,fb) say
+ * where inside, and fa+fb past the halfway line means up vs down. edge_glyph
+ * picks '/', '\', '_' from whichever edge is nearest.
  *
- * References (things the code can't tell you):
- *   Triangular tiling   — https://en.wikipedia.org/wiki/Triangular_tiling
- *   Barycentric coords  — https://en.wikipedia.org/wiki/Barycentric_coordinate_system
- *   Red Blob Games (hex)— https://www.redblobgames.com/grids/hexagons/
- *   Coxeter, "Regular Polytopes" §4.6 (regular tilings of the plane)
- */
-
-/* ── The idea, in plain words ──
- *
- * Picture the plane covered with slim diamonds (rhombuses), each one split
- * down the middle into two triangles: a "down" triangle (point at the bottom)
- * and an "up" triangle (point at the top). The whole thing is one repeating
- * pattern, so we don't keep a list of triangles. For any screen cell we work
- * backwards: where does this point land in the diamond pattern, and which half
- * of its diamond is it in?
- *
- * Finding a cell's triangle:
- *   1. Convert the screen cell to a point in the slanted grid — basically
- *      "how many steps along each of the two grid directions to get here?".
- *      Call those two numbers a and b. One grid direction is slanted, so we
- *      have to undo that slant when we compute a (subtract half of b).
- *   2. The whole-number parts of a and b say which diamond we're in.
- *   3. The leftover fractional parts say where inside the diamond we are.
- *      If they add up past the halfway line it's the up triangle, else down.
- *
- * Picking the character to draw:
- *   Each triangle has three corners. From the fractional position we get three
- *   "how close to each corner" weights. The smallest weight points at the edge
- *   we're nearest, and that edge decides which line character to draw: '/', '\'
- *   or '_'. If we're not near any edge (deep in the middle), draw nothing — the
- *   triangle interiors stay empty so you see clean outlines.
- *
- * Moving the cursor:
- *   Each arrow press steps the cursor across one edge into a neighbour, looked
- *   up in a small table. When there's no edge in that direction, it flips to
- *   the other triangle in the same diamond instead. Handy quirk: pressing UP
- *   twice always climbs one full row of triangles, whichever half you started
- *   in.
- *
- * Things to keep in mind:
- *  • Terminal characters are about twice as tall as wide, so a cell is 2 wide
- *    by 4 tall in our sub-pixel units. That's what makes the triangles look
- *    correctly equilateral instead of squashed.
- *  • All the grid math is floating point, so the cursor can jitter by a pixel
- *    right on a boundary. Harmless for a demo.
- *  • The bottom row is the HUD, so the triangle fill stops one row short.
- *  • Resizing just re-centers the grid; the cursor's position is independent of
- *    the terminal size, so it survives a resize.
+ * Sister: rect_grids/01_uniform_rect.c (same per-cell trick, square grid).
+ * Refs: Triangular tiling  https://en.wikipedia.org/wiki/Triangular_tiling
+ *       Barycentric coords https://en.wikipedia.org/wiki/Barycentric_coordinate_system
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -79,40 +34,27 @@
 
 #define TARGET_FPS 60
 
-/*
- * We pretend each terminal character is a little block of CELL_W by CELL_H
- * sub-pixels, so we can do smoother math than one-character steps allow. 2 wide
- * by 4 tall matches the roughly 1:2 shape of a real terminal character.
- */
-#define CELL_W 2
-#define CELL_H 4
+#define CELL_W 2     /* sub-pixels per cell (2 wide x 4 tall) — keeps triangles */
+#define CELL_H 4     /* looking equilateral, not squashed */
 
-/* How big one triangle is (its side length), plus how far +/- nudges it. */
-#define TRI_SIZE_DEFAULT 14.0
+#define TRI_SIZE_DEFAULT 14.0   /* triangle side length, sub-pixels; +/- tunes it */
 #define TRI_SIZE_MIN      6.0
 #define TRI_SIZE_MAX     40.0
 #define TRI_SIZE_STEP     2.0
 
-/*
- * How close to an edge a point must be before we draw the edge. Small = thin
- * crisp outlines with hollow middles; large = fat outlines that nearly fill
- * the triangle. The [/] keys nudge it.
- */
-#define BORDER_W_DEFAULT 0.10
+#define BORDER_W_DEFAULT 0.10   /* how close to an edge counts as "on it"; [/] tunes it */
 #define BORDER_W_MIN     0.03
 #define BORDER_W_MAX     0.35
 #define BORDER_W_STEP    0.02
 
 #define N_THEMES 4
 
-/* The fps number is smoothed so it doesn't twitch every frame. */
-#define FPS_EWMA_ALPHA 0.05
+#define FPS_EWMA_ALPHA 0.05     /* small = steadier on-screen fps number */
 
-/* Color pair IDs */
-#define PAIR_BORDER 1   /* the triangle outlines             */
-#define PAIR_CURSOR 2   /* the triangle the cursor is on + the '@' */
-#define PAIR_HUD    3   /* yellow status bar (top right)     */
-#define PAIR_HINT   4   /* cyan key hints (bottom left)      */
+#define PAIR_BORDER 1   /* triangle outlines */
+#define PAIR_CURSOR 2   /* the cursor's triangle + the '@' */
+#define PAIR_HUD    3
+#define PAIR_HINT   4
 
 /* ── §2 clock ── */
 
@@ -133,16 +75,8 @@ static void clock_sleep_ns(int64_t ns)
 
 /* ── §3 color ── */
 
-static const short THEME_FG[N_THEMES] = {
-    /* 256-color preferred values, with 8-color fallback below */
-     75,   /* steel blue   */
-     82,   /* lime green   */
-    214,   /* gold         */
-     15,   /* bright white */
-};
-static const short THEME_FG_8[N_THEMES] = {
-    COLOR_CYAN, COLOR_GREEN, COLOR_YELLOW, COLOR_WHITE,
-};
+static const short THEME_FG[N_THEMES]   = { 75, 82, 214, 15 };
+static const short THEME_FG_8[N_THEMES] = { COLOR_CYAN, COLOR_GREEN, COLOR_YELLOW, COLOR_WHITE };
 
 static void color_init(int theme)
 {
@@ -155,36 +89,21 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula ── */
+/* ── §4 tri mapping & lattice ── */
 
-/*
- * GridCtx — everything needed to map screen cells to triangles right now.
- *
- * The grid is kept centered on the screen, and the cell at the very center is
- * treated as the origin point (0,0) of the grid. From any terminal cell we get
- * a point relative to that center, then ask which triangle it falls in.
- *
- * tri_size and border_w live here (not as fixed constants) because the user can
- * tune them live with +/- and [/], and the drawing code reads them each frame.
- *
- * The plane of triangles is infinite, so max_col/max_row aren't hard limits —
- * they're just a rough "how far out is still on screen" estimate at the current
- * triangle size.
- */
+/* GridCtx — the triangle grid for one frame. Centred on screen, with the centre
+ * cell as origin (0,0). tri_size/border_w live here (not as constants) because
+ * +/- and [/] tune them live. The plane is infinite, so max_col/row are a rough
+ * on-screen reach, not hard limits. */
 typedef struct {
-    int    rows, cols;     /* terminal size in cells                          */
-
-    double tri_size;       /* triangle side length, in sub-pixels            */
-    double border_w;       /* how close to an edge still counts as "on it"   */
-    int    cw, ch;         /* sub-pixels per cell (copies of CELL_W, CELL_H) */
-
-    int    ox, oy;         /* the center cell, used as grid origin (0,0)     */
-
-    int    max_col, max_row; /* rough on-screen reach, not a hard boundary   */
+    int    rows, cols;       /* terminal size in cells */
+    double tri_size;         /* triangle side length, sub-pixels */
+    double border_w;         /* how close to an edge still counts as on it */
+    int    cw, ch;           /* sub-pixels per cell (CELL_W, CELL_H) */
+    int    ox, oy;           /* centre cell = grid origin (0,0) */
+    int    max_col, max_row; /* rough on-screen reach, not a hard boundary */
 } GridCtx;
 
-/* Re-fits the grid to the current terminal size. Keeps the user's chosen
- * tri_size/border_w if they're already set, so a resize doesn't reset them. */
 static void ctx_init(GridCtx *g, int rows, int cols)
 {
     g->rows = rows;
@@ -199,16 +118,12 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->max_row = (int)((double)rows * CELL_H / (sqrt(3.0) * 0.5 * g->tri_size)) + 1;
 }
 
-/*
- * The heart of the demo: given a point on screen, work out which triangle it's
- * in. We measure how many steps along each grid direction reach the point (a
- * and b), undoing the grid's slant for the first one. The whole-number parts
- * say which diamond; the leftover fractions (fa, fb) say where inside it, and
- * whether their sum has crossed the halfway line tells up-triangle from down.
- */
-static void ctx_pixel_to_tri(const GridCtx *g, double px, double py,
-                             int *col, int *row, int *up,
-                             double *fa, double *fb)
+/* recipe step 1 (reverse) — a pixel -> which triangle (col,row,up) it lands in,
+ * plus where inside it (fa,fb). Undo the slant: a = px/size - b/2. Whole parts
+ * pick the diamond; fa+fb >= 1 means the up triangle. */
+static void screen_to_tri(const GridCtx *g, double px, double py,
+                          int *col, int *row, int *up,
+                          double *fa, double *fb)
 {
     double h = g->tri_size * sqrt(3.0) * 0.5;
     double b = py / h;
@@ -222,8 +137,7 @@ static void ctx_pixel_to_tri(const GridCtx *g, double px, double py,
     *up  = (*fa + *fb >= 1.0) ? 1 : 0;
 }
 
-/* Finds the middle point of a given triangle, in pixels. This is the forward
- * direction of the grid math (triangle -> point), used to place the '@'. */
+/* the middle of a triangle, in pixels (forward: triangle -> point) */
 static void tri_centroid_pixel(int col, int row, int up, double size,
                                double *cx_pix, double *cy_pix)
 {
@@ -234,12 +148,9 @@ static void tri_centroid_pixel(int col, int row, int up, double size,
     *cy_pix = b * h;
 }
 
-/*
- * Which terminal cell sits at the middle of a triangle. We chop off the
- * fraction instead of rounding on purpose: it nudges the '@' a hair toward the
- * inside, so it never lands exactly on an outline character and get hidden.
- */
-static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
+/* the terminal cell at a triangle's middle. Truncates (not rounds) on purpose,
+ * nudging '@' inside so it never lands on an outline char and hides. */
+static void tri_to_screen(const GridCtx *g, int col, int row, int up,
                           int *sr, int *sc)
 {
     double cx_pix, cy_pix;
@@ -248,14 +159,10 @@ static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
     *sr = g->oy + (int)(cy_pix / g->ch);
 }
 
-/*
- * Picks the line character for a point inside a triangle, based on which edge
- * it's closest to: '/', '\', or '_'. It works out a "distance to each corner"
- * and the smallest one points at the nearest edge. It also hands back that
- * smallest distance in *out_min, so the caller can skip points that sit too
- * deep in the middle to be part of an outline.
- */
-static char tri_edge_char(int up, double fa, double fb, double *out_min)
+/* the line char for a point inside a triangle, by nearest edge: '/', '\', '_'.
+ * out_min returns the distance to that edge, so the caller can skip deep-inside
+ * points (no outline there). */
+static char edge_glyph(int up, double fa, double fb, double *out_min)
 {
     double l1, l2, l3;
     char   ch1, ch2, ch3;
@@ -276,14 +183,9 @@ static char tri_edge_char(int up, double fa, double fb, double *out_min)
     return ch;
 }
 
-/*
- * Draws the whole triangle grid by visiting every cell, asking which triangle
- * it's in, and stamping the right outline character (or nothing for interiors).
- * Nothing is stored between frames — it's all recomputed, which is why a resize
- * costs nothing. While we're at it, if a cell belongs to the cursor's triangle
- * we paint it in the cursor color instead of the normal one.
- */
-static void ctx_draw_bg(const GridCtx *g, int cC, int cR, int cU)
+/* recipe step 2 — draw the grid: every cell -> its triangle -> an outline char
+ * (or nothing for interiors). The cursor's triangle is painted in its colour. */
+static void draw_lattice(const GridCtx *g, int cC, int cR, int cU)
 {
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
@@ -292,8 +194,8 @@ static void ctx_draw_bg(const GridCtx *g, int cC, int cR, int cU)
 
             int    tC, tR, tU;
             double fa, fb, m;
-            ctx_pixel_to_tri(g, px, py, &tC, &tR, &tU, &fa, &fb);
-            char ch = tri_edge_char(tU, fa, fb, &m);
+            screen_to_tri(g, px, py, &tC, &tR, &tU, &fa, &fb);
+            char ch = edge_glyph(tU, fa, fb, &m);
             if (m >= g->border_w) continue;
 
             int on_cur = (tC == cC && tR == cR && tU == cU);
@@ -308,14 +210,8 @@ static void ctx_draw_bg(const GridCtx *g, int cC, int cR, int cU)
 
 /* ── §5 cursor ── */
 
-/*
- * Cursor — which triangle the user is pointing at, and nothing more.
- *
- * col/row pick the diamond; up says which half of it (0 = the down triangle,
- * 1 = the up triangle). It deliberately knows nothing about screen size or
- * pixels — pair it with a GridCtx and ctx_to_screen() turns it into a spot on
- * the screen.
- */
+/* Cursor — which triangle is selected: col/row pick the diamond, up its half
+ * (0 = down, 1 = up). Pair with a GridCtx and run through tri_to_screen. */
 typedef struct { int col, row, up; } Cursor;
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
@@ -326,27 +222,17 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->up  = 0;
 }
 
-/*
- * TRI_DIR — the move table for the arrow keys. Look up [which arrow][which half
- * you're in now] and you get the change to apply: how col and row shift, and
- * which half you end up in. When an arrow has no edge to cross in that
- * direction, the entry just flips you to the other half of the same diamond.
- *   arrow order : 0=LEFT 1=RIGHT 2=UP 3=DOWN
- *   half order  : 0=down triangle, 1=up triangle
- */
+/* move table: [arrow][current half] -> (d_col, d_row, new_up). When an arrow has
+ * no edge to cross, the entry just flips to the other half of the same diamond.
+ * arrows: 0=LEFT 1=RIGHT 2=UP 3=DOWN; halves: 0=down, 1=up. */
 static const int TRI_DIR[4][2][3] = {
-    /* LEFT  */ { { -1,  0,  1 },    /* down → up(col-1, row)             */
-                  {  0,  0,  0 } },  /* up   → down(col, row)  toggle      */
-    /* RIGHT */ { {  0,  0,  1 },    /* down → up(col, row)    toggle      */
-                  { +1,  0,  0 } },  /* up   → down(col+1, row)            */
-    /* UP    */ { {  0, -1,  1 },    /* down → up(col, row-1)  cross top   */
-                  {  0,  0,  0 } },  /* up   → down(col, row)  toggle      */
-    /* DOWN  */ { {  0,  0,  1 },    /* down → up(col, row)    toggle      */
-                  {  0, +1,  0 } },  /* up   → down(col, row+1) cross bot  */
+    /* LEFT  */ { { -1,  0,  1 }, {  0,  0,  0 } },
+    /* RIGHT */ { {  0,  0,  1 }, { +1,  0,  0 } },
+    /* UP    */ { {  0, -1,  1 }, {  0,  0,  0 } },
+    /* DOWN  */ { {  0,  0,  1 }, {  0, +1,  0 } },
 };
 
-/* Steps the cursor one triangle in the given direction. No edge-of-grid
- * clamping on purpose — the plane of triangles goes on forever. */
+/* recipe step 3 — step the cursor one triangle. No clamp; the plane is infinite. */
 static void cursor_move(Cursor *cur, const GridCtx *g, int dir)
 {
     (void)g;
@@ -356,12 +242,11 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dir)
     cur->up   = t[2];
 }
 
-/* Puts the '@' in the middle of the cursor's triangle. Called after the grid is
- * drawn so it sits on top of any outline character that shares that cell. */
+/* put '@' in the cursor's triangle; after the grid so it lands on top */
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc;
-    ctx_to_screen(g, cur->col, cur->row, cur->up, &sr, &sc);
+    tri_to_screen(g, cur->col, cur->row, cur->up, &sr, &sc);
     if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
         attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
         mvaddch(sr, sc, '@');
@@ -371,8 +256,6 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
 
 /* ── §6 scene ── */
 
-/* The on-screen overlay: status readout top-right, key hints along the bottom.
- * Bold and bright so it stays readable over the triangles. */
 static void hud_draw(const GridCtx *g, const Cursor *cur, int theme,
                      int paused, double fps)
 {
@@ -396,7 +279,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, int theme,
                        int paused, double fps)
 {
     erase();
-    ctx_draw_bg(g, cur->col, cur->row, cur->up);
+    draw_lattice(g, cur->col, cur->row, cur->up);
     cursor_draw(cur, g);
     hud_draw(g, cur, theme, paused, fps);
     wnoutrefresh(stdscr);

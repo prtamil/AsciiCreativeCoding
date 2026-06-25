@@ -1,42 +1,18 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 03_double_diagonal.c — squares cut into 4 triangles, one per direction.
+ * 03_double_diagonal.c — squares cut by BOTH diagonals into 4 triangles.
  *
- * Each square gets both diagonals drawn in, splitting it into 4 triangles
- * that meet at the centre. Each triangle points one way — N, E, S, or W —
- * and the arrow keys walk the @ cursor between them.
+ * THE RECIPE: tetrakis square tiling. No triangles are stored; for each screen
+ * cell we ask "which triangle is this?" and compute it (§4). screen_to_tri
+ * divides by cell_size for the square, then a point's offset from the square's
+ * centre picks the wedge (N/E/S/W — more horizontal -> E/W, more vertical ->
+ * N/S). edge_glyph picks '/', '\', '_', '|' from whichever of the wedge's three
+ * edges is nearest.
  *
- * Sister files: 02_right_isosceles.c (one diagonal, 2 triangles per square),
- *               04_30_60_90.c (the same idea for a triangular grid).
- * Background: "tetrakis square tiling" on Wikipedia; Conway, Burgiel &
- *             Goodman-Strauss, "The Symmetries of Things" (2008) §22.
- */
-
-/*
- * THE BIG PICTURE
- *
- * There is no grid stored in memory. Instead, for every character cell on
- * screen we ask: which square is this, and which of its 4 triangles does it
- * fall in? Both answers come straight from the pixel's position, recomputed
- * fresh each frame.
- *
- * To find the triangle, stand at the centre of a square. The two diagonals
- * cut it into 4 wedges, like slicing a sandwich corner to corner both ways:
- *   N is the top wedge, E the right, S the bottom, W the left.
- * Which wedge a point lands in just depends on whether it's further from the
- * centre horizontally or vertically: more horizontal -> E or W (left/right
- * tells which), more vertical -> N or S.
- *
- * To draw, we only paint the thin outlines, not the solid interiors. For each
- * pixel we measure how close it is to the triangle's three edges; if it's
- * hugging an edge we draw a slash, backslash, underscore or bar, otherwise we
- * leave it blank. Edge distances use barycentric weights — a standard way to
- * say "how close am I to each side of a triangle" (see the Barycentric
- * coordinates article on Wikipedia).
- *
- * Good to know:
- *  - Right on a diagonal the two wedges tie; we just pick one, it's invisible.
- *  - Make squares too small (below size 8) and the inner triangles vanish.
+ * Sister: tri_grids/01_equilateral.c (shared §4/§5 vocabulary),
+ *         02_right_isosceles.c (one diagonal, 2 triangles per square).
+ * Refs: Tetrakis square tiling https://en.wikipedia.org/wiki/Tetrakis_square_tiling
+ *       Conway, Burgiel & Goodman-Strauss, "The Symmetries of Things" (2008) §22.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -118,29 +94,19 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula — which square, which triangle, which edge ── */
+/* ── §4 tri mapping & lattice ── */
 
-/*
- * GridCtx — everything we need to draw the grid this frame.
- *
- * There's no stored grid; this just holds the current size and placement so
- * any pixel can be turned into a square + triangle. cell_size and border_w
- * are live-tunable, so the picture redraws when the user zooms or thickens
- * the outlines. Centring matches its sister file 02.
- */
+/* GridCtx — the tetrakis grid for one frame. Centred on screen, origin pixel
+ * at cell (ox,oy). cell_size/border_w live here (not as constants) because
+ * +/- and [/] tune them live. The plane is infinite, so max_col/row are a
+ * rough on-screen reach, not hard limits. */
 typedef struct {
-    /* size of the terminal, in character cells */
-    int rows, cols;
-
-    double cell_size;      /* one square's side length, in pixels            */
-    double border_w;       /* how close to an edge counts as "on the line";
-                              bigger = thicker outlines                      */
-    int    cw, ch;         /* pixels packed into one character cell (a cell
-                              is taller than it is wide), = CELL_W, CELL_H   */
-
-    int    ox, oy;         /* screen cell that sits at pixel (0,0)           */
-
-    int    max_col, max_row;  /* rough how-far-the-grid-reaches hint         */
+    int    rows, cols;       /* terminal size in cells */
+    double cell_size;        /* one square's side length, sub-pixels */
+    double border_w;         /* how close to an edge still counts as on it */
+    int    cw, ch;           /* sub-pixels per cell (CELL_W, CELL_H) */
+    int    ox, oy;           /* centre cell = grid origin (0,0) */
+    int    max_col, max_row; /* rough on-screen reach, not a hard boundary */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols)
@@ -157,16 +123,13 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->max_row = (int)((double)rows * CELL_H / g->cell_size) + 1;
 }
 
-/*
- * Given a pixel, work out which square it's in and which of the 4 triangles.
- * The square comes from dividing by the square size; the triangle comes from
- * asking whether the pixel sits further from the square's centre sideways or
- * up/down. Also hands back where inside the square it landed (fa, fb, each
- * 0..1) so the caller can measure edge distances.
- */
-static void ctx_pixel_to_tri(const GridCtx *g, double px, double py,
-                             int *col, int *row, int *wedge,
-                             double *fa, double *fb)
+/* recipe step 1 (reverse) — a pixel -> which triangle (col,row,wedge) it lands
+ * in, plus where inside the square (fa,fb in 0..1). Divide by cell_size for the
+ * square; the offset from its centre picks the wedge (sideways -> E/W, up/down
+ * -> N/S). */
+static void screen_to_tri(const GridCtx *g, double px, double py,
+                          int *col, int *row, int *wedge,
+                          double *fa, double *fb)
 {
     double inv = 1.0 / g->cell_size;
     double a   = px * inv;
@@ -183,12 +146,8 @@ static void ctx_pixel_to_tri(const GridCtx *g, double px, double py,
     else           *wedge = (dy > 0.0) ? WEDGE_S : WEDGE_N;
 }
 
-/*
- * The opposite trip: given a triangle, find the pixel at its middle. Used to
- * place the @ marker on the triangle the cursor is sitting on. Each triangle's
- * middle sits a fixed fraction into its square (the N triangle's middle is
- * near its top edge, and so on).
- */
+/* the middle of a wedge, in pixels (forward: triangle -> point). Each wedge's
+ * centroid sits a fixed fraction into its square (N near the top edge, etc). */
 static void tri_centroid_pixel(int col, int row, int wedge, double size,
                                double *cx_pix, double *cy_pix)
 {
@@ -203,7 +162,9 @@ static void tri_centroid_pixel(int col, int row, int wedge, double size,
     *cy_pix = ((double)row + b) * size;
 }
 
-static void ctx_to_screen(const GridCtx *g, int col, int row, int wedge,
+/* the terminal cell at a wedge's middle. Truncates (not rounds) on purpose,
+ * nudging '@' inside so it never lands on an outline char and hides. */
+static void tri_to_screen(const GridCtx *g, int col, int row, int wedge,
                           int *sr, int *sc)
 {
     double cx_pix, cy_pix;
@@ -212,14 +173,10 @@ static void ctx_to_screen(const GridCtx *g, int col, int row, int wedge,
     *sr = g->oy + (int)(cy_pix / g->ch);
 }
 
-/*
- * Pick the outline character for a pixel, and report how close it is to the
- * nearest edge. Each triangle has three edges, each drawn with its own glyph:
- * a slash, a backslash, and a flat one (underscore or bar). We measure the
- * distance to all three (smaller = closer), keep the nearest, and return its
- * glyph. The caller draws it only when that distance is small enough.
- */
-static char tri_edge_char(int wedge, double fa, double fb, double *out_min)
+/* the line char for a point inside a wedge, by nearest of its three edges:
+ * '/', '\', '_' or '|'. out_min returns the distance to that edge, so the
+ * caller can skip deep-inside points (no outline there). */
+static char edge_glyph(int wedge, double fa, double fb, double *out_min)
 {
     double l1, l2, l3;
     char   ch1, ch2, ch3;
@@ -253,7 +210,9 @@ static char tri_edge_char(int wedge, double fa, double fb, double *out_min)
     return ch;
 }
 
-static void ctx_draw_bg(const GridCtx *g, int cC, int cR, int cWedge)
+/* recipe step 2 — draw the grid: every cell -> its wedge -> an outline char
+ * (or nothing for interiors). The cursor's wedge is painted in its colour. */
+static void draw_lattice(const GridCtx *g, int cC, int cR, int cWedge)
 {
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
@@ -262,8 +221,8 @@ static void ctx_draw_bg(const GridCtx *g, int cC, int cR, int cWedge)
 
             int    tC, tR, tW;
             double fa, fb, m;
-            ctx_pixel_to_tri(g, px, py, &tC, &tR, &tW, &fa, &fb);
-            char ch = tri_edge_char(tW, fa, fb, &m);
+            screen_to_tri(g, px, py, &tC, &tR, &tW, &fa, &fb);
+            char ch = edge_glyph(tW, fa, fb, &m);
             if (m >= g->border_w) continue;
 
             int on_cur = (tC == cC && tR == cR && tW == cWedge);
@@ -278,27 +237,16 @@ static void ctx_draw_bg(const GridCtx *g, int cC, int cR, int cWedge)
 
 /* ── §5 cursor ── */
 
-/*
- * Cursor — where the @ marker currently sits.
- *
- * col, row say which square; wedge says which of its 4 triangles
- * (0=N, 1=E, 2=S, 3=W — the direction that triangle points).
- */
+/* Cursor — which triangle is selected: col/row pick the square, wedge its
+ * quarter (0=N, 1=E, 2=S, 3=W — the way that triangle points). Pair with a
+ * GridCtx and run through tri_to_screen. */
 typedef struct { int col, row, wedge; } Cursor;
 
-/*
- * TETRA_DIR — the movement rules, baked into a lookup table.
- *
- * Read it as TETRA_DIR[which arrow][current triangle] -> {shift in column,
- * shift in row, new triangle}. Arrows are 0:LEFT 1:RIGHT 2:UP 3:DOWN;
- * triangles are 0:N 1:E 2:S 3:W.
- *
- * The idea: an arrow nudges the cursor that way. Usually it just hops to the
- * neighbouring triangle inside the same square. But if you're already against
- * the square's outer edge in that direction, it steps into the next square and
- * lands on the triangle facing back the way you came. Example: in the W
- * triangle pressing LEFT crosses into the previous square's E triangle.
- */
+/* move table: TETRA_DIR[arrow][current wedge] -> {d_col, d_row, new_wedge}.
+ * Usually an arrow hops to the neighbouring wedge inside the same square; when
+ * the cursor is already against the square's outer edge that way, it steps into
+ * the next square and lands on the wedge facing back. arrows: 0=LEFT 1=RIGHT
+ * 2=UP 3=DOWN; wedges: 0=N 1=E 2=S 3=W. */
 static const int TETRA_DIR[4][4][3] = {
     /* LEFT  */ { {  0,  0, WEDGE_W }, {  0,  0, WEDGE_W }, {  0,  0, WEDGE_W }, { -1,  0, WEDGE_E } },
     /* RIGHT */ { {  0,  0, WEDGE_E }, { +1,  0, WEDGE_W }, {  0,  0, WEDGE_E }, {  0,  0, WEDGE_E } },
@@ -314,6 +262,7 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->wedge = WEDGE_N;
 }
 
+/* recipe step 3 — step the cursor one wedge. No clamp; the plane is infinite. */
 static void cursor_move(Cursor *cur, const GridCtx *g, int arrow)
 {
     (void)g;
@@ -323,10 +272,11 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int arrow)
     cur->wedge = t[2];
 }
 
+/* put '@' in the cursor's wedge; after the grid so it lands on top */
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc;
-    ctx_to_screen(g, cur->col, cur->row, cur->wedge, &sr, &sc);
+    tri_to_screen(g, cur->col, cur->row, cur->wedge, &sr, &sc);
     if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
         attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
         mvaddch(sr, sc, '@');
@@ -361,7 +311,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, int theme,
                        int paused, double fps)
 {
     erase();
-    ctx_draw_bg(g, cur->col, cur->row, cur->wedge);
+    draw_lattice(g, cur->col, cur->row, cur->wedge);
     cursor_draw(cur, g);
     hud_draw(g, cur, theme, paused, fps);
     wnoutrefresh(stdscr);

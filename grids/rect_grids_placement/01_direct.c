@@ -2,14 +2,11 @@
 /*
  * 01_direct.c — drop objects onto any of 14 grid styles with a movable cursor.
  *
- * Move the cursor with the arrows, press SPACE to drop or pick up an object at
- * that cell, and step through all 14 grid backgrounds with a/e. The same object
- * list works on every grid: each grid just hands us one formula for turning a
- * (row,col) cell into a screen position, and one drawer for its background.
+ * SPACE toggles an object on the cursor's cell; a/e cycle the 14 backgrounds.
+ * Each grid supplies one (row,col)->screen formula (cell_to_screen) and one
+ * background drawer; the object list and cursor work the same on all of them.
  *
- * Sister files: grids/rect_grids/01_uniform_rect.c (where the grid formulas
- * come from), 02_patterns.c (filling whole patterns instead of one cell).
- * Object-list trick borrowed from gameprogrammingpatterns.com/object-pool.html.
+ * Sister files: rect_grids/01_uniform_rect.c (the grid formulas), 02_patterns.c.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -98,7 +95,7 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,    -1);
 }
 
-/* ── §4 gridctx ── */
+/* ── §4 grid mapping & backgrounds ── */
 
 /* GridMode — which of the 14 grid styles we're showing right now. The order
    here matches the 14 sibling source files, and GM_COUNT (last) doubles as the
@@ -118,28 +115,14 @@ static const char *const gm_name[GM_COUNT] = {
     "13 dot","14 origin"
 };
 
-/* GridCtx — everything we need to know about the grid that's on screen now.
-   Rebuilt from scratch each time you switch grids (see ctx_init). Holding it in
-   one struct means the rest of the code never asks "which grid is this?" — it
-   just reads these fields.
-
-   mode         which of the 14 styles this is.
-   rows, cols   terminal size in characters, grabbed at init.
-   cw, ch       cell width and height in characters (the rectangular grids).
-   ox, oy       where cell (0,0) lands on screen. The diamond/iso grids put
-                their origin at the middle of the terminal so they fan out
-                from the centre; the rectangular grids leave these at 0.
-   range        for the centred diamond/iso grids, cells run from -range..+range
-                on each axis. Unused by the others.
-   min/max r,c  how far the cursor is allowed to roam, in cell coordinates.
-                Computed once per grid so cursor_move can just clamp. */
+/* GridCtx — the grid on screen now, rebuilt on every switch/resize. */
 typedef struct {
     GridMode mode;
-    int rows, cols;
-    int cw, ch;
-    int ox, oy;
-    int range;
-    int min_r, max_r, min_c, max_c;
+    int rows, cols;                  /* terminal size in characters */
+    int cw, ch;                      /* cell width/height in characters */
+    int ox, oy;                      /* where cell (0,0) lands; centre for diamond/iso */
+    int range;                       /* diamond/iso run -range..+range per axis */
+    int min_r, max_r, min_c, max_c;  /* cursor roam limits, in cells */
 } GridCtx;
 
 /* One tiny setter per grid style, just filling in that style's cell size.
@@ -214,7 +197,7 @@ static void ctx_init(GridCtx *g, GridMode m, int rows, int cols)
    diamond/iso grids it returns the cell's centre. Keeping all the layout math
    here means objects and the cursor never have to know which grid they're on —
    they just ask this. */
-static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
+static void cell_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
     switch (g->mode) {
     case GM_DIAMOND:
@@ -438,7 +421,7 @@ static void bg_draw_dot(const GridCtx *g)
 
 /* Draw whichever grid is active by handing off to its drawer. The five plain
    rectangular styles share one drawer since they only differ in cell size. */
-static void ctx_draw_bg(const GridCtx *g)
+static void draw_grid(const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_GRID));
     switch (g->mode) {
@@ -506,7 +489,7 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     for (int i = 0; i < p->count; i++) {
         if (!p->items[i].alive) continue;
         int sr, sc;
-        ctx_to_screen(g, p->items[i].r, p->items[i].c, &sr, &sc);
+        cell_to_screen(g, p->items[i].r, p->items[i].c, &sr, &sc);
         /* nudge inside the cell so the object sits in the open space, not on
            top of the grid lines. The slanted grids draw at the centre already,
            so they skip this. */
@@ -542,7 +525,7 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc;
-    ctx_to_screen(g, cur->r, cur->c, &sr, &sc);
+    cell_to_screen(g, cur->r, cur->c, &sr, &sc);
     attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD | A_REVERSE);
 
     if (g->mode == GM_DIAMOND || g->mode == GM_ISO) {
@@ -588,7 +571,7 @@ static void scene_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
                        double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_grid(g);
     pool_draw(p, g);
     cursor_draw(cur, g);
     hud_draw(g, p, cur, fps);

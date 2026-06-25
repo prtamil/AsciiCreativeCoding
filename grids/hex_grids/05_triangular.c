@@ -1,24 +1,13 @@
 /*
- * 05_triangular.c — a grid made of equilateral triangles you can move a cursor around.
+ * 05_triangular.c — a screen of equilateral triangles with a movable cursor.
  *
- * Arrow keys hop a '@' between neighbouring triangles; the one you're on is
- * highlighted. The cursor's spot is stored as two "stripe" numbers (si, sj),
- * a counting scheme made just for triangle grids.
+ * No grid is stored. A triangle tiling is three sets of parallel lines (flat,
+ * up-right, up-left); for each screen cell we ask "which stripe of each set am
+ * I in, and is this pixel near a line?" and answer with arithmetic — that is §4.
  *
- * Sister file: hex_grids/01_flat_top.c — a hex grid is the flip side of this
- * tiling (one hex centre per triangle corner, and vice versa).
- *
- * How it works, in one breath: a rectangle grid is built from two sets of
- * parallel lines (across and down). A triangle grid needs THREE sets, running
- * flat, up-to-the-right, and up-to-the-left. For every screen cell we ask how
- * close it is to a line in each of the three sets; the nearest one decides
- * whether to draw an edge ('-', '/', '\') and which way it leans. There's no
- * stored grid array — we recompute everything from the cell's position each
- * frame.
- *
- * References (the kind the code can't show you):
- *   Triangular tiling     — https://mathworld.wolfram.com/TriangularGrid.html
- *   Hex/triangle flip side — https://www.redblobgames.com/grids/hexagons/#map-storage
+ * Sister file: hex_grids/01_flat_top.c — same skeleton; a hex grid is the flip
+ * side of this tiling. Only the mapping math differs.
+ * Reference:   https://mathworld.wolfram.com/TriangularGrid.html
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -34,35 +23,28 @@
 
 /* ── §1 config ── */
 
-/* One terminal cell counts as this many tiny "pixels" of room — the geometry
- * math works in pixels so the triangles aren't chained to character size. */
 #define CELL_W              2
 #define CELL_H              4
 
-/* How big each triangle is, in pixels. The one knob that sets the scale. */
-#define TRI_SIZE_DEFAULT   20.0
+#define TRI_SIZE_DEFAULT   20.0   /* triangle side length, pixels; bigger = fewer triangles */
 #define TRI_SIZE_MIN        8.0
 #define TRI_SIZE_MAX       60.0
 #define TRI_SIZE_STEP       4.0
 
-/* How close to a line counts as "on the border". 0 = right on the line,
- * 0.5 = dead centre of a triangle. Bigger value = fatter drawn edges. */
-#define BORDER_W_DEFAULT    0.10
+#define BORDER_W_DEFAULT    0.10  /* how near a line counts as edge: 0 on the line, 0.5 mid-triangle */
 #define BORDER_W_MIN        0.02
 #define BORDER_W_MAX        0.45
 #define BORDER_W_STEP       0.02
 
 #define N_THEMES            4
-#define TICK_NS            16666667LL    /* one frame at ~60 per second */
+#define TICK_NS            16666667LL
 
-/* The on-screen fps reading is smoothed so it doesn't jitter; smaller = calmer. */
-#define FPS_EWMA_ALPHA      0.05
+#define FPS_EWMA_ALPHA      0.05   /* small = steadier on-screen fps number */
 
-/* Colour slots */
-#define PAIR_BORDER   1   /* the triangle edges (takes the theme colour) */
-#define PAIR_CURSOR   2   /* the highlighted triangle (white on blue) */
-#define PAIR_HUD      3   /* status line (yellow) */
-#define PAIR_HINT     4   /* key reminders at the bottom (cyan) */
+#define PAIR_BORDER   1
+#define PAIR_CURSOR   2   /* selected triangle's edges and its '@' */
+#define PAIR_HUD      3
+#define PAIR_HINT     4
 
 /* ── §2 clock ── */
 
@@ -100,75 +82,70 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula — the triangle grid and how a screen cell maps onto it ── */
+/* ── §4 triangle mapping & lattice ── */
 
-/*
- * GridCtx — everything we need to know about the current triangle grid:
- * how big the triangles are, how big the terminal is, and how far the cursor
- * is allowed to roam.
- *
- * Why bundle it instead of using globals? So the math functions take a grid
- * as an argument and work for any grid — the same shape is reused across the
- * rectangle/hex/triangle/polar demos in this folder.
- */
+/* GridCtx — the whole triangle grid for one frame. Stripe (si,sj)=(0,0) sits at
+ * screen centre; every other triangle is named by its stripe numbers measured
+ * from there. Keys +/- and [/] write tri_size / border_w; the rest is
+ * recomputed on resize. */
 typedef struct {
-    /* size of the terminal, counted in character cells */
-    int rows, cols;
-
-    /* tri_size: triangle side length in pixels.
-     * cell_w/cell_h: how many pixels one terminal cell is worth. */
-    double tri_size;
-    int    cell_w, cell_h;
-
-    /* where the grid's centre sits, as a cell position — used to centre
-     * the whole tiling on screen */
-    int ox, oy;
-
-    /* how far the cursor may travel, in stripe-number space. Kept generous
-     * so the cursor can reach any triangle that's visible; going past the
-     * edge just parks it off-screen. */
-    int max_si, max_sj;
-
-    /* the "how close counts as an edge" threshold (see BORDER_W in §1) */
-    double border_w;
+    int    rows, cols;      /* terminal size in character cells */
+    double tri_size;        /* triangle side length, pixels; bigger = fewer triangles */
+    double border_w;        /* outline band width, 0..0.5; how near a line counts as edge */
+    int    cell_w, cell_h;  /* pixels per char cell (2 vs 4) — undoes the cell's tall aspect */
+    int    ox, oy;          /* screen-centre cell; the (0,0) triangle lives here */
+    int    max_si, max_sj;  /* furthest stripe the cursor may reach; off past it is harmless */
 } GridCtx;
 
-/* Fills in a GridCtx for the current terminal size and triangle size.
- * Call it again after a resize or after the user changes the triangle size. */
 static void ctx_init(GridCtx *g, int rows, int cols,
                      double tri_size, double border_w)
 {
-    g->rows = rows; g->cols = cols;
+    g->rows     = rows;
+    g->cols     = cols;
     g->tri_size = tri_size;
-    g->cell_w = CELL_W; g->cell_h = CELL_H;
-    g->ox = cols / 2;
-    g->oy = (rows - 1) / 2;
     g->border_w = border_w;
-
-    /* Pick cursor limits big enough to cover the whole screen with room to
-     * spare — rough is fine, since stepping off-screen does no harm. */
-    int max_pix_w = cols * CELL_W;
-    int max_pix_h = rows * CELL_H;
+    g->cell_w   = CELL_W;
+    g->cell_h   = CELL_H;
+    g->ox       = cols / 2;
+    g->oy       = (rows - 1) / 2;
+    /* generous stripe limits — enough to cover the screen with room to spare */
     double h = tri_size * sqrt(3.0) * 0.5;
-    g->max_si = (int)(max_pix_h / h) + 4;
-    g->max_sj = (int)((max_pix_w + max_pix_h) / h) + 4;
+    g->max_si = (int)((double)(rows * CELL_H) / h) + 4;
+    g->max_sj = (int)((double)((cols * CELL_W) + (rows * CELL_H)) / h) + 4;
 }
 
-/* Given a triangle's two stripe numbers (si, sj), find the screen cell at its
- * centre. si picks the row going down; sj picks how far along that row to go.
- * This is the reverse of the per-pixel stripe math done in ctx_draw_bg(). */
-static void ctx_to_screen(const GridCtx *g, int si, int sj, int *sr, int *sc)
+/* one triangle's centre in pixels, measured from the grid centre. si counts
+ * rows down (row height h); sj counts diagonal steps along the row. */
+static void tri_center_pixel(double size, int si, int sj, double *cx, double *cy)
 {
-    double h    = g->tri_size * sqrt(3.0) * 0.5;
-    double py_c = ((double)si + 0.5) * h;
-    double px_c = (double)(sj - si) * g->tri_size * 0.5;
-    *sr = g->oy + (int)(py_c / g->cell_h);
-    *sc = g->ox + (int)(px_c / g->cell_w);
+    double h = size * sqrt(3.0) * 0.5;
+    *cx = (double)(sj - si) * size * 0.5;
+    *cy = ((double)si + 0.5) * h;
 }
 
-/* How close is v to the nearest whole number? Returns 0 right on a line and
- * 0.5 at the midpoint between two. We use it to tell "near an edge" from
- * "deep inside a triangle". (The +1 fixes C's fmod, which can go negative.) */
+/* recipe step 1 — triangle address (si,sj) -> the screen cell at its centre */
+static void tri_to_screen(const GridCtx *g, int si, int sj, int *sr, int *sc)
+{
+    double cx, cy;
+    tri_center_pixel(g->tri_size, si, sj, &cx, &cy);
+    *sc = g->ox + (int)(cx / g->cell_w);
+    *sr = g->oy + (int)(cy / g->cell_h);
+}
+
+/* the reverse — a pixel offset from grid centre -> position along each of the
+ * three line-sets (flat, up-right, up-left), counted in row-heights. */
+static void screen_to_tristripe(const GridCtx *g, double px, double py,
+                                double *n1, double *n2, double *n3)
+{
+    double h   = g->tri_size * sqrt(3.0) * 0.5;
+    double sq3 = sqrt(3.0);
+    *n1 =          py  / h;   /* flat lines     */
+    *n2 = ( sq3 * px + py) / h;   /* up-right lines */
+    *n3 = (-sq3 * px + py) / h;   /* up-left lines  */
+}
+
+/* how near a line a stripe value sits: 0 right on a line, 0.5 mid-triangle.
+ * (The +1 folds C's fmod, which can go negative, back into [0,1).) */
 static double edge_frac(double v)
 {
     double t = fmod(v, 1.0);
@@ -176,48 +153,39 @@ static double edge_frac(double v)
     return t < 0.5 ? t : 1.0 - t;
 }
 
-/*
- * Draws the whole triangle grid and shades the triangle the cursor sits on.
- *
- * The idea: for each screen cell, measure its distance to the nearest line in
- * each of the three line-sets (flat, up-right, up-left). Whichever set is
- * closest wins and decides the edge character ('-', '/', or '\', leaning the
- * same way the real line does). If the closest distance is small, we're near
- * an edge and draw it; otherwise we're inside a triangle and leave it blank —
- * unless it's the cursor's triangle, which gets a coloured fill.
- *
- * The cursor's own (si, sj) is passed in; this grid type doesn't store it.
- */
-static void ctx_draw_bg(const GridCtx *g, int cur_si, int cur_sj)
+/* the ASCII glyph for whichever line-set this cell is closest to: '-' flat,
+ * '/' up-right, '\' up-left. Returns the closest distance via *dmin. */
+static char edge_glyph(double n1, double n2, double n3, double *dmin)
 {
-    double h   = g->tri_size * sqrt(3.0) * 0.5;
-    double sq3 = sqrt(3.0);
+    double d1 = edge_frac(n1), d2 = edge_frac(n2), d3 = edge_frac(n3);
+    double d = d1;
+    char   ch = '-';
+    if (d2 < d) { d = d2; ch = '/';  }
+    if (d3 < d) { d = d3; ch = '\\'; }
+    *dmin = d;
+    return ch;
+}
 
+/* recipe step 2 — draw the grid: for every screen cell, find its stripes and
+ * how near a line it sits. Near a line -> an edge glyph; deep inside -> blank.
+ * The cursor's triangle is filled and its edges drawn in its own colour. */
+static void draw_lattice(const GridCtx *g, int cur_si, int cur_sj)
+{
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
             double px = (double)(col - g->ox) * g->cell_w;
             double py = (double)(row - g->oy) * g->cell_h;
 
-            /* position relative to each of the three line-sets */
-            double n1 = py / h;
-            double n2 = (sq3 * px + py) / h;
-            double n3 = (-sq3 * px + py) / h;
+            double n1, n2, n3;
+            screen_to_tristripe(g, px, py, &n1, &n2, &n3);
 
-            /* which triangle is this cell in? two of the three numbers,
-             * rounded down, name it uniquely */
-            int cell_si = (int)floor(n1);
-            int cell_sj = (int)floor(n2);
-            int on_cur  = (cell_si == cur_si && cell_sj == cur_sj);
+            /* two stripes floored name the triangle uniquely */
+            int si = (int)floor(n1);
+            int sj = (int)floor(n2);
+            int on_cur = (si == cur_si && sj == cur_sj);
 
-            double d1 = edge_frac(n1);
-            double d2 = edge_frac(n2);
-            double d3 = edge_frac(n3);
-
-            /* keep the closest line; its character leans the matching way */
-            double dmin = d1;
-            char   ch   = '-';
-            if (d2 < dmin) { dmin = d2; ch = '/';  }
-            if (d3 < dmin) { dmin = d3; ch = '\\'; }
+            double dmin;
+            char ch = edge_glyph(n1, n2, n3, &dmin);
 
             if (dmin < g->border_w) {
                 int attr = on_cur ? (COLOR_PAIR(PAIR_CURSOR) | A_BOLD)
@@ -226,7 +194,6 @@ static void ctx_draw_bg(const GridCtx *g, int cur_si, int cur_sj)
                 mvaddch(row, col, (chtype)(unsigned char)ch);
                 attroff(attr);
             } else if (on_cur) {
-                /* inside the cursor's triangle: paint the highlight */
                 attron(COLOR_PAIR(PAIR_CURSOR));
                 mvaddch(row, col, ' ');
                 attroff(COLOR_PAIR(PAIR_CURSOR));
@@ -237,39 +204,19 @@ static void ctx_draw_bg(const GridCtx *g, int cur_si, int cur_sj)
 
 /* ── §5 cursor ── */
 
-/*
- * Cursor — where the user is pointing, as the two stripe numbers (si, sj)
- * that name one triangle.
- *
- * si: which row of triangles (counts down the screen).
- * sj: which diagonal stripe along that row.
- *
- * It deliberately knows nothing about grid size — the limits live in GridCtx.
- * Hand both to ctx_to_screen() to turn (si, sj) into a screen position.
- */
+/* Cursor — which triangle is selected, named by its stripe numbers (si, sj):
+ * si counts rows down the screen, sj the diagonal step along that row. Its own
+ * scheme — not the hex (q,r). Pair with a GridCtx to find it on screen. */
 typedef struct { int si, sj; } Cursor;
 
-/*
- * TRI_DIR — the four arrow-key moves, written as changes to (si, sj).
- *
- *           UP: si-1
- *              ^
- *   LEFT: sj-1 < @ > RIGHT: sj+1
- *              v
- *          DOWN: si+1
- *
- * Up/down step to the next row of triangles (crossing a flat edge); left/right
- * step along the diagonal (crossing a slanted edge). Either way you land on a
- * triangle that shares an edge with the one you left — never a diagonal jump.
- *
- * Note: this is its own counting scheme, unrelated to the (Q,R) scheme hex
- * grids use, so don't reach for the hex movement table here.
- */
+/* what each arrow key adds to (si,sj) to step onto an edge-sharing neighbour.
+ * up/down cross a flat edge to the next row; left/right cross a slanted edge
+ * along the diagonal — never a diagonal jump. */
 static const int TRI_DIR[4][2] = {
-    {-1,  0 },   /* UP */
-    {+1,  0 },   /* DOWN */
-    { 0, -1 },   /* LEFT */
-    { 0, +1 },   /* RIGHT */
+    {-1,  0 },   /* up    */
+    {+1,  0 },   /* down  */
+    { 0, -1 },   /* left  */
+    { 0, +1 },   /* right */
 };
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
@@ -279,7 +226,7 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->sj = 0;
 }
 
-/* Nudges the cursor by one step, refusing to wander past the grid limits. */
+/* recipe step 3 — move the cursor by one triangle, clamped to grid limits */
 static void cursor_move(Cursor *cur, const GridCtx *g, int dsi, int dsj)
 {
     int nsi = cur->si + dsi;
@@ -288,12 +235,11 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dsi, int dsj)
     if (nsj >= -g->max_sj && nsj <= g->max_sj) cur->sj = nsj;
 }
 
-/* Drops a bold '@' on the cursor's triangle, but only if it's actually
- * on screen. */
+/* drop the '@' on the selected triangle; called after the grid so it lands on top */
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc;
-    ctx_to_screen(g, cur->si, cur->sj, &sr, &sc);
+    tri_to_screen(g, cur->si, cur->sj, &sr, &sc);
     if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
         attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
         mvaddch(sr, sc, '@');
@@ -303,8 +249,6 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
 
 /* ── §6 scene ── */
 
-/* Draws the two text overlays: a status line top-right and the key reminders
- * along the bottom. */
 static void hud_draw(const GridCtx *g, const Cursor *cur,
                      int theme, int paused, double fps)
 {
@@ -327,7 +271,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur,
                        int theme, int paused, double fps)
 {
     erase();
-    ctx_draw_bg(g, cur->si, cur->sj);
+    draw_lattice(g, cur->si, cur->sj);
     cursor_draw(cur, g);
     hud_draw(g, cur, theme, paused, fps);
     wnoutrefresh(stdscr);

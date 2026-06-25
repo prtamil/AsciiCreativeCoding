@@ -2,40 +2,16 @@
 /*
  * 06_hex_subdivision.c — flat-top hexagons, each sliced into 6 triangles.
  *
- * Draws a grid of hexagons and cuts each one into 6 pie-slice triangles by
- * running three lines through its centre. Arrow keys move a cursor from hex
- * to hex; ',' and '.' spin the cursor around the 6 slices of its hex.
+ * THE RECIPE: no grid is stored. Per screen cell, screen_to_hex maps the pixel
+ * back to its hexagon (Q,R) and how far out it sits (dist); slice_of takes the
+ * offset from the hex centre and bins its angle into one of six 60° wedges.
+ * draw_lattice paints the hex outline (dist near the rim) or, inside, whichever
+ * of the three centre lines is nearest (nearest_radius) — those three lines are
+ * what cut each hex into 6 pie-slice triangles, the idea distinct to this file.
  *
- * Sister files: grids/hex_grids/01_flat_top.c (the plain hex grid this builds
- *   on) and 04_30_60_90.c (the same "slice each tile up" idea, but on
- *   triangles instead of hexagons).
- * Background: Red Blob Games hex guide — https://www.redblobgames.com/grids/hexagons/
- */
-
-/* ── how it works ──
- *
- * There is no grid stored in memory. For every character cell on screen we
- * work out, from its position alone, which hexagon it falls in and which of
- * that hex's 6 slices it falls in. Two bits of math do the whole job:
- *
- *   - Which hex?  A hexagon's corners are the same distance from its centre
- *     as its edges are long, so the three lines joining opposite corners cut
- *     it into 6 identical triangles, like slices of a pie. To find the hex,
- *     we use the standard flat-top hex lookup from hex_grids/01 (round the
- *     cell's position to the nearest hex).
- *
- *   - Which slice?  Take the cell's offset from the hex centre and ask which
- *     way it points (the angle, measured counter-clockwise from due east).
- *     Sort that angle into one of six 60-degree wedges — that's the slice.
- *
- * Drawing each cell: if it's near the hex's outline, paint a border character
- * angled to follow the edge. If it's near one of the three centre lines,
- * paint that line. Otherwise leave it blank (unless it's the cursor's slice,
- * which gets a faint dot so you can still see which slice is selected).
- *
- * One thing to watch: the slice test only runs for inside-the-hex cells. If
- * we let the centre lines run on past the outline, they'd leak into the
- * neighbouring hexagons' borders.
+ * Sister: tri_grids/01_equilateral.c (same per-cell screen->grid->glyph trick);
+ *   hex_grids/01_flat_top.c (the plain hex lookup this reuses).
+ * Refs: Red Blob Games hex guide — https://www.redblobgames.com/grids/hexagons/
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -136,36 +112,19 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula — find the hex and slice for any point ── */
+/* ── §4 hex mapping & lattice ── */
 
-/*
- * GridCtx — everything we need to know to lay the hex grid out on screen.
- *
- * Bundled together so any drawing routine can be handed one struct and work
- * out where every hexagon goes. The grid is recentred (and these numbers
- * recomputed) on startup, resize, and whenever the size is changed.
- */
+/* GridCtx — the hex grid for one frame. Centred on screen, recomputed on
+ * startup/resize/size-change. hex_size/border_w live here (not as constants)
+ * because +/- and [/] tune them live. The plane is infinite, so max_q/r are a
+ * rough on-screen reach, not hard limits. */
 typedef struct {
-    /* Terminal size, in character cells. */
-    int rows, cols;
-
-    /* hex_size: how big one hexagon is, in pixels (centre to corner).
-     * border_w: how thick the hex outline is, as a fraction (0..0.5) — bigger
-     *   means a chunkier border.
-     * cw, ch: how many pixels one character cell is worth across and down,
-     *   so wide-looking cells still produce round-looking hexes. */
-    double hex_size;
-    double border_w;
-    int    cw, ch;
-
-    /* Where pixel (0,0) lands on screen — the grid's anchor point, kept in
-     * the middle so the layout stays centred. */
-    int    ox, oy;
-
-    /* Rough hint for how far the cursor can roam and still be on screen. The
-     * hex plane is endless, so these aren't hard limits — just the largest
-     * hex coordinates whose centre still fits at the current size. */
-    int    max_q, max_r;
+    int    rows, cols;       /* terminal size in cells */
+    double hex_size;         /* hex centre-to-corner, sub-pixels */
+    double border_w;         /* outline thickness, as a fraction 0..0.5 */
+    int    cw, ch;           /* sub-pixels per cell (CELL_W, CELL_H) */
+    int    ox, oy;           /* where pixel (0,0) lands — the centred anchor */
+    int    max_q, max_r;     /* rough on-screen reach, not a hard boundary */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols)
@@ -182,10 +141,8 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->max_r = (int)((double)rows * CELL_H / (sqrt(3.0) * g->hex_size)) + 1;
 }
 
-/* Picks the ASCII character ( - \ | / ) that best matches the slope of a
- * line pointing in the given direction. Copied from hex_grids/01_flat_top.c.
- * A line looks the same flipped 180 degrees, so opposite angles share a
- * character. */
+/* ASCII char ( - \ | / ) matching the slope of a line at angle theta. A line
+ * looks the same flipped 180°, so opposite angles share a char. */
 static char angle_char(double theta)
 {
     double t = fmod(theta, M_PI);
@@ -197,11 +154,9 @@ static char angle_char(double theta)
     else                              return '-';
 }
 
-/* Which of the 6 pie slices does this offset point into? Takes how far a
- * point sits to the right (dx) and below (dy) the hex centre and returns a
- * slice number 0..5. Slice 0 faces right; the rest follow counter-clockwise,
- * each spanning 60 degrees. */
-static int sector_of(double dx, double dy)
+/* the slice idea, distinct to this file — bin the offset's angle into one of
+ * six 60° wedges. Slice 0 faces right (east); the rest go counter-clockwise. */
+static int slice_of(double dx, double dy)
 {
     double ang = atan2(dy, dx);
     int s = (int)floor((ang + M_PI / 6.0) / (M_PI / 3.0));
@@ -209,14 +164,11 @@ static int sector_of(double dx, double dy)
     return s;
 }
 
-/* Given a pixel, find which hexagon it lands in. Returns that hex's
- * coordinates (Q, R) plus dist: how far out toward the hex's edge the pixel
- * is, where small means near the centre and ~0.5 means near the outline.
- * This is the standard flat-top hex lookup from hex_grids/01 — snap the
- * pixel to the nearest of the three hex axes, then nudge the result so the
- * coordinates stay consistent. */
-static void ctx_pixel_to_hex(const GridCtx *g, double px, double py,
-                             int *Q, int *R, double *dist)
+/* recipe step 1 (reverse) — a pixel -> which hexagon (Q,R) it lands in, plus
+ * dist: how far out toward the rim (~0 centre, ~0.5 outline). Standard flat-top
+ * hex lookup: snap to the nearest of the three axes, then fix up coordinates. */
+static void screen_to_hex(const GridCtx *g, double px, double py,
+                          int *Q, int *R, double *dist)
 {
     double sq3   = sqrt(3.0);
     double sq3_3 = sq3 / 3.0;
@@ -241,8 +193,7 @@ static void ctx_pixel_to_hex(const GridCtx *g, double px, double py,
     *dist = d;
 }
 
-/* The reverse of the lookup above: given a hexagon's coordinates (Q, R),
- * work out the pixel where its centre sits. */
+/* the pixel where a hexagon's centre sits (forward: hex -> point) */
 static void hex_centre_pixel(int Q, int R, double size,
                               double *cx, double *cy)
 {
@@ -251,15 +202,14 @@ static void hex_centre_pixel(int Q, int R, double size,
     *cy = size * (sq3*0.5 * (double)Q + sq3 * (double)R);
 }
 
-/* Finds the character cell sitting at the middle of one pie slice, so we can
- * drop the cursor marker there. The middle of a slice is partway out from
- * the hex centre toward the slice's outer edge. */
-static void ctx_to_screen(const GridCtx *g, int Q, int R, int sector,
+/* the terminal cell at a slice's middle — partway out from the hex centre
+ * toward the slice's outer edge, so '@' lands inside the slice. */
+static void hex_to_screen(const GridCtx *g, int Q, int R, int slice,
                           int *sr, int *sc)
 {
     double cx_pix, cy_pix;
     hex_centre_pixel(Q, R, g->hex_size, &cx_pix, &cy_pix);
-    double ang = (double)sector * M_PI / 3.0;
+    double ang = (double)slice * M_PI / 3.0;
     double r   = g->hex_size * sqrt(3.0) / 3.0;
     double mx  = cx_pix + r * cos(ang);
     double my  = cy_pix + r * sin(ang);
@@ -267,13 +217,27 @@ static void ctx_to_screen(const GridCtx *g, int Q, int R, int sector,
     *sr = g->oy + (int)(my / g->ch);
 }
 
-/* Draws the whole grid by walking every character cell and deciding what,
- * if anything, belongs there: a hex outline, one of the three centre lines,
- * or nothing. The cursor's slice is drawn in a highlight colour. */
-static void ctx_draw_bg(const GridCtx *g, int cQ, int cR, int cSector)
+/* the subdivision math, distinct to this file — the three lines through the
+ * hex centre that cut it into 6 slices. Returns the distance to the nearest of
+ * them (in out_min) and its glyph, so a small out_min means "on a centre line". */
+static char nearest_radius(double dx, double dy, double *out_min)
 {
-    double sq3   = sqrt(3.0);
-    double sq3_2 = sq3 * 0.5;
+    double sq3_2 = sqrt(3.0) * 0.5;
+    double r0 = fabs(dy);                       /* horizontal line */
+    double r1 = fabs(0.5 * dy - sq3_2 * dx);    /* / line */
+    double r2 = fabs(0.5 * dy + sq3_2 * dx);    /* \ line */
+    char rch = '-'; double rmin = r0;
+    if (r1 < rmin) { rmin = r1; rch = '/'; }
+    if (r2 < rmin) { rmin = r2; rch = '\\'; }
+    *out_min = rmin;
+    return rch;
+}
+
+/* recipe step 2 — draw the grid: every cell -> its hex and slice -> a glyph.
+ * Near the rim, a hex outline; inside, the nearest centre line (or nothing).
+ * A blank cursor slice still gets a faint dot so the selection stays visible. */
+static void draw_lattice(const GridCtx *g, int cQ, int cR, int cSlice)
+{
     double limit_inner = 0.5 - g->border_w;
     double radius_t    = g->hex_size * RADIUS_T_FRAC * 0.5;
 
@@ -284,20 +248,18 @@ static void ctx_draw_bg(const GridCtx *g, int cQ, int cR, int cSector)
 
             int Q, R;
             double dist;
-            ctx_pixel_to_hex(g, px, py, &Q, &R, &dist);
+            screen_to_hex(g, px, py, &Q, &R, &dist);
 
             double cx, cy;
             hex_centre_pixel(Q, R, g->hex_size, &cx, &cy);
             double dxp = px - cx, dyp = py - cy;
 
-            int on_cur_hex = (Q == cQ && R == cR);
-            int sector     = sector_of(dxp, dyp);
-            int on_cur_sec = (on_cur_hex && sector == cSector);
+            int slice      = slice_of(dxp, dyp);
+            int on_cur_sec = (Q == cQ && R == cR && slice == cSlice);
 
-            /* Near the hex's outline: draw an edge piece. */
+            /* near the rim: an outline piece, angled to follow the edge */
             if (dist >= limit_inner) {
-                double theta = atan2(dyp, dxp);
-                char ch = angle_char(theta + M_PI / 2.0);
+                char ch = angle_char(atan2(dyp, dxp) + M_PI / 2.0);
                 int attr = on_cur_sec ? (COLOR_PAIR(PAIR_CURSOR) | A_BOLD)
                                        : (COLOR_PAIR(PAIR_BORDER) | A_BOLD);
                 attron(attr);
@@ -306,14 +268,9 @@ static void ctx_draw_bg(const GridCtx *g, int cQ, int cR, int cSector)
                 continue;
             }
 
-            /* Inside the hex: how close are we to each of the three centre
-             * lines? Keep the nearest one; if it's close enough, draw it. */
-            double r0 = fabs(dyp);
-            double r1 = fabs(0.5 * dyp - sq3_2 * dxp);
-            double r2 = fabs(0.5 * dyp + sq3_2 * dxp);
-            char rch = '-'; double rmin = r0;
-            if (r1 < rmin) { rmin = r1; rch = '/'; }
-            if (r2 < rmin) { rmin = r2; rch = '\\'; }
+            /* inside: draw the nearest centre line if we're close enough */
+            double rmin;
+            char rch = nearest_radius(dxp, dyp, &rmin);
             if (rmin < radius_t) {
                 int attr = on_cur_sec ? (COLOR_PAIR(PAIR_CURSOR) | A_BOLD)
                                        : COLOR_PAIR(PAIR_RADIUS);
@@ -323,8 +280,6 @@ static void ctx_draw_bg(const GridCtx *g, int cQ, int cR, int cSector)
                 continue;
             }
 
-            /* Blank cell, but it's in the cursor's slice — leave a faint dot
-             * so the selected slice is still visible when it has no lines. */
             if (on_cur_sec) {
                 attron(COLOR_PAIR(PAIR_CURSOR));
                 mvaddch(row, col, '.');
@@ -336,16 +291,11 @@ static void ctx_draw_bg(const GridCtx *g, int cQ, int cR, int cSector)
 
 /* ── §5 cursor ── */
 
-/*
- * Cursor — where the user's selection sits: which hexagon (q, r) and which
- * of its 6 slices (sector, 0..5).
- *
- * It holds nothing about screen size or hex size — that lives in GridCtx.
- * Hand both to ctx_to_screen() to turn a selection into a screen position.
- */
+/* Cursor — the selection: which hexagon (q,r) and which of its 6 slices
+ * (sector, 0..5). Pair with a GridCtx and run through hex_to_screen. */
 typedef struct { int q, r, sector; } Cursor;
 
-/* The four arrow-key moves, as steps in hex coordinates (up/down/left/right). */
+/* arrow-key moves as steps in hex coordinates */
 static const int HEX_DIR[4][2] = {
     { 0, -1 },   /* UP    */
     { 0, +1 },   /* DOWN  */
@@ -361,8 +311,7 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->sector = 0;
 }
 
-/* Steps the cursor one hex in an arrow direction. No edge to bump into — the
- * grid is endless, so the cursor can wander off screen if pushed far enough. */
+/* recipe step 3 — step the cursor one hex. No clamp; the plane is infinite. */
 static void cursor_move(Cursor *cur, const GridCtx *g, int idx)
 {
     (void)g;
@@ -370,16 +319,18 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int idx)
     cur->r += HEX_DIR[idx][1];
 }
 
+/* spin the selection around the 6 slices of the current hex */
 static void cursor_rotate(Cursor *cur, const GridCtx *g, int delta)
 {
     (void)g;
     cur->sector = (cur->sector + delta + 6) % 6;
 }
 
+/* put '@' in the cursor's slice; after the grid so it lands on top */
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc;
-    ctx_to_screen(g, cur->q, cur->r, cur->sector, &sr, &sc);
+    hex_to_screen(g, cur->q, cur->r, cur->sector, &sr, &sc);
     if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
         attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
         mvaddch(sr, sc, '@');
@@ -411,7 +362,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, int theme,
                        int paused, double fps)
 {
     erase();
-    ctx_draw_bg(g, cur->q, cur->r, cur->sector);
+    draw_lattice(g, cur->q, cur->r, cur->sector);
     cursor_draw(cur, g);
     hud_draw(g, cur, theme, paused, fps);
     wnoutrefresh(stdscr);

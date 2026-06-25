@@ -2,39 +2,12 @@
 /*
  * 09_isometric.c — a tilted grid drawn the way 2D games like SimCity do it.
  *
- * We place square cells on screen so they look like flat, wide diamonds seen
- * from an angle. Arrow keys walk a cursor one cell at a time along the grid's
- * own axes. The math is the same as 08_diamond.c — only the cell shape differs.
+ * Cells are wide flat diamonds seen at an angle. The projection spreads a
+ * cell-step sideways and marches it down; the lattice reverses it with two
+ * modulo line-tests. Arrow keys walk the cursor one cell along the grid axes.
  *
- * Study alongside: 08_diamond.c (same idea, square 45° cells).
+ * Sister files: 08_diamond.c (same math, square 45° cells), 01_uniform_rect.c.
  * Reference: en.wikipedia.org/wiki/Isometric_projection
- */
-
-/*
- * THE BIG PICTURE
- *
- * Each grid cell sits at whole-number coordinates (r, c). To draw it we turn
- * those into a screen spot:
- *     column = origin_col + (c - r) * IW
- *     row    = origin_row + (c + r) * IH
- * IW and IH are how far one cell-step stretches sideways and downward. Make a
- * cell wide and shallow (IW big, IH small) and it looks tilted, like a game's
- * floor tile. Make them equal-ish and it looks like a square diamond.
- *
- * Here IW=8, IH=2, so cells are 16 chars wide and 4 rows tall — the classic
- * 2:1 game-isometric look (about a 26.6° tilt once you account for terminal
- * chars being taller than they are wide).
- *
- * Drawing the lines: for every screen spot we run the formula backwards to
- * ask "does a grid line pass through here?" Two checks — one for the lines
- * heading one way ('/'), one for the other way ('\'). Where both lines cross
- * we draw a corner '+'. With these proportions the two line families land in
- * different spots, so you actually see the '/' and '\' strokes, not just dots.
- *
- * Moving the cursor: arrow keys change one grid coordinate at a time (like a
- * normal grid), not one screen direction. A move only happens if it keeps the
- * cursor inside the allowed range — both r and c must stay in bounds or
- * neither moves.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -51,29 +24,17 @@
 
 #define TARGET_FPS  30
 
-/*
- * IW, IH set the cell shape: how far one cell-step moves sideways and down.
- * The cell ends up 2*IW=16 chars wide and 2*IH=4 rows tall — the wide, flat
- * look of game isometric tiles. Want a different tilt? Shrink IW to stand the
- * cells up, or shrink IH to flatten them. IW=4, IH=2 gives the square 45°
- * diamond from 08_diamond.
- */
+/* IW, IH set the cell shape: how far one cell-step moves sideways and down.
+ * Cell ends up 2*IW=16 wide, 2*IH=4 tall — the flat 2:1 game-isometric look.
+ * IW=4, IH=2 gives the square 45° diamond of 08_diamond. */
 #define IW     8   /* half-cell width  — cell is 2*IW=16 chars wide */
 #define IH     2   /* half-cell height — cell is 2*IH= 4 rows  tall */
 
-/* The number the line-finding math wraps around; just 2*IW*IH worked out. */
-#define MODULUS  (2 * IW * IH)   /* = 32 */
+#define MODULUS  (2 * IW * IH)   /* line-test wrap-around = 2*IW*IH = 32 */
 
-/*
- * How many cells the cursor may roam from the centre, each direction. At the
- * far diagonal corner that's about 2*RANGE*IW = 64 chars off-centre, fine on a
- * wide terminal. If it ever lands off-screen the '@' draw simply skips it, so
- * a narrow terminal won't crash — it just won't show the cursor out there.
- */
-#define RANGE  4   /* cursor stays within -RANGE .. +RANGE on each axis */
+#define RANGE  4   /* cursor stays within -RANGE..+RANGE on each axis */
 
-/* How much to smooth the FPS number so it doesn't jitter every frame. */
-#define FPS_EWMA_ALPHA  0.05
+#define FPS_EWMA_ALPHA  0.05   /* small = steadier on-screen fps number */
 
 #define PAIR_GRID    1
 #define PAIR_ACTIVE  2
@@ -108,21 +69,15 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula — turning a cell (r,c) into a screen spot, and back ── */
+/* ── §4 iso mapping & lattice ── */
 
-/*
- * GridCtx — everything we need to know to place this grid on the screen.
- * Filled once at startup (and again on resize), then read-only while drawing.
- */
+/* GridCtx — the grid for one frame: terminal size, half-cell size, where cell
+ * (0,0) lands, and how far the cursor may roam. */
 typedef struct {
-    int rows, cols;     /* size of the terminal, in chars */
-    int cw, ch;         /* half-cell width and height (IW, IH copied here) */
-    int ox, oy;         /* where cell (0,0) lands — the grid's centre point */
-
-    /* How far the cursor may wander from the centre. range is the limit per
-     * axis; max_r / max_c are the same value kept for clarity at call sites. */
-    int range;
-    int max_r, max_c;
+    int rows, cols;      /* terminal size in characters */
+    int cw, ch;          /* half-cell width and height (IW, IH) */
+    int ox, oy;          /* screen spot of cell (0,0) — the grid centre */
+    int max_r, max_c;    /* furthest cell the cursor can reach from centre */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols)
@@ -131,31 +86,25 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->cw = IW;     g->ch = IH;
     g->ox = cols / 2;
     g->oy = (rows - 1) / 2;
-    g->range = RANGE;
     g->max_r = RANGE;
     g->max_c = RANGE;
 }
 
-/* Where does cell (r,c) land on screen? This is the whole projection.
- *   col = ox + (c - r) * IW,   row = oy + (c + r) * IH */
-static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
+/* recipe step 1 — cell (r,c) -> its centre-top spot on screen. The whole
+ * projection: col spreads with (c-r), row marches down with (c+r). */
+static void cell_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
     *sc = g->ox + (c - r) * g->cw;
     *sr = g->oy + (c + r) * g->ch;
 }
 
-/* C's % can return negative; this always lands in 0..b-1 so the line checks
- * still fire in the upper-left quadrant where u and v go negative. */
+/* C's % can return negative; this lands in 0..b-1 so the line checks still fire
+ * in the upper-left quadrant where u and v go negative. */
 static int safe_mod(int a, int b) { return ((a % b) + b) % b; }
 
-/*
- * Which grid mark belongs at screen spot (sr,sc)? We run the projection
- * backwards: one test says "a '/' line passes here", the other "a '\' line
- * passes here". Both true means a corner '+'; one true means that single
- * stroke; neither means blank. With IW=8, IH=2 the two families fall in
- * different spots, so you see the strokes, not just the corners.
- */
-static char ctx_grid_char(const GridCtx *g, int sr, int sc)
+/* which glyph belongs at a screen spot: run the projection backwards into two
+ * line families. '/' line and '\' line crossing -> '+', else one stroke. */
+static char grid_glyph_at(const GridCtx *g, int sr, int sc)
 {
     int u = sc - g->ox;
     int v = sr - g->oy;
@@ -167,13 +116,9 @@ static char ctx_grid_char(const GridCtx *g, int sr, int sc)
     return ' ';
 }
 
-/*
- * Does screen spot (sr,sc) fall inside the diamond of cell (pr,pc)?
- * Running the projection backwards gives a scaled-up (r,c) for the spot; if
- * both land in this cell's slice of that range, the spot is inside. Each cell
- * owns its far edge but not its near edge, so neighbours don't fight over the
- * shared grid line.
- */
+/* does screen spot (sr,sc) fall inside cell (pr,pc)'s diamond? Reverse the
+ * projection to a scaled (r,c); each cell owns its far edge but not its near
+ * edge, so neighbours don't fight over the shared grid line. */
 static bool in_cursor_cell(const GridCtx *g, int sr, int sc, int pr, int pc)
 {
     int u = sc - g->ox, v = sr - g->oy;
@@ -183,14 +128,13 @@ static bool in_cursor_cell(const GridCtx *g, int sr, int sc, int pr, int pc)
             rn > pr * MODULUS && rn <= (pr + 1) * MODULUS);
 }
 
-/* Draw the grid: visit every screen spot, ask what mark goes there, and stamp
- * it. We skip blanks so we don't paint over the background. */
-static void ctx_draw_bg(const GridCtx *g)
+/* recipe step 2 — draw the grid by asking grid_glyph_at at every screen spot */
+static void draw_lattice(const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_GRID));
     for (int sr = 0; sr < g->rows - 1; sr++)
         for (int sc = 0; sc < g->cols; sc++) {
-            char ch = ctx_grid_char(g, sr, sc);
+            char ch = grid_glyph_at(g, sr, sc);
             if (ch != ' ')
                 mvaddch(sr, sc, (chtype)(unsigned char)ch);
         }
@@ -199,7 +143,7 @@ static void ctx_draw_bg(const GridCtx *g)
 
 /* ── §5 cursor ── */
 
-/* The highlighted cell the user is standing on, in grid coordinates. */
+/* Cursor — which cell the user is in, in grid coordinates from centre (0,0). */
 typedef struct { int r, c; } Cursor;
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
@@ -208,25 +152,22 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->r = 0; cur->c = 0;
 }
 
-/* Step the cursor one cell along a grid axis. The move only counts if it keeps
- * the cursor in range — both r and c must stay valid, or nothing moves. */
+/* recipe step 3 — step one cell along a grid axis, clamped: r and c must both
+ * stay in range or nothing moves. */
 static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
 {
     int nr = cur->r + dr, nc = cur->c + dc;
-    if (nr >= -g->range && nr <= g->range && nc >= -g->range && nc <= g->range) {
+    if (nr >= -g->max_r && nr <= g->max_r && nc >= -g->max_c && nc <= g->max_c) {
         cur->r = nr;
         cur->c = nc;
     }
 }
 
-/*
- * Show where the cursor is: dot-fill the highlighted cell, then drop an '@' in
- * the middle. We scan a small box around the cell and dot every empty spot that
- * tests as inside it, so the fill follows the diamond shape exactly.
- */
+/* highlight the cursor's cell: dot every spot that tests inside the diamond,
+ * then drop '@' in the middle. */
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
-    int csr, csc; ctx_to_screen(g, cur->r, cur->c, &csr, &csc);
+    int csr, csc; cell_to_screen(g, cur->r, cur->c, &csr, &csc);
     int span_r = g->ch * 2 + 1;   /* tall enough to cover the 4-row cell */
     int span_c = g->cw * 2;       /* wide enough to cover the 16-col cell */
 
@@ -236,15 +177,14 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
             int sr = csr + dr, sc = csc + dc;
             if (sr < 0 || sr >= g->rows - 1 || sc < 0 || sc >= g->cols) continue;
             if (!in_cursor_cell(g, sr, sc, cur->r, cur->c)) continue;
-            if (ctx_grid_char(g, sr, sc) == ' ')
+            if (grid_glyph_at(g, sr, sc) == ' ')
                 mvaddch(sr, sc, (chtype)'.');
         }
     }
     attroff(COLOR_PAIR(PAIR_ACTIVE));
 
-    /* Place '@' at the cell's middle. We check the middle (not the top corner)
-     * against the screen edges, so the marker still shows when the corner has
-     * scrolled off the top. */
+    /* '@' at the cell middle — tested against the edges (not the top corner) so
+     * it still shows when the corner has scrolled off the top. */
     int centre_sc = g->ox + (cur->c - cur->r) * g->cw;
     int centre_sr = g->oy + (cur->c + cur->r + 1) * g->ch;
     if (centre_sr >= 0 && centre_sr < g->rows - 1 &&
@@ -275,7 +215,7 @@ static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
 static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_lattice(g);
     cursor_draw(cur, g);
     hud_draw(g, cur, fps);
     wnoutrefresh(stdscr); doupdate();

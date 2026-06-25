@@ -122,39 +122,27 @@ static void color_init(int theme)
     init_pair(PAIR_HYPER,  hfg,                                -1);
 }
 
-/* ── §4 formula ── */
+/* ── §4 elliptic mapping & lattice ── */
 
-/*
- * GridCtx — everything we need to know to draw the grid and to know where the
- * @ marker can go.
- *
- * The stretch factors and the ring gap live here as fields (not constants) on
- * purpose: when you press a key to stretch or space out the rings, we just edit
- * this struct and the very next frame draws the new shape.
- *
- *   rows, cols       size of the terminal, in characters
- *   cell_w, cell_h   how many pixels wide/tall one character cell counts as
- *   ox, oy           the centre of the grid (in cell coordinates)
- *   axis_a           sideways stretch; bigger = wider ellipses
- *   axis_b           up/down stretch; bigger = taller ellipses
- *   ring_spacing     gap from one ring to the next
- *   show_hyper       whether the 'h' overlay is on
- *   n_spokes         how many evenly spaced stops the @ marker has going around
- *   max_ring         outermost ring the marker can reach before it runs off-screen
- *   max_spoke        last marker stop going around (always n_spokes - 1)
- */
+/* GridCtx — the elliptic grid for one frame: like 01_rings_spokes' polar grid,
+ * but the rings are confocal ELLIPSES instead of circles. axis_a/axis_b stretch
+ * the radial coordinate before measuring distance, so a ring at constant elliptic
+ * radius traces an ellipse; the 'h' overlay adds the orthogonal hyperbolae. The
+ * grid is never stored — every cell decides its glyph from its elliptic radius
+ * and angle. Always centred on (ox, oy). */
 typedef struct {
-    int rows, cols;
-    int cell_w, cell_h;
-    int ox, oy;
+    int    rows, cols;       /* terminal size in character cells */
+    int    cell_w, cell_h;   /* pixels per cell (CELL_W / CELL_H) */
+    int    ox, oy;           /* grid centre, as a cell column and row */
 
-    double axis_a;
-    double axis_b;
-    double ring_spacing;
-    bool   show_hyper;
+    double axis_a;           /* sideways stretch; bigger = wider ellipses; a/z */
+    double axis_b;           /* up/down stretch; bigger = taller ellipses; s/x */
+    double ring_spacing;     /* gap from one ring to the next, in elliptic radius */
+    bool   show_hyper;       /* 'h' overlay: draw the orthogonal hyperbolae */
 
-    int    n_spokes;
-    int    max_ring, max_spoke;
+    int    n_spokes;         /* evenly spaced marker stops going around */
+    int    max_ring;         /* outermost ring whose marker cell stays on screen */
+    int    max_spoke;        /* n_spokes - 1; the spoke index wraps past it */
 } GridCtx;
 
 /* Recompute centre and how many rings fit, given the current terminal size.
@@ -187,24 +175,37 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->max_spoke = g->n_spokes - 1;
 }
 
-/* Turn a (which ring, which way around) pair into an actual screen cell.
- * We aim for the middle of the ring's band, not its edge, so the @ sits
- * comfortably between two rings rather than on a line. */
-static void ctx_to_screen(const GridCtx *g, int ring, int spoke,
-                          int *sr, int *sc)
+/* recipe step 1 — an (ring, spoke) cell -> the screen cell at its middle (half a
+ * ring out, half a wedge round), so the marker lands centred between two rings.
+ * The ellipse comes from scaling the radial step by axis_a across, axis_b down. */
+static void polar_to_screen(const GridCtx *g, int ring, int spoke,
+                            int *sr, int *sc)
 {
-    double theta_mid = ((double)spoke + 0.5) *
-                       (2.0 * M_PI / (double)g->n_spokes);
-    double u_mid     = ((double)ring + 0.5) * g->ring_spacing;
-    double cx = u_mid * g->axis_a * cos(theta_mid);
-    double cy = u_mid * g->axis_b * sin(theta_mid);
+    double mid_radius = ((double)ring + 0.5) * g->ring_spacing;
+    double theta_mid  = ((double)spoke + 0.5) * (2.0 * M_PI / (double)g->n_spokes);
+    double cx = mid_radius * g->axis_a * cos(theta_mid);
+    double cy = mid_radius * g->axis_b * sin(theta_mid);
     *sc = g->ox + (int)round(cx / (double)g->cell_w);
     *sr = g->oy + (int)round(cy / (double)g->cell_h);
 }
 
-/* Pick the ASCII character ( - \ | / ) that best looks like a line tilted
- * at this angle, so the rings read as smooth curves instead of dots. */
-static char angle_char(double theta)
+/* the reverse — a screen cell -> its ELLIPTIC radius and angle from the centre.
+ * Un-stretch the displacement by axis_a/axis_b first, so distance is measured in
+ * ellipse units: a constant r_ell traces an ellipse, not a circle. */
+static void screen_to_elliptic(const GridCtx *g, int col, int row,
+                               double *r_ell, double *theta)
+{
+    double dx = (double)(col - g->ox) * g->cell_w;
+    double dy = (double)(row - g->oy) * g->cell_h;
+    double u  = dx / g->axis_a;
+    double v  = dy / g->axis_b;
+    *r_ell = sqrt(u * u + v * v);
+    *theta = atan2(v, u);
+}
+
+/* the line char matching a direction: '-' horizontal, '|' vertical, '/' '\' the
+ * diagonals. A line and its 180° flip look the same, so we fold into a half-turn. */
+static char line_glyph(double theta)
 {
     double a = fmod(theta + 2.0*M_PI, M_PI);
     if (a < M_PI/8.0 || a >= 7.0*M_PI/8.0) return '-';
@@ -213,29 +214,25 @@ static char angle_char(double theta)
     return '/';
 }
 
-/* Draw the whole grid: walk every screen cell, ask "is this on a ring? on a
- * hyperbola?", and stamp a character if so. The trick that makes the rings
- * elliptical is dividing the distance from centre by the stretch factors
- * before measuring how far out we are. */
-static void ctx_draw_bg(const GridCtx *g)
+/* recipe step 2 — draw the grid: each cell knows it's on *some* elliptic ring
+ * from its elliptic radius, and (with 'h') on *some* hyperbola from its angle,
+ * with no loop over rings. Ring + hyperbola crossing -> '+', one of them -> a
+ * line char, neither -> blank. */
+static void draw_lattice(const GridCtx *g)
 {
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
-            double dx = (double)(col - g->ox) * g->cell_w;
-            double dy = (double)(row - g->oy) * g->cell_h;
-            double u  = dx / g->axis_a;
-            double v  = dy / g->axis_b;
-            double e_r       = sqrt(u*u + v*v);
+            double e_r, ell_theta;
+            screen_to_elliptic(g, col, row, &e_r, &ell_theta);
             if (e_r < E_R_MIN) continue;
-            double ell_theta = atan2(v, u);
 
             /* On a ring? Count how many ring-gaps out we are; if we're close
              * to a whole number we're sitting on a ring line. */
-            double u_ring = e_r / g->ring_spacing;
-            double frac   = u_ring - floor(u_ring);
-            bool on_ring  = (frac < RING_W_U || frac > 1.0 - RING_W_U);
+            double ring_phase = e_r / g->ring_spacing;
+            double frac       = ring_phase - floor(ring_phase);
+            bool on_ring      = (frac < RING_W_U || frac > 1.0 - RING_W_U);
 
-            /* On a hyperbola? Step the angle evenly and check the same way. */
+            /* On a hyperbola? Step |cos(angle)| evenly and check the same way. */
             bool on_hyper = false;
             if (g->show_hyper) {
                 double cv    = fabs(cos(ell_theta));
@@ -245,7 +242,7 @@ static void ctx_draw_bg(const GridCtx *g)
 
             if (!on_ring && !on_hyper) continue;
 
-            char c = angle_char(ell_theta);
+            char c = line_glyph(ell_theta);
             if (on_ring && on_hyper) {
                 attron(COLOR_PAIR(PAIR_HYPER));
                 mvaddch(row, col, (chtype)(unsigned char)'+');
@@ -265,12 +262,9 @@ static void ctx_draw_bg(const GridCtx *g)
 
 /* ── §5 cursor ── */
 
-/*
- * Cursor — where the @ marker sits, named by grid position rather than pixels.
- *   ring   how many rings out from the centre (0 = innermost)
- *   spoke  which way around, as one of the evenly spaced slots
- * Arrow keys just bump these two numbers; ctx_to_screen turns them into a cell.
- */
+/* Cursor — the grid cell the user points at: a ring (band out from the centre)
+ * and a spoke (wedge round). ring is 0..max_ring; spoke wraps, since an ellipse
+ * has no first or last wedge. */
 typedef struct { int ring, spoke; } Cursor;
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
@@ -279,6 +273,7 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->spoke = 0;
 }
 
+/* recipe step 3 — move the cursor: in/out clamps at the edge, round wraps */
 static void cursor_move(Cursor *cur, const GridCtx *g, int d_ring, int d_spoke)
 {
     int nr = cur->ring + d_ring;
@@ -292,10 +287,11 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int d_ring, int d_spoke)
     cur->spoke = ns;
 }
 
+/* draw the '@' on the cursor's cell; after the grid so it sits on top */
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc;
-    ctx_to_screen(g, cur->ring, cur->spoke, &sr, &sc);
+    polar_to_screen(g, cur->ring, cur->spoke, &sr, &sc);
     if (sr < 0 || sr >= g->rows - 1 || sc < 0 || sc >= g->cols) return;
     attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
     mvaddch(sr, sc, (chtype)'@');
@@ -330,7 +326,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, int theme,
                        double fps, bool paused)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_lattice(g);
     cursor_draw(cur, g);
     hud_draw(g, cur, theme, fps, paused);
     wnoutrefresh(stdscr);

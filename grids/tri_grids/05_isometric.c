@@ -1,19 +1,17 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 05_isometric.c — a triangle grid colored to look like a stack of cubes.
+ * 05_isometric.c — a triangle grid coloured to look like a stack of cubes.
  *
- * It's the same triangular tiling as 01_equilateral.c, but instead of
- * drawing the edges between triangles, we fill each triangle with one of
- * six colors. Picked the right way, the colors trick the eye into seeing
- * a wall of stacked 3-D cubes (the classic isometric look). Arrow keys
- * walk a cursor from triangle to triangle.
+ * THE RECIPE: same triangular tiling as 01_equilateral.c (screen_to_tri undoes
+ * the 60° slant to name the triangle a pixel falls in), but instead of drawing
+ * edges, draw_lattice fills each triangle with one of six colours. palette_index
+ * is the distinct math: the stripe number col+2*row+up cycles through 6 across
+ * the three line families, so the six triangles around each vertex read as the
+ * three faces of stacked cubes (the classic isometric look).
  *
- * Sister file: 01_equilateral.c — same grid and same cursor logic; that
- * one draws the edges, this one fills the cells with color.
- *
- * Why six triangles meet at a vertex and why that reads as cubes:
- *   Isometric projection — https://en.wikipedia.org/wiki/Isometric_projection
- *   Triangular tiling    — https://en.wikipedia.org/wiki/Triangular_tiling
+ * Sister: 01_equilateral.c — same grid and cursor; it draws edges, this fills.
+ * Refs: Isometric projection https://en.wikipedia.org/wiki/Isometric_projection
+ *       Triangular tiling    https://en.wikipedia.org/wiki/Triangular_tiling
  *
  * Keys: arrows move @   r reset   t theme   p pause   +/- size   q/ESC quit
  */
@@ -71,11 +69,7 @@ static void clock_sleep_ns(int64_t ns)
 
 /* ── §3 color ── */
 
-/*
- * Three color themes, six colors each. Press 't' to cycle them. We keep two
- * copies: rich 256-color values for modern terminals, and a plain 8-color
- * version as a fallback for old ones.
- */
+/* Three themes, six colours each (256-colour values + 8-colour fallback). */
 static const short PAL256[N_THEMES][N_PALETTE] = {
     /* warm  */ { 196, 214, 226, 118, 39, 129 },
     /* cool  */ {  21,  39,  82, 226, 207, 21  },
@@ -101,28 +95,18 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula — screen ↔ triangle, plus the cube-coloring trick ── */
+/* ── §4 tri mapping & lattice ── */
 
-/*
- * GridCtx — everything we need to know about the current grid layout.
- *
- * It answers two questions: how big are the triangles, and where on screen
- * does the grid sit. Given a screen cell, the helpers below use these
- * numbers to figure out which triangle that cell falls inside. Same idea as
- * 01_equilateral.c, but with no edge-width field since we only fill cells.
- */
+/* GridCtx — the triangle grid for one frame. Centred on screen, origin at the
+ * centre cell. No border_w field (sister 01_equilateral.c has one) because we
+ * fill cells instead of drawing edges. The plane is infinite, so max_col/row
+ * are a rough on-screen reach, not hard limits. */
 typedef struct {
-    /* Size of the terminal, in character cells. */
-    int rows, cols;
-
-    double tri_size;       /* triangle side length, measured in pixels       */
-    int    cw, ch;         /* how many pixels wide/tall one character cell is */
-
-    /* Where pixel (0,0) lands on screen — we center the grid here.          */
-    int    ox, oy;
-
-    /* Rough guess at how far the cursor can roam; just an advisory bound.    */
-    int    max_col, max_row;
+    int    rows, cols;       /* terminal size in cells */
+    double tri_size;         /* triangle side length, sub-pixels */
+    int    cw, ch;           /* sub-pixels per cell (CELL_W, CELL_H) */
+    int    ox, oy;           /* centre cell = grid origin (0,0) */
+    int    max_col, max_row; /* rough on-screen reach, not a hard boundary */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols)
@@ -138,9 +122,11 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->max_row = (int)((double)rows * CELL_H / (sqrt(3.0) * 0.5 * g->tri_size)) + 1;
 }
 
-static void ctx_pixel_to_tri(const GridCtx *g, double px, double py,
-                             int *col, int *row, int *up,
-                             double *fa, double *fb)
+/* recipe step 1 (reverse) — a pixel -> which triangle (col,row,up), plus where
+ * inside it (fa,fb). Undo the slant: a = px/size - b/2; fa+fb >= 1 = up. */
+static void screen_to_tri(const GridCtx *g, double px, double py,
+                          int *col, int *row, int *up,
+                          double *fa, double *fb)
 {
     double h = g->tri_size * sqrt(3.0) * 0.5;
     double b = py / h;
@@ -153,7 +139,7 @@ static void ctx_pixel_to_tri(const GridCtx *g, double px, double py,
     *up = (*fa + *fb >= 1.0) ? 1 : 0;
 }
 
-/* Finds the center point of a triangle, so we can mark it (same as 01). */
+/* the middle of a triangle, in pixels (forward: triangle -> point) */
 static void tri_centroid_pixel(int col, int row, int up, double size,
                                double *cx_pix, double *cy_pix)
 {
@@ -164,8 +150,9 @@ static void tri_centroid_pixel(int col, int row, int up, double size,
     *cy_pix = b * h;
 }
 
+/* the terminal cell at a triangle's middle (forward: triangle -> screen) */
 __attribute__((unused))
-static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
+static void tri_to_screen(const GridCtx *g, int col, int row, int up,
                           int *sr, int *sc)
 {
     double cx_pix, cy_pix;
@@ -174,12 +161,10 @@ static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
     *sr = g->oy + (int)(cy_pix / g->ch);
 }
 
-/*
- * Picks which of the six colors a triangle gets — this is the whole trick.
- * Six triangles meet at every grid corner, and this little formula hands
- * each of those six a different color. The result reads as the three faces
- * of stacked cubes (top, left, right), so the flat grid looks 3-D.
- */
+/* THE DISTINCT MATH — which of the six colours a triangle gets. The stripe
+ * number col + 2*row + up cycles through 6 as you cross the three line families
+ * meeting at a vertex, so the six triangles around each corner each get a
+ * different colour and read as the three faces of a stacked cube. */
 static int palette_index(int col, int row, int up)
 {
     int k = col + 2 * row + up;
@@ -188,12 +173,10 @@ static int palette_index(int col, int row, int up)
     return k;
 }
 
-/*
- * Paints the whole screen. For every cell we find its triangle, look up that
- * triangle's color, and fill the cell with it. The cursor's cell gets an '@'
- * in reverse video on top, so it stands out no matter what color it sits on.
- */
-static void ctx_draw_bg(const GridCtx *g, int cC, int cR, int cU)
+/* recipe step 2 — draw the grid: every cell -> its triangle -> a colour fill.
+ * The cursor's cell gets a reverse-video '@' on top of its own fill colour, so
+ * it stays legible whatever colour it sits on. */
+static void draw_lattice(const GridCtx *g, int cC, int cR, int cU)
 {
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
@@ -202,7 +185,7 @@ static void ctx_draw_bg(const GridCtx *g, int cC, int cR, int cU)
 
             int    tC, tR, tU;
             double fa, fb;
-            ctx_pixel_to_tri(g, px, py, &tC, &tR, &tU, &fa, &fb);
+            screen_to_tri(g, px, py, &tC, &tR, &tU, &fa, &fb);
 
             int p    = palette_index(tC, tR, tU);
             int pair = PAIR_FILL_BASE + p;
@@ -222,22 +205,14 @@ static void ctx_draw_bg(const GridCtx *g, int cC, int cR, int cU)
 
 /* ── §5 cursor ── */
 
-/*
- * Cursor — which triangle the '@' is sitting on. Same as 01_equilateral.c.
- *   col, row : which rhombus of the grid, like a square-grid x and y.
- *   up       : 0 for the lower triangle of that rhombus, 1 for the upper one.
- * There's no separate draw function — ctx_draw_bg paints the '@' as it goes,
- * which keeps it on the right background color.
- */
+/* Cursor — which triangle is selected: col/row pick the diamond, up its half
+ * (0 = down, 1 = up). No cursor_draw helper (sister 01 has one): draw_lattice
+ * paints the '@' as it goes, which keeps it on the right background colour. */
 typedef struct { int col, row, up; } Cursor;
 
-/*
- * Movement table, same as 01_equilateral.c. To move in a direction we need
- * to know which triangle we're on (the 'up' flag), because a left arrow from
- * an upper triangle lands somewhere different than from a lower one. Each row
- * is a direction; the two entries inside are the up=0 and up=1 cases; the
- * three numbers are how much col, row, and up change.
- */
+/* move table: [arrow][current half] -> (d_col, d_row, new_up). When an arrow has
+ * no edge to cross, the entry just flips to the other half of the same diamond.
+ * arrows: 0=LEFT 1=RIGHT 2=UP 3=DOWN; halves: 0=down, 1=up. */
 static const int TRI_DIR[4][2][3] = {
     /* LEFT  */ { { -1,  0,  1 }, {  0,  0,  0 } },
     /* RIGHT */ { {  0,  0,  1 }, { +1,  0,  0 } },
@@ -253,6 +228,7 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->up  = 0;
 }
 
+/* recipe step 3 — step the cursor one triangle. No clamp; the plane is infinite. */
 static void cursor_move(Cursor *cur, const GridCtx *g, int dir)
 {
     (void)g;
@@ -287,7 +263,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, int theme,
                        int paused, double fps)
 {
     erase();
-    ctx_draw_bg(g, cur->col, cur->row, cur->up);
+    draw_lattice(g, cur->col, cur->row, cur->up);
     hud_draw(g, cur, theme, paused, fps);
     wnoutrefresh(stdscr);
     doupdate();

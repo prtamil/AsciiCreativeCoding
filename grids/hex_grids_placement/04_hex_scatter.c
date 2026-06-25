@@ -8,7 +8,8 @@
  * and gradient (thick near the cursor, thinning toward the edge). The spray
  * radius and the density/spacing knobs are all adjustable live.
  *
- * Sister files: 03_hex_path.c (placing along a path on this same grid),
+ * Sister files: 01_hex_direct.c (the base template — grid + pool + cursor),
+ *               03_hex_path.c (placing along a path on this same grid),
  *               ../rect_grids_placement/04_scatter.c (the same idea on squares).
  * The even-spacing spray follows Poisson-disk sampling
  * (Bridson 2007: https://www.cs.ubc.ca/~rbridson/docs/bridson-siggraph07-poissondisk.pdf).
@@ -30,15 +31,15 @@
 
 /* ── §1 config ── */
 
-#define CELL_W              2
-#define CELL_H              4
+#define CELL_W              2     /* pixels per char cell (2 wide x 4 tall) — */
+#define CELL_H              4     /* undoes the cell's tall aspect so hexes look round */
 
-#define HEX_SIZE_DEFAULT   14.0
+#define HEX_SIZE_DEFAULT   14.0   /* centre-to-corner, pixels; bigger = fewer hexes */
 #define HEX_SIZE_MIN        6.0
 #define HEX_SIZE_MAX       40.0
 #define HEX_SIZE_STEP       2.0
 
-#define BORDER_W_DEFAULT    0.10
+#define BORDER_W_DEFAULT    0.10  /* outline band width, 0..0.5 (0 = none, 0.5 = solid) */
 #define BORDER_W_MIN        0.03
 #define BORDER_W_MAX        0.35
 
@@ -64,12 +65,10 @@
  * by zero at the center cell. */
 #define GRAD_FALLOFF        3
 
-/* Most objects we'll ever hold; extra placements past this are dropped. */
-#define MAX_OBJ            256
-#define FRAME_NS    16666667LL   /* one frame, ~60 per second, in nanoseconds */
+#define MAX_OBJ           256     /* room for far more objects than fit on screen */
+#define FRAME_NS    16666667LL    /* one frame at ~60 fps, in nanoseconds */
 
-/* How heavily to smooth the on-screen fps number so it doesn't jump around. */
-#define FPS_EWMA_ALPHA      0.05
+#define FPS_EWMA_ALPHA      0.05  /* small = steadier on-screen fps number */
 
 /* ── §2 clock ── */
 
@@ -89,11 +88,11 @@ static void clock_sleep_ns(int64_t ns)
 
 /* ── §3 color ── */
 
-#define PAIR_GRID      1
-#define PAIR_CURSOR    2
-#define PAIR_OBJ       3
-#define PAIR_HUD       4   /* status bar (yellow)    */
-#define PAIR_HINT      5   /* key-hint footer (cyan) */
+#define PAIR_GRID    1   /* the hex outlines            */
+#define PAIR_CURSOR  2   /* the hex you're on + the '@' */
+#define PAIR_OBJ     3   /* scattered objects           */
+#define PAIR_HUD     4
+#define PAIR_HINT    5
 
 static void color_init(void)
 {
@@ -106,15 +105,15 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,    -1);
 }
 
-/* ── §4 gridctx ── */
+/* ── §4 hex mapping & lattice ── */
 
-/* Everything needed to turn a hex coordinate into a spot on the screen, and
- * back. Bundled together so the drawing code can pass one thing around. */
+/* GridCtx — the hex grid for one frame: window size, hex size/look, and where
+ * hex (0,0) lands on screen (recomputed on resize so the grid stays centred). */
 typedef struct {
-    int    rows, cols;   /* terminal size in characters */
-    double hex_size;     /* how big one hex is drawn, in sub-cell units */
-    double border_w;     /* fraction of each hex left blank as a gap (0..0.5) */
-    int    ox, oy;       /* screen cell that the center hex (0,0) sits on */
+    int    rows, cols;        /* terminal size, in character cells */
+    double hex_size;          /* centre-to-corner distance, pixels */
+    double border_w;          /* outline band width, 0..0.5 */
+    int    ox, oy;            /* screen cell that hex (0,0) sits on */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols,
@@ -127,12 +126,36 @@ static void ctx_init(GridCtx *g, int rows, int cols,
     g->oy = (rows - 1) / 2;
 }
 
-/*
- * Snaps a fuzzy in-between hex position to the nearest real hex cell. Hex
- * coordinates come in threes that must always sum to zero; rounding each one
- * separately can break that, so we fix up whichever one we rounded worst.
- * Full derivation lives in 01_hex_direct.c §4.
- */
+/* one hex's centre in pixels, measured from the grid centre (flat-top layout) */
+static void hex_center_pixel(double size, int q, int r, double *cx, double *cy)
+{
+    double sq3 = sqrt(3.0);
+    *cx = size * 1.5 * (double)q;
+    *cy = size * (sq3 * 0.5 * (double)q + sq3 * (double)r);
+}
+
+/* recipe step 1 — hex address (q,r) -> the screen cell at its centre. Rounds to
+ * nearest so a placed object lands dead-centre in its hex. */
+static void axial_to_screen(const GridCtx *g, int q, int r, int *col, int *row)
+{
+    double cx, cy;
+    hex_center_pixel(g->hex_size, q, r, &cx, &cy);
+    *col = g->ox + (int)round(cx / CELL_W);
+    *row = g->oy + (int)round(cy / CELL_H);
+}
+
+/* the reverse — a pixel offset from grid centre -> fractional hex (q,r,s).
+ * s = -q-r, so the three coordinates always sum to zero. */
+static void screen_to_axial_frac(const GridCtx *g, double px, double py,
+                                 double *fq, double *fr, double *fs)
+{
+    *fq = (2.0 / 3.0 * px) / g->hex_size;
+    *fr = (-1.0 / 3.0 * px + sqrt(3.0) / 3.0 * py) / g->hex_size;
+    *fs = -*fq - *fr;
+}
+
+/* snap fractional (q,r,s) to the nearest real hex. Rounding each on its own can
+ * push their sum off zero, so we re-derive whichever we rounded most. */
 static void cube_round(double fq, double fr, double fs, int *q, int *r)
 {
     int rq = (int)round(fq), rr = (int)round(fr), rs = (int)round(fs);
@@ -140,34 +163,35 @@ static void cube_round(double fq, double fr, double fs, int *q, int *r)
     double dr = fabs((double)rr - fr);
     double ds = fabs((double)rs - fs);
     if      (dq > dr && dq > ds) { *q = -rr - rs; *r = rr; }
-    else if (dr > ds)             { *q = rq; *r = -rq - rs; }
-    else                          { *q = rq; *r = rr; }
+    else if (dr > ds)            { *q = rq; *r = -rq - rs; }
+    else                         { *q = rq; *r = rr; }
 }
 
-/* Hex coordinate (q, r) -> which screen cell to draw it on. */
-static void ctx_to_screen(const GridCtx *g, int q, int r, int *col, int *row)
+/* how near a hex edge a fractional point is: 0 at the centre, 0.5 at an edge */
+static double hex_edge_distance(double fq, double fr, double fs, int q, int r)
 {
-    double sq3 = sqrt(3.0);
-    double cx  = g->hex_size * 1.5 * (double)q;
-    double cy  = g->hex_size * (sq3 * 0.5 * (double)q + sq3 * (double)r);
-    *col = g->ox + (int)round(cx / CELL_W);
-    *row = g->oy + (int)round(cy / CELL_H);
+    double dq = fabs(fq - (double)q);
+    double dr = fabs(fr - (double)r);
+    double ds = fabs(fs - (double)(-q - r));
+    double d = dq;
+    if (dr > d) d = dr;
+    if (ds > d) d = ds;
+    return d;
 }
 
-/*
- * How many hex steps apart two cells are. This is the workhorse of the whole
- * file: every spray uses it to keep only the cells inside the circle, and the
- * even-spacing spray uses it to check nothing is too close to nothing else.
- */
+/* how many hex steps apart two cells are. Every spray uses it to keep only the
+ * cells inside the circle; the even-spacing spray also uses it to reject
+ * candidates too near an already-placed object. */
 static int hex_dist(int q1, int r1, int q2, int r2)
 {
     int dq = q2 - q1, dr = r2 - r1;
     return (abs(dq) + abs(dr) + abs(dq + dr)) / 2;
 }
 
-/* Picks the ASCII line character ( - \ | / ) that best matches a given angle,
- * so a hex edge looks like it's leaning the right way. */
-static char angle_char(double theta)
+/* the ASCII glyph whose slant lies along an edge at angle theta: '-' flattish,
+ * '|' steep, '/' and '\' between. The glyphs look the same flipped 180°, so we
+ * fold theta into [0,pi). */
+static char edge_glyph(double theta)
 {
     double t = fmod(theta, M_PI);
     if (t < 0.0) t += M_PI;
@@ -175,43 +199,35 @@ static char angle_char(double theta)
     else if (t < 3.0 * M_PI / 8.0)  return '\\';
     else if (t < 5.0 * M_PI / 8.0)  return '|';
     else if (t < 7.0 * M_PI / 8.0)  return '/';
-    else                              return '-';
+    else                            return '-';
 }
 
-/* Draws the empty hex grid that fills the screen. For each screen cell it
- * works out which hex it belongs to; cells near a hex's edge get an outline
- * character, cells deep inside a hex are left blank. The hex under the cursor
- * is tinted to stand out. */
-static void ctx_draw_bg(const GridCtx *g, int curq, int curr)
+/* recipe step 2 — draw the grid: for every screen cell, find its hex and how
+ * near an edge it sits. Near an edge -> an outline glyph; deep inside -> blank.
+ * The cursor's hex is drawn in its own colour. */
+static void draw_lattice(const GridCtx *g, int curq, int curr)
 {
-    double size  = g->hex_size;
-    double sq3   = sqrt(3.0);
-    double sq3_3 = sq3 / 3.0;
-    double sq3_2 = sq3 * 0.5;
     double limit = 0.5 - g->border_w;
+
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
             double px = (double)(col - g->ox) * CELL_W;
             double py = (double)(row - g->oy) * CELL_H;
-            double fq = (2.0/3.0 * px) / size;
-            double fr = (-1.0/3.0 * px + sq3_3 * py) / size;
-            double fs = -fq - fr;
+
+            double fq, fr, fs;
+            screen_to_axial_frac(g, px, py, &fq, &fr, &fs);
             int q, r;
             cube_round(fq, fr, fs, &q, &r);
-            double fS   = (double)(-q - r);
-            double dist = fabs(fq - (double)q);
-            double d2   = fabs(fr - (double)r);
-            double d3   = fabs(fs - fS);
-            if (d2 > dist) dist = d2;
-            if (d3 > dist) dist = d3;
-            if (dist < limit) continue;
-            double cx    = size * 1.5 * (double)q;
-            double cy    = size * (sq3_2 * (double)q + sq3 * (double)r);
-            double theta = atan2(py - cy, px - cx);
-            char ch = angle_char(theta + M_PI / 2.0);
-            int on_cur = (q == curq && r == curr);
-            int attr   = on_cur ? (COLOR_PAIR(PAIR_CURSOR) | A_BOLD)
-                                : (COLOR_PAIR(PAIR_GRID)   | A_BOLD);
+
+            if (hex_edge_distance(fq, fr, fs, q, r) < limit) continue;  /* inside the hex */
+
+            double cx, cy;
+            hex_center_pixel(g->hex_size, q, r, &cx, &cy);
+            char ch = edge_glyph(atan2(py - cy, px - cx) + M_PI / 2.0);
+
+            int attr = (q == curq && r == curr)
+                       ? (COLOR_PAIR(PAIR_CURSOR) | A_BOLD)
+                       : (COLOR_PAIR(PAIR_GRID)   | A_BOLD);
             attron(attr);
             mvaddch(row, col, (chtype)(unsigned char)ch);
             attroff(attr);
@@ -219,38 +235,41 @@ static void ctx_draw_bg(const GridCtx *g, int curq, int curr)
     }
 }
 
-/* ── §5 pool ── */
+/* ── §5 pool — the objects placed on the grid ── */
 
-/* One placed object: which hex it sits on (q, r) and the character to draw. */
+/* Obj — one placed object: which hex it's on (q,r) and its glyph. Storing the
+ * hex address (not a screen spot) is what keeps it stuck to its hex on resize.
+ * Pool — all objects packed into the front of items[]; count is how many. */
 typedef struct { int q, r; char glyph; } Obj;
-
-/* The bag of everything that's been scattered so far. Fixed-size array, no
- * heap; once it's full (count == MAX_OBJ) further placements are ignored.
- * 'count' is how many of the 'items' slots are actually in use. */
 typedef struct { Obj items[MAX_OBJ]; int count; } Pool;
 
-/* Adds an object at a hex, or just updates the glyph if one's already there,
- * so the same cell never gets two objects. Silently does nothing if the bag
- * is full. */
+static int pool_find(const Pool *p, int q, int r)
+{
+    for (int i = 0; i < p->count; i++)
+        if (p->items[i].q == q && p->items[i].r == r)
+            return i;
+    return -1;
+}
+
+/* place an object on this hex, or just overwrite its glyph if one's already
+ * there, so a hex never holds two. Silently does nothing if the pool is full. */
 static void pool_place(Pool *p, int q, int r, char glyph)
 {
-    for (int i = 0; i < p->count; i++) {
-        if (p->items[i].q == q && p->items[i].r == r) {
-            p->items[i].glyph = glyph; return;
-        }
-    }
+    int i = pool_find(p, q, r);
+    if (i >= 0) { p->items[i].glyph = glyph; return; }
     if (p->count < MAX_OBJ)
         p->items[p->count++] = (Obj){ q, r, glyph };
 }
 
 static void pool_clear(Pool *p) { p->count = 0; }
 
+/* draw every object on top of the grid, each at its hex's centre */
 static void pool_draw(const Pool *p, const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_OBJ) | A_BOLD);
     for (int i = 0; i < p->count; i++) {
         int col, row;
-        ctx_to_screen(g, p->items[i].q, p->items[i].r, &col, &row);
+        axial_to_screen(g, p->items[i].q, p->items[i].r, &col, &row);
         if (col >= 0 && col < g->cols && row >= 0 && row < g->rows - 1)
             mvaddch(row, col, (chtype)(unsigned char)p->items[i].glyph);
     }
@@ -259,14 +278,19 @@ static void pool_draw(const Pool *p, const GridCtx *g)
 
 /* ── §6 cursor ── */
 
-/* Where the '@' marker is on the grid, in hex coordinates. */
+/* Cursor — where the player is, as a hex address (q,r). Unbounded: it can roam
+ * off-screen and back, since the grid is conceptually endless. */
 typedef struct { int q, r; } Cursor;
 
 static void cursor_reset(Cursor *cur) { cur->q = 0; cur->r = 0; }
 
-/* The (q, r) step for each arrow key: up, down, left, right in that order. */
+/* what each arrow key adds to (q,r). Four arrows reach four of a hex's six
+ * neighbours; the two diagonals are reached by combining moves. */
 static const int HEX_DIR[4][2] = {
-    { 0, -1 }, { 0, +1 }, {-1, 0}, {+1, 0}
+    { 0, -1 },   /* UP    */
+    { 0, +1 },   /* DOWN  */
+    {-1,  0 },   /* LEFT  */
+    {+1,  0 },   /* RIGHT */
 };
 
 static void cursor_move(Cursor *cur, int dq, int dr)
@@ -274,12 +298,12 @@ static void cursor_move(Cursor *cur, int dq, int dr)
     cur->q += dq; cur->r += dr;
 }
 
+/* draw the '@' on the player's hex. Unlike objects this truncates instead of
+ * rounding, nudging '@' just inside the hex so it never lands on the outline. */
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
-    double sq3   = sqrt(3.0);
-    double sq3_2 = sq3 * 0.5;
-    double cx    = g->hex_size * 1.5    * (double)cur->q;
-    double cy    = g->hex_size * (sq3_2 * (double)cur->q + sq3 * (double)cur->r);
+    double cx, cy;
+    hex_center_pixel(g->hex_size, cur->q, cur->r, &cx, &cy);
     int col = g->ox + (int)(cx / CELL_W);
     int row = g->oy + (int)(cy / CELL_H);
     if (col >= 0 && col < g->cols && row >= 0 && row < g->rows - 1) {
@@ -291,16 +315,16 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
 
 /* ── §7 scatter ── */
 /*
- * The four sprays all walk the same circle of hexes around the cursor (every
- * cell within 'radius' steps). What differs is the rule each one uses to
- * decide whether a given cell gets an object. That single rule is the whole
- * personality of each spray.
+ * THE DISTINCT STEP of this file. The four sprays all walk the same circle of
+ * hexes around the cursor (every cell within 'radius' steps). What differs is
+ * the rule each one uses to decide whether a given cell gets an object — that
+ * single rule is the whole personality of each spray.
  */
 
 /* Uniform spray: flip a weighted coin for every cell, place a '.' if it wins.
  * Higher density = more cells win, but they're scattered with no pattern. */
 static void scatter_uniform(Pool *pool, int cQ, int cR,
-                             int radius, double density)
+                            int radius, double density)
 {
     for (int dr = -radius; dr <= radius; dr++) {
         for (int dq = -radius; dq <= radius; dq++) {
@@ -315,11 +339,11 @@ static void scatter_uniform(Pool *pool, int cQ, int cR,
  * Even-spacing spray (Poisson-disk sampling): place a '+' only where it stays
  * at least 'mindist' steps from every object already down. That guarantee is
  * what makes the result look tidy and evenly spread instead of clumpy. We
- * check each candidate against the whole bag, which is cheap here (a few tens
+ * check each candidate against the whole pool, which is cheap here (a few tens
  * of thousands of comparisons at most, well under a millisecond).
  */
 static void scatter_mindist(Pool *pool, int cQ, int cR,
-                             int radius, int mindist)
+                            int radius, int mindist)
 {
     for (int dr = -radius; dr <= radius; dr++) {
         for (int dq = -radius; dq <= radius; dq++) {
@@ -349,8 +373,8 @@ static void scatter_flood(Pool *pool, int cQ, int cR, int radius)
 
 /* Gradient spray: like the uniform spray, but the win chance shrinks the
  * farther a cell is from the cursor. The center cell always wins; outer cells
- * win less and less, giving a '*' blob that's dense in the middle and fades at
- * the rim. GRAD_FALLOFF sets how gentle the fade is. */
+ * win less and less, giving a '*' blob dense in the middle and fading at the
+ * rim. GRAD_FALLOFF sets how gentle the fade is. */
 static void scatter_gradient(Pool *pool, int cQ, int cR, int radius)
 {
     for (int dr = -radius; dr <= radius; dr++) {
@@ -436,7 +460,7 @@ static void scene_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
                         const SceneCfg *cfg, double fps)
 {
     erase();
-    ctx_draw_bg(g, cur->q, cur->r);
+    draw_lattice(g, cur->q, cur->r);
     pool_draw(p, g);
     cursor_draw(cur, g);
     hud_draw(g, p, cfg, fps);
@@ -485,8 +509,6 @@ int main(void)
 
     while (g_running) {
         if (g_need_resize) {
-            /* Terminal was resized: the endwin/refresh pair is the ncurses
-             * way to pick up the new window size before we re-measure it. */
             g_need_resize = 0; endwin(); refresh();
             getmaxyx(stdscr, rows, cols);
             ctx_init(&g, rows, cols, g.hex_size, g.border_w);

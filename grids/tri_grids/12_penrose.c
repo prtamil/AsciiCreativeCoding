@@ -1,59 +1,17 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 12_penrose.c — a Penrose-style tiling drawn by splitting triangles forever.
+ * 12_penrose.c — Penrose-style tiling by recursive deflation of Robinson
+ * triangles. Start with one acute or obtuse half-tile; each round splits every
+ * triangle at the golden-ratio point on one edge into one acute + one obtuse
+ * child. The golden ratio is what makes the result aperiodic.
  *
- * We start with one of two special triangles and keep cutting each one into
- * two smaller copies of the same family. After a few rounds the screen fills
- * with a pattern that never quite repeats — the hallmark of a Penrose tiling.
+ * Simplified cut: each triangle makes exactly two children (textbook Penrose
+ * makes two or three) — same two shapes, same golden cut, same self-similarity.
  *
- * Sister files: 10_pinwheel.c and 09_sierpinski.c — other "split a shape into
- * smaller copies of itself" demos to compare against.
- * The full math: https://en.wikipedia.org/wiki/Penrose_tiling
+ * Sister files: 10_pinwheel.c, 09_sierpinski.c (other substitution tilings).
+ * Refs: Penrose "Pentaplexity" (1979); Robinson (1971); Senechal §7 (1995).
+ *       https://en.wikipedia.org/wiki/Penrose_tiling
  */
-
-/* ── the idea ───────────────────────────────────────────────────────────── *
- *
- * Two triangles do all the work. One is tall and thin (we call it "acute",
- * sharp point at the top). One is wide and shallow ("obtuse", blunt point at
- * the top). Both are built around the golden ratio, the famous number
- * φ ≈ 1.618 that shows up whenever something splits into a 1-to-bigger
- * proportion.
- *
- * The trick: each triangle can be cut into two smaller triangles drawn from
- * the same two-shape family. Cut those, cut their pieces, and so on. The
- * cut always lands at the golden-ratio point along one edge, which is why
- * the pattern never settles into a repeating grid — you can't tile the plane
- * periodically with an irrational ratio baked in. That "never repeats" quality
- * is what makes it a Penrose-style tiling.
- *
- * A note on honesty: this uses a simplified cut (each triangle makes exactly
- * two children) rather than the textbook Penrose rule (which makes two or
- * three). It looks aperiodic and shows the same core ideas — two shapes, a
- * golden-ratio cut, self-similarity — without the bookkeeping.
- *
- * The cut, in words:
- *   - For the thin (acute) triangle, mark a point along one leg at the
- *     golden-ratio spot, then join it up to form one wide child and one
- *     thin child.
- *   - For the wide (obtuse) triangle, mark a point along the long base at
- *     the golden-ratio spot, then join it up the same way.
- *   Either way: one acute child + one obtuse child, both smaller.
- *
- * The exact corner-by-corner recipe lives next to the substitute() function
- * in §5 — that's where the meaning of each vertex is spelled out.
- *
- * What you'll see: bump the depth up with +/-. Depth 0 is just the starting
- * triangle; each step doubles the triangle count, so depth 10 is ~1024 of
- * them. Around depth 4 and up the familiar Penrose motifs (suns, stars,
- * kites, darts) start to appear. Acute and obtuse triangles are drawn in
- * different colors so you can see which is which.
- *
- * References:
- *   Penrose, "Pentaplexity" (1979)
- *   Robinson, "Undecidability and Nonperiodicity for Tilings" (1971)
- *   Senechal, "Quasicrystals and Geometry" (1995) §7
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -143,24 +101,20 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula — screen layout + line drawing ── */
+/* ── §4 screen layout & line drawing ── */
 
 #define TYPE_ACUTE   0
 #define TYPE_OBTUSE  1
 
-/*
- * GridCtx — everything we need to place the tiling on this particular screen.
- * It bundles the terminal size, where the center of the drawing sits, and the
- * three knobs the user controls: how many rounds of cutting (depth), how big
- * the starting triangle is (size_frac), and which triangle we start from.
- */
+/* GridCtx — the tiling placed on this frame: screen size, centre (sub-pixel
+ * units), and the three live knobs steered by keys. */
 typedef struct {
-    int    rows, cols;       /* terminal size, in characters */
-    int    cw, ch;           /* sub-cell resolution: how many sub-units fit in one character cell */
-    int    ox, oy;           /* center of the drawing, in sub-cell units */
-    int    depth;            /* how many rounds of cutting to do */
-    double size_frac;        /* how much of the screen the starting triangle fills, 0..1 */
-    int    seed_type;        /* which triangle we begin with: TYPE_ACUTE or TYPE_OBTUSE */
+    int    rows, cols;       /* terminal size, in cells */
+    int    cw, ch;           /* sub-pixels per cell (CELL_W, CELL_H) */
+    int    ox, oy;           /* centre of the drawing, in sub-pixels */
+    int    depth;            /* deflation rounds, 0..DEPTH_MAX */
+    double size_frac;        /* seed triangle's share of the screen, 0..1 */
+    int    seed_type;        /* TYPE_ACUTE or TYPE_OBTUSE */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols,
@@ -175,7 +129,7 @@ static void ctx_init(GridCtx *g, int rows, int cols,
     g->seed_type = seed_type;
 }
 
-/* Pick the ASCII character (- | / \) that best matches the slope of a line. */
+/* the line char (- | / \) nearest a segment's slope */
 static char slope_char(double dx, double dy)
 {
     double ax = fabs(dx) * (1.0 / CELL_W);
@@ -207,75 +161,65 @@ static void line_draw(const GridCtx *g, double px0, double py0,
     attroff(attr);
 }
 
-/* ── §5 mesh — cut each triangle into smaller ones ── */
+/* ── §5 deflation — split each Robinson triangle into two smaller ones ── */
 
-/*
- * PTri — one triangle in the tiling, plus which family it belongs to.
- * We always keep the corners in a fixed order: corner 0 is the apex (the
- * sharp 36° point for acute, the blunt 108° point for obtuse), and corners
- * 1 and 2 are the two base corners. Every cut preserves this order so the
- * children come out with their apex in the right place automatically.
- */
+/* PTri — one half-tile. Corners are kept in a fixed order: 0 = apex (the sharp
+ * 36° point for acute, the blunt 108° point for obtuse), 1 and 2 = base. Every
+ * deflation rule preserves this order, so children come out apex-first. */
 typedef struct {
-    double x[3], y[3];      /* corner 0 = apex, corners 1 and 2 = base */
+    double x[3], y[3];      /* corner 0 = apex, 1 and 2 = base */
     int    type;            /* TYPE_ACUTE (thin) or TYPE_OBTUSE (wide) */
 } PTri;
 
 static void tri_draw_edges(const GridCtx *g, PTri t)
 {
-    int pair = (t.type == TYPE_ACUTE) ? PAIR_ACUTE : PAIR_OBTUSE;
-    int attr = COLOR_PAIR(pair);
+    int attr = COLOR_PAIR(t.type == TYPE_ACUTE ? PAIR_ACUTE : PAIR_OBTUSE);
     line_draw(g, t.x[0], t.y[0], t.x[1], t.y[1], attr);
     line_draw(g, t.x[1], t.y[1], t.x[2], t.y[2], attr);
     line_draw(g, t.x[2], t.y[2], t.x[0], t.y[0], attr);
 }
 
-/*
- * The heart of the demo: cut one triangle into two smaller ones, then do the
- * same to those, until we've gone as deep as the user asked. When we hit the
- * bottom we stop cutting and actually draw the triangle.
- *
- * Each cut marks a point P along one edge at the golden-ratio spot (that's
- * what INV_PHI is), then wires P up to the existing corners to form one acute
- * child and one obtuse child. The exact corners used:
- *
- *   Starting from a thin (acute) triangle:
- *     P sits along the leg from apex toward base corner 1.
- *     Wide child: apex at P, base across corners 0 and 2.
- *     Thin child: apex at corner 2, base across P and corner 1.
- *
- *   Starting from a wide (obtuse) triangle:
- *     P sits along the long base between corners 1 and 2.
- *     Thin child: apex at corner 1, base across corner 0 and P.
- *     Wide child: apex at P, base across corners 0 and 2.
- */
-static void substitute(const GridCtx *g, PTri t, int depth, int max_depth)
+/* the golden-ratio point along edge a->b — the cut always lands here */
+static void golden_point(PTri t, int a, int b, double *px, double *py)
+{
+    *px = t.x[a] + (t.x[b] - t.x[a]) * INV_PHI;
+    *py = t.y[a] + (t.y[b] - t.y[a]) * INV_PHI;
+}
+
+/* deflate one acute (thin) tile -> one obtuse + one acute child.
+ * P sits on the leg apex->base-corner-1. out[0] wide: apex P, base (0,2).
+ *                                         out[1] thin: apex 2, base (P,1). */
+static void deflate_acute(PTri t, PTri out[2])
+{
+    double Px, Py; golden_point(t, 0, 1, &Px, &Py);
+    out[0] = (PTri){ { Px, t.x[0], t.x[2] }, { Py, t.y[0], t.y[2] }, TYPE_OBTUSE };
+    out[1] = (PTri){ { t.x[2], Px, t.x[1] }, { t.y[2], Py, t.y[1] }, TYPE_ACUTE  };
+}
+
+/* deflate one obtuse (wide) tile -> one acute + one obtuse child.
+ * P sits on the long base corner-1->corner-2. out[0] thin: apex 1, base (0,P).
+ *                                              out[1] wide: apex P, base (0,2). */
+static void deflate_obtuse(PTri t, PTri out[2])
+{
+    double Px, Py; golden_point(t, 1, 2, &Px, &Py);
+    out[0] = (PTri){ { t.x[1], t.x[0], Px }, { t.y[1], t.y[0], Py }, TYPE_ACUTE  };
+    out[1] = (PTri){ { Px, t.x[0], t.x[2] }, { Py, t.y[0], t.y[2] }, TYPE_OBTUSE };
+}
+
+/* recurse: deflate to the requested depth, then draw the leaf triangles */
+static void deflate(const GridCtx *g, PTri t, int depth, int max_depth)
 {
     if (depth == max_depth) { tri_draw_edges(g, t); return; }
 
-    if (t.type == TYPE_ACUTE) {
-        double Px = t.x[0] + (t.x[1] - t.x[0]) * INV_PHI;
-        double Py = t.y[0] + (t.y[1] - t.y[0]) * INV_PHI;
-        PTri c0 = { { Px, t.x[0], t.x[2] }, { Py, t.y[0], t.y[2] }, TYPE_OBTUSE };
-        PTri c1 = { { t.x[2], Px, t.x[1] }, { t.y[2], Py, t.y[1] }, TYPE_ACUTE  };
-        substitute(g, c0, depth + 1, max_depth);
-        substitute(g, c1, depth + 1, max_depth);
-    } else {
-        double Px = t.x[1] + (t.x[2] - t.x[1]) * INV_PHI;
-        double Py = t.y[1] + (t.y[2] - t.y[1]) * INV_PHI;
-        PTri c0 = { { t.x[1], t.x[0], Px }, { t.y[1], t.y[0], Py }, TYPE_ACUTE  };
-        PTri c1 = { { Px, t.x[0], t.x[2] }, { Py, t.y[0], t.y[2] }, TYPE_OBTUSE };
-        substitute(g, c0, depth + 1, max_depth);
-        substitute(g, c1, depth + 1, max_depth);
-    }
+    PTri child[2];
+    if (t.type == TYPE_ACUTE) deflate_acute(t, child);
+    else                      deflate_obtuse(t, child);
+    deflate(g, child[0], depth + 1, max_depth);
+    deflate(g, child[1], depth + 1, max_depth);
 }
 
-/*
- * Build the very first triangle — the one everything else is cut from. It's
- * centered on screen with its point at the top, and sized to fill the
- * fraction of the screen the user picked. Returns either a thin or wide
- * starting triangle depending on which seed type is selected.
- */
+/* the first triangle, centred with its apex up, sized to size_frac of the
+ * screen — acute or obtuse per seed_type. Everything else deflates from this. */
 static PTri scene_seed(const GridCtx *g)
 {
     double pw = (double)g->cols * CELL_W;
@@ -308,16 +252,12 @@ static PTri scene_seed(const GridCtx *g)
 
 /* ── §6 scene ── */
 
-/*
- * Scene — the live state the user is steering: how deep to recurse, how big
- * the starting triangle is, which triangle to start from, the color theme,
- * and whether the demo is paused. This is what the keypresses in main() edit.
- */
+/* Scene — the live state the keys steer. */
 typedef struct {
-    int    depth;           /* rounds of cutting, 0..DEPTH_MAX */
-    double size_frac;       /* starting triangle's share of the screen, 0..1 */
-    int    seed_type;       /* starting triangle: TYPE_ACUTE or TYPE_OBTUSE */
-    int    theme;           /* which color palette, 0..N_THEMES-1 */
+    int    depth;           /* deflation rounds, 0..DEPTH_MAX */
+    double size_frac;       /* seed triangle's share of the screen, 0..1 */
+    int    seed_type;       /* TYPE_ACUTE or TYPE_OBTUSE */
+    int    theme;           /* palette index, 0..N_THEMES-1 */
     int    paused;          /* nonzero while paused */
 } Scene;
 
@@ -353,7 +293,7 @@ static void scene_draw(const GridCtx *g, const Scene *s, double fps)
 {
     erase();
     PTri seed = scene_seed(g);
-    substitute(g, seed, 0, s->depth);
+    deflate(g, seed, 0, s->depth);
     hud_draw(g, s, fps);
     wnoutrefresh(stdscr);
     doupdate();

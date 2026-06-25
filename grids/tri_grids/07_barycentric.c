@@ -1,14 +1,16 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 07_barycentric.c — keep splitting one triangle into smaller triangles
+ * 07_barycentric.c — subdivide one triangle by barycentric coordinates
  *
- * Start with one equilateral triangle. Split it into 6 smaller ones: find
- * the center point and the middle of each side, then connect them. Do that
- * to every piece, over and over. The depth key (+/-) sets how many times.
- * A depth-N picture has 6^N little triangles, all self-similar.
+ * Every point inside a triangle is a weighted blend of its three corners:
+ * weights (u,v,w) with u+v+w = 1. The splitting points are exactly such
+ * blends — the centroid is (1/3,1/3,1/3), each side's midpoint sets one
+ * weight to 0 and the other two to 1/2. Fan from the centroid to make 6
+ * smaller triangles, then recurse. Depth-N has 6^N self-similar pieces.
  *
- * Related files: 04_30_60_90.c does a single split; 08_triforce.c splits
- * a different way (corners to midpoints, no center point).
+ * Sister: 01_equilateral.c (the shared tri/GridCtx skeleton); 08_triforce.c
+ * splits the other classic way (midpoint triangle, no centroid).
+ * Ref: Barycentric coords https://en.wikipedia.org/wiki/Barycentric_coordinate_system
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -94,33 +96,20 @@ static void color_init(int theme)
     init_pair(PAIR_HINT, COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula — grid context, line characters, line drawing ── */
+/* ── §4 tri mapping & lattice ── */
 
-/*
- * GridCtx — everything we need to draw one frame.
- *
- * It holds the current terminal size, where the center of the picture sits,
- * and the two knobs the user controls (how many times to split, how big the
- * triangle is). Because we never store the triangles themselves, this little
- * struct is the whole picture's state — hand it to the drawing code and it
- * can redraw from scratch.
- */
+/* GridCtx — the triangle picture for one frame. We never store the triangles,
+ * so this struct (terminal size, centre, the two live knobs) is the whole
+ * state: hand it to the drawing code and it redraws from scratch. */
 typedef struct {
-    /* how many rows and columns the terminal currently has */
-    int    rows, cols;
-
-    /* one character is this many tiny units wide/tall; lets us treat the
-       screen as square even though characters are taller than they are wide */
-    int    cw, ch;
-
-    /* center of the picture, measured in those tiny units */
-    int    ox, oy;
-
-    int    depth;       /* how many times to split (0..5) */
-    double size_frac;   /* triangle size, as a fraction of the screen */
+    int    rows, cols;   /* terminal size in cells */
+    int    cw, ch;       /* sub-pixels per cell (CELL_W, CELL_H) — keeps the
+                            grid square despite tall characters */
+    int    ox, oy;       /* picture centre, in sub-pixels */
+    int    depth;        /* how many times to split, 0..DEPTH_MAX */
+    double size_frac;    /* triangle size as a fraction of the screen */
 } GridCtx;
 
-/* Work out the geometry from the current terminal size and the user's knobs. */
 static void ctx_init(GridCtx *g, int rows, int cols, int depth, double size_frac)
 {
     g->rows = rows; g->cols = cols;
@@ -131,12 +120,8 @@ static void ctx_init(GridCtx *g, int rows, int cols, int depth, double size_frac
     g->size_frac = size_frac;
 }
 
-/*
- * Pick the character that best matches a line's slant: '-' for nearly flat,
- * '|' for nearly upright, and '/' or '\' for the diagonals. We squish the
- * direction by the cell shape first so the choice looks right on screen,
- * where characters are taller than they are wide.
- */
+/* the line char nearest a segment's slant: '-' flat, '|' upright, '/' '\' the
+ * diagonals. Squish by cell shape first so the choice looks right on screen. */
 static char slope_char(double dx, double dy)
 {
     double ax = fabs(dx) * (1.0 / CELL_W);
@@ -147,11 +132,8 @@ static char slope_char(double dx, double dy)
     return ((dx >= 0) == (dy >= 0)) ? '\\' : '/';
 }
 
-/*
- * Draw a straight line between two points using Bresenham's method — the
- * classic trick for stepping along a line one cell at a time using only
- * integers. The whole line uses one character, chosen from its slant.
- */
+/* draw a segment cell-by-cell with Bresenham (integer line stepping); the
+ * whole segment uses one character, chosen from its slant. */
 static void line_draw(const GridCtx *g, double px0, double py0,
                       double px1, double py1, int attr)
 {
@@ -173,15 +155,21 @@ static void line_draw(const GridCtx *g, double px0, double py0,
     attroff(attr);
 }
 
-/* ── §5 mesh — split each triangle into 6 ── */
-/*
- * There's no "cursor" here. You explore by changing the depth (+/-) and the
- * size ([/]), not by stepping through individual triangles. So we never
- * store the triangles at all — we just draw them as we generate them.
- */
+/* ── §5 subdivision ── */
+/* No cursor here: you explore by depth (+/-) and size ([/]), not by stepping
+ * triangles. We never store the mesh — each piece is drawn as it's generated. */
 
 /* One triangle: its three corners, stored as x's and y's. */
 typedef struct { double x[3], y[3]; } Tri;
+
+/* recipe step 1 — barycentric point: blend the three corners by weights
+ * (u,v,w), u+v+w = 1. Every split point is one of these blends. */
+static void bary_point(Tri t, double u, double v, double w,
+                       double *px, double *py)
+{
+    *px = u * t.x[0] + v * t.x[1] + w * t.x[2];
+    *py = u * t.y[0] + v * t.y[1] + w * t.y[2];
+}
 
 /* Draw a triangle's three sides. Color comes from depth, so every triangle
    at the same split level looks alike; level 0 is drawn bold to stand out. */
@@ -194,20 +182,19 @@ static void tri_draw_edges(const GridCtx *g, Tri t, int depth)
     line_draw(g, t.x[2], t.y[2], t.x[0], t.y[0], attr);
 }
 
-/*
- * The heart of it. If we've split enough, just draw this triangle. Otherwise
- * find its center point and the middle of each side, fan out into 6 smaller
- * triangles (each one runs center -> a corner -> the next side's middle),
- * and do the same to every piece.
- */
+/* recipe step 2 — split, recurse, draw. At max depth, draw the triangle.
+ * Otherwise find the centroid (1/3,1/3,1/3) and the three side midpoints
+ * (each one weight 0, the others 1/2), then fan into 6 triangles that each
+ * run centroid -> a corner -> the next side's midpoint, and split those too. */
 static void subdivide(const GridCtx *g, Tri t, int depth, int max_depth)
 {
     if (depth == max_depth) { tri_draw_edges(g, t, depth); return; }
-    double cx  = (t.x[0] + t.x[1] + t.x[2]) / 3.0;
-    double cy  = (t.y[0] + t.y[1] + t.y[2]) / 3.0;
-    double m01x = (t.x[0] + t.x[1]) * 0.5, m01y = (t.y[0] + t.y[1]) * 0.5;
-    double m12x = (t.x[1] + t.x[2]) * 0.5, m12y = (t.y[1] + t.y[2]) * 0.5;
-    double m20x = (t.x[2] + t.x[0]) * 0.5, m20y = (t.y[2] + t.y[0]) * 0.5;
+
+    double cx,  cy;   bary_point(t, 1.0/3, 1.0/3, 1.0/3, &cx,  &cy);   /* centroid */
+    double m01x, m01y; bary_point(t, 0.5, 0.5, 0.0, &m01x, &m01y);     /* side 0-1 */
+    double m12x, m12y; bary_point(t, 0.0, 0.5, 0.5, &m12x, &m12y);     /* side 1-2 */
+    double m20x, m20y; bary_point(t, 0.5, 0.0, 0.5, &m20x, &m20y);     /* side 2-0 */
+
     Tri subs[6] = {
         { {cx, t.x[0], m01x}, {cy, t.y[0], m01y} },
         { {cx, m01x, t.x[1]}, {cy, m01y, t.y[1]} },
@@ -220,10 +207,8 @@ static void subdivide(const GridCtx *g, Tri t, int depth, int max_depth)
         subdivide(g, subs[i], depth + 1, max_depth);
 }
 
-/*
- * Build the starting triangle: a centered equilateral one, point up, sized
- * to a fraction of whichever screen dimension is smaller so it always fits.
- */
+/* the starting triangle: centred, point up, sized to a fraction of the
+ * smaller screen dimension so it always fits. */
 static Tri scene_seed(const GridCtx *g)
 {
     double pw = (double)g->cols * CELL_W;
@@ -241,12 +226,12 @@ static Tri scene_seed(const GridCtx *g)
 
 /* ── §6 scene ── */
 
-/* The user's current settings — everything the keys can change. */
+/* the live state the keys can change. */
 typedef struct {
-    int    depth;       /* how many times to split (0..5) */
+    int    depth;       /* how many times to split, 0..DEPTH_MAX */
     double size_frac;   /* triangle size, fraction of the screen */
     int    theme;       /* which color palette is active */
-    int    paused;      /* true while paused */
+    int    paused;      /* 1 = frozen */
 } Scene;
 
 static void scene_reset(Scene *s)

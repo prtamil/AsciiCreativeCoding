@@ -1,14 +1,11 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 14_origin.c — a grid with math-style (x,y) axes drawn through the centre.
+ * 14_origin.c — a math-axis grid: origin pinned at the screen centre, with
+ * +Y pointing UP like graph paper instead of down like a terminal.
  *
- * Move the '@' cursor with the arrows; the HUD shows where it sits in math
- * coordinates and which quadrant it's in. Unlike the terminal, +Y points UP
- * here, like graph paper. Sister file: 01_uniform_rect.c (plain grid, no axes).
- *
- * The one trick: on a terminal, row 0 is the top and rows grow downward, but
- * in math, y grows upward. So when we turn a math point into a screen row we
- * subtract instead of add — that single minus sign flips the Y axis upright.
+ * The distinct mapping: screen_col = ox + mx*UNIT_W, screen_row = oy - my*UNIT_H.
+ * That minus on the row is the whole Y flip — math y grows up, terminal rows
+ * grow down. Sister file: 01_uniform_rect.c (plain grid, no axes, no origin).
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -25,15 +22,10 @@
 
 #define TARGET_FPS  30
 
-/*
- * How big one math unit is on screen. Cells are taller than they are wide,
- * so we use more columns than rows per unit to keep each step looking square.
- */
-#define UNIT_W   8    /* screen cols per 1 math unit */
-#define UNIT_H   4    /* screen rows per 1 math unit */
+#define UNIT_W   8    /* screen cols per 1 math unit; cells are wider than tall, */
+#define UNIT_H   4    /* so more cols than rows per unit keeps a step looking square */
 
-/* How sharply the FPS readout reacts to each frame: small = smooth, slow. */
-#define FPS_EWMA_ALPHA  0.05
+#define FPS_EWMA_ALPHA  0.05   /* small = steadier on-screen fps number */
 
 #define PAIR_GRID   1   /* faint background grid lines */
 #define PAIR_XAXIS  2   /* the horizontal axis         */
@@ -72,24 +64,17 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula — turning math points into screen positions ── */
+/* ── §4 math-axis mapping & lattice ── */
 
-/*
- * Everything the drawing code needs to know about the current grid layout:
- * how big the terminal is, how many cells make one math unit, where the
- * centre (the origin) sits on screen, and how far the cursor may roam.
- *
- *   rows, cols    terminal size, in characters
- *   cw, ch        one math unit's width and height, in screen chars
- *   ox, oy        where math (0,0) lands on screen — its column and row
- *   range         cursor stays within [-range, +range] on both axes, so it
- *                 never wanders off the visible grid
- *   max_r, max_c  copies of range, kept only to match the shared grid template
- */
+/* GridCtx — the grid for one frame: terminal size, unit size, where the origin
+ * lands on screen, and how far the cursor may roam from it.
+ *   ox, oy        screen column/row where math (0,0) lands (the centre)
+ *   range         cursor stays in [-range, +range] on both axes
+ *   max_r, max_c  copies of range, kept to match the shared rect template */
 typedef struct {
-    int rows, cols;
-    int cw, ch;
-    int ox, oy;
+    int rows, cols;      /* terminal size in characters */
+    int cw, ch;          /* one math unit's width and height, in screen chars */
+    int ox, oy;          /* screen position of the origin */
     int range;
     int max_r, max_c;
 } GridCtx;
@@ -105,38 +90,19 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->max_c = g->range;
 }
 
-/*
- * Where does a math point (mx, my) land on screen? Step right from the centre
- * for x, and step up for y — and "up" on a terminal means a smaller row, which
- * is why y is subtracted, not added. That minus is the whole Y flip.
- */
-static void ctx_to_screen(const GridCtx *g, int my, int mx, int *sr, int *sc)
+/* recipe step 1 — math point (mx,my) -> its screen cell. Step right for x,
+ * step UP for y; "up" is a smaller row, so y is subtracted. That is the Y flip. */
+static void cell_to_screen(const GridCtx *g, int mx, int my, int *sr, int *sc)
 {
     *sc = g->ox + mx * g->cw;
     *sr = g->oy - my * g->ch;
 }
 
-/* The reverse trip: given a screen cell, which math point is it? */
-static void screen_to_math(const GridCtx *g, int sr, int sc, int *mx, int *my)
-{
-    *mx = (sc - g->ox) / g->cw;
-    *my = (g->oy - sr) / g->ch;
-}
-
-/*
- * What kind of mark belongs at a given screen cell, listed from most to least
- * important. The origin wins over the axes, and the axes win over plain grid
- * lines, so a cell that's both an axis and a grid line shows the axis.
- *
- *   GC_NONE     blank space, nothing to draw
- *   GC_GRID     a faint background grid line or crossing
- *   GC_XAXIS    the horizontal axis through the centre
- *   GC_YAXIS    the vertical axis through the centre
- *   GC_ORIGIN   the single centre point where both axes meet
- */
+/* what a screen cell is, by priority: origin beats axes, axes beat grid lines,
+ * so a cell that is both axis and grid line shows the axis. */
 typedef enum { GC_NONE, GC_GRID, GC_XAXIS, GC_YAXIS, GC_ORIGIN } GridCharType;
 
-static GridCharType ctx_grid_char_type(const GridCtx *g, int sr, int sc, char *out_ch)
+static GridCharType grid_type_at(const GridCtx *g, int sr, int sc, char *out_ch)
 {
     bool on_x = (sr == g->oy);
     bool on_y = (sc == g->ox);
@@ -154,67 +120,48 @@ static GridCharType ctx_grid_char_type(const GridCtx *g, int sr, int sc, char *o
     return GC_NONE;
 }
 
-/* Same question as above, but when you only want the character, not its kind. */
-static char ctx_grid_char(const GridCtx *g, int sr, int sc)
+static int pair_for_type(GridCharType t)
 {
-    char ch; ctx_grid_char_type(g, sr, sc, &ch);
-    return ch;
+    switch (t) {
+        case GC_ORIGIN: return PAIR_XAXIS;   /* origin painted as bold x-axis */
+        case GC_XAXIS:  return PAIR_XAXIS;
+        case GC_YAXIS:  return PAIR_YAXIS;
+        default:        return PAIR_GRID;
+    }
 }
 
-/* Paints the whole grid and axes, giving each cell the colour its kind earns. */
-static void ctx_draw_bg(const GridCtx *g)
+/* recipe step 2 — draw the axes & grid by asking grid_type_at at every spot */
+static void draw_lattice(const GridCtx *g)
 {
     for (int sr = 0; sr < g->rows - 1; sr++) {
         for (int sc = 0; sc < g->cols; sc++) {
-            char ch; GridCharType t = ctx_grid_char_type(g, sr, sc, &ch);
+            char ch; GridCharType t = grid_type_at(g, sr, sc, &ch);
             if (t == GC_NONE) continue;
-            if (t == GC_ORIGIN) {
-                attron(COLOR_PAIR(PAIR_XAXIS) | A_BOLD);
-                mvaddch(sr, sc, (chtype)(unsigned char)ch);
-                attroff(COLOR_PAIR(PAIR_XAXIS) | A_BOLD);
-            } else if (t == GC_XAXIS) {
-                attron(COLOR_PAIR(PAIR_XAXIS));
-                mvaddch(sr, sc, (chtype)(unsigned char)ch);
-                attroff(COLOR_PAIR(PAIR_XAXIS));
-            } else if (t == GC_YAXIS) {
-                attron(COLOR_PAIR(PAIR_YAXIS));
-                mvaddch(sr, sc, (chtype)(unsigned char)ch);
-                attroff(COLOR_PAIR(PAIR_YAXIS));
-            } else {
-                attron(COLOR_PAIR(PAIR_GRID));
-                mvaddch(sr, sc, (chtype)(unsigned char)ch);
-                attroff(COLOR_PAIR(PAIR_GRID));
-            }
+            chtype attr = COLOR_PAIR(pair_for_type(t));
+            if (t == GC_ORIGIN) attr |= A_BOLD;
+            attron(attr);
+            mvaddch(sr, sc, (chtype)(unsigned char)ch);
+            attroff(attr);
         }
     }
 }
 
-/* Drops a Roman-numeral label into the middle of each of the four corners. */
+/* a Roman-numeral label dropped into the middle of each quadrant */
 static void labels_draw(const GridCtx *g)
 {
     int r, c;
     attron(COLOR_PAIR(PAIR_QUAD) | A_DIM);
-    /* I: right and above the centre */
-    ctx_to_screen(g, 2,  2, &r, &c);  mvprintw(r, c, "I");
-    /* II: left and above */
-    ctx_to_screen(g, 2, -3, &r, &c);  mvprintw(r, c, "II");
-    /* III: left and below */
-    ctx_to_screen(g, -2, -3, &r, &c); mvprintw(r, c, "III");
-    /* IV: right and below */
-    ctx_to_screen(g, -2,  2, &r, &c); mvprintw(r, c, "IV");
+    cell_to_screen(g,  2,  2, &r, &c);  mvprintw(r, c, "I");     /* upper-right */
+    cell_to_screen(g, -3,  2, &r, &c);  mvprintw(r, c, "II");    /* upper-left  */
+    cell_to_screen(g, -3, -2, &r, &c);  mvprintw(r, c, "III");   /* lower-left  */
+    cell_to_screen(g,  2, -2, &r, &c);  mvprintw(r, c, "IV");    /* lower-right */
     attroff(COLOR_PAIR(PAIR_QUAD) | A_DIM);
 }
 
 /* ── §5 cursor ── */
 
-/*
- * The '@' the user steers, stored in math coordinates rather than screen ones.
- *
- *   mx   horizontal position; positive is right of centre
- *   my   vertical position; positive is ABOVE centre, math-style
- *
- * How far it can travel is decided by GridCtx.range, not stored here.
- */
+/* Cursor — the '@', stored in math coords. mx>0 is right of centre, my>0 is
+ * ABOVE centre (math-style). How far it can travel lives in GridCtx.range. */
 typedef struct { int mx, my; } Cursor;
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
@@ -223,10 +170,7 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->mx = 0; cur->my = 0;
 }
 
-/*
- * Nudges the cursor by one step, but only if it would stay inside the grid;
- * a step off the edge is simply ignored so the '@' can't escape.
- */
+/* recipe step 3 — move the cursor, clamped so it never steps off the grid */
 static void cursor_move(Cursor *cur, const GridCtx *g, int dmx, int dmy)
 {
     int nx = cur->mx + dmx, ny = cur->my + dmy;
@@ -236,10 +180,7 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dmx, int dmy)
 
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
-    int sr, sc; ctx_to_screen(g, cur->my, cur->mx, &sr, &sc);
-    /* Round-trip back to math coords as a sanity check; result is unused. */
-    int vx, vy; screen_to_math(g, sr, sc, &vx, &vy);
-    (void)vx; (void)vy;
+    int sr, sc; cell_to_screen(g, cur->mx, cur->my, &sr, &sc);
     attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
     mvaddch(sr, sc, (chtype)'@');
     attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
@@ -275,16 +216,12 @@ static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
 static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_lattice(g);
     labels_draw(g);
     cursor_draw(cur, g);
     hud_draw(g, cur, fps);
     wnoutrefresh(stdscr); doupdate();
 }
-
-/* ctx_grid_char isn't called anywhere; this touches it so the compiler
- * doesn't warn about an unused function. */
-static void ctx_grid_char_ref(void) { (void)ctx_grid_char; }
 
 /* ── §7 screen ── */
 
@@ -313,7 +250,6 @@ int main(void)
     screen_init();
     GridCtx g;     ctx_init(&g, LINES, COLS);
     Cursor  cur;   cursor_reset(&cur, &g);
-    ctx_grid_char_ref();   /* keeps the unused helper from being flagged */
 
     const int64_t FRAME_NS = 1000000000LL / TARGET_FPS;
     double fps = TARGET_FPS;

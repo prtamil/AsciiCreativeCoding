@@ -3,11 +3,10 @@
  * 06_hex_subdivision_direct.c — place glyphs on a hex grid, one wedge at a time.
  *
  * A flat-top hex grid. Each hex is sliced into 6 pie-slice wedges by three
- * lines through the centre. A cursor lives on one wedge; you move it across
- * hexes with the arrows, spin it to a different wedge with ',' / '.', and
- * drop or remove a glyph there with SPACE. Glyphs are stored by which wedge
- * they sit in, not by screen position, so they stay put when you resize the
- * window or change the hex size.
+ * lines through the centre. Move the '@' cursor across hexes with the arrows,
+ * spin it to a different wedge with ',' / '.', and toggle a glyph there with
+ * SPACE. Glyphs are stored by which wedge they sit in (q,r,sector), not by
+ * screen position, so they stay put across a resize or hex-size change.
  *
  * Sister files: grids/tri_grids/06_hex_subdivision.c (the rasterized version),
  *               grids/hex_grids/01_flat_top.c (the plain hex grid this builds on).
@@ -93,16 +92,9 @@ static const short THEME_FG_8[N_THEMES][3] = {
 static void color_init(int theme)
 {
     start_color(); use_default_colors();
-    short fg_e, fg_r, fg_o;
-    if (COLORS >= 256) {
-        fg_e = THEME_FG[theme][0];
-        fg_r = THEME_FG[theme][1];
-        fg_o = THEME_FG[theme][2];
-    } else {
-        fg_e = THEME_FG_8[theme][0];
-        fg_r = THEME_FG_8[theme][1];
-        fg_o = THEME_FG_8[theme][2];
-    }
+    short fg_e = (COLORS >= 256) ? THEME_FG[theme][0] : THEME_FG_8[theme][0];
+    short fg_r = (COLORS >= 256) ? THEME_FG[theme][1] : THEME_FG_8[theme][1];
+    short fg_o = (COLORS >= 256) ? THEME_FG[theme][2] : THEME_FG_8[theme][2];
     init_pair(PAIR_BORDER, fg_e, -1);
     init_pair(PAIR_RADIUS, fg_r, -1);
     init_pair(PAIR_OBJECT, fg_o, -1);
@@ -111,26 +103,26 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 gridctx ── */
+/* ── §4 hex mapping & lattice ── */
 
-/*
- * Everything needed to turn hex coordinates into screen cells, recomputed
- * whenever the window or hex size changes. Holds the layout, not the contents.
- */
+/* The hex grid for one frame plus the user's live knobs. Positions are
+ * measured in sub-pixels first, then divided down to character cells, so hex
+ * size can change smoothly. Centred on (ox,oy) so glyphs stay on their wedge
+ * across a resize. */
 typedef struct {
     int    rows, cols;          /* terminal size in character cells */
-    int    cw, ch;              /* width/height of one logical pixel, in cells */
-    double hex_size;            /* hex side length, in pixels */
-    int    ox, oy;              /* screen cell of hex (0,0), so the grid is centred */
+    int    cell_w, cell_h;      /* sub-pixels per character column / row */
+    double hex_size;            /* hex side length, in sub-pixels */
+    int    ox, oy;              /* screen cell of hex (0,0); re-centred each frame */
     int    max_q, max_r;        /* how far the cursor may roam from the centre hex */
-    double border_w;            /* how thick the hex outline is, as a fraction of a hex */
-    double radius_t_frac;       /* how thick the three inner divider lines are */
+    double border_w;            /* a cell is on the outline if within this of one */
+    double radius_t_frac;       /* thickness of the three inner divider lines */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols, double hex_size)
 {
     g->rows = rows; g->cols = cols;
-    g->cw = CELL_W; g->ch = CELL_H;
+    g->cell_w = CELL_W; g->cell_h = CELL_H;
     g->hex_size = hex_size;
     g->ox = cols / 2;
     g->oy = (rows - 1) / 2;
@@ -140,12 +132,10 @@ static void ctx_init(GridCtx *g, int rows, int cols, double hex_size)
     g->radius_t_frac = RADIUS_T_FRAC;
 }
 
-/*
- * Pick the ASCII character ( - \ | / ) that best draws a line pointing in
- * the given direction. Flipping a line 180 degrees looks the same, so we
- * fold the angle into half a turn first. Borrowed from hex_grids/01_flat_top.c.
- */
-static char angle_char(double theta)
+/* The ASCII char ( - \ | / ) that best draws a line at the given angle.
+ * Flipping a line 180° looks the same, so fold the angle into half a turn
+ * first. Borrowed from hex_grids/01_flat_top.c. */
+static char edge_glyph(double theta)
 {
     double t = fmod(theta, M_PI);
     if (t < 0.0) t += M_PI;
@@ -156,13 +146,11 @@ static char angle_char(double theta)
     return '-';
 }
 
-/*
- * Given a point, find which hex it lands in. Also hands back dist: roughly
- * how far the point is from the hex centre on a 0-to-0.5 scale, so the
- * caller can tell whether it's near the centre or out near an edge.
- */
-static void pixel_to_hex(double px, double py, double size,
-                         int *Q, int *R, double *dist)
+/* recipe step 1 (reverse) — a pixel -> which hex (Q,R) it lands in, via cube
+ * rounding. dist is how far the point sits from the hex centre on a 0..0.5
+ * scale, so the caller can tell outline (near 0.5) from interior. */
+static void screen_to_hex(double px, double py, double size,
+                          int *Q, int *R, double *dist)
 {
     double sq3 = sqrt(3.0), sq3_3 = sq3 / 3.0;
     double fq = (2.0 / 3.0 * px) / size;
@@ -186,14 +174,15 @@ static void pixel_to_hex(double px, double py, double size,
     *dist = d;
 }
 
-static void hex_centre_pixel(int Q, int R, double size,
-                              double *cx, double *cy)
+/* the pixel at a hex's centre. */
+static void hex_centre_pixel(int Q, int R, double size, double *cx, double *cy)
 {
     double sq3 = sqrt(3.0);
     *cx = size * 1.5      * (double)Q;
     *cy = size * (sq3*0.5 * (double)Q + sq3 * (double)R);
 }
 
+/* the pixel at a wedge's centre: out from the hex centre toward sector*60°. */
 static void wedge_centroid_pixel(int Q, int R, int sector, double size,
                                  double *cx_pix, double *cy_pix)
 {
@@ -205,23 +194,20 @@ static void wedge_centroid_pixel(int Q, int R, int sector, double size,
     *cy_pix = cy + r * sin(ang);
 }
 
-/* Where on screen a given wedge sits: feed it (q, r, sector), get back a cell. */
-static void ctx_to_screen(const GridCtx *g, int q, int r, int sector,
+/* a wedge's address -> the character cell to draw its glyph on. */
+static void hex_to_screen(const GridCtx *g, int q, int r, int sector,
                           int *scol, int *srow)
 {
     double cx, cy;
     wedge_centroid_pixel(q, r, sector, g->hex_size, &cx, &cy);
-    *scol = g->ox + (int)(cx / g->cw);
-    *srow = g->oy + (int)(cy / g->ch);
+    *scol = g->ox + (int)(cx / g->cell_w);
+    *srow = g->oy + (int)(cy / g->cell_h);
 }
 
-/*
- * Draw the whole grid background: the hex outlines plus the three lines
- * that split each hex into wedges. Walks every screen cell, figures out
- * which hex it belongs to, and decides whether it's on an outline, on one
- * of the inner dividers, or empty.
- */
-static void ctx_draw_bg(const GridCtx *g)
+/* recipe step 2 — draw the grid: every cell -> its hex -> an outline char on
+ * rim cells, else one of the three divider chars near the inner spokes,
+ * else blank. Nothing stored; redrawn each frame. */
+static void draw_lattice(const GridCtx *g)
 {
     double sq3 = sqrt(3.0), sq3_2 = sq3 * 0.5;
     double limit_inner = 0.5 - g->border_w;
@@ -229,19 +215,18 @@ static void ctx_draw_bg(const GridCtx *g)
 
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
-            double px = (double)(col - g->ox) * g->cw;
-            double py = (double)(row - g->oy) * g->ch;
+            double px = (double)(col - g->ox) * g->cell_w;
+            double py = (double)(row - g->oy) * g->cell_h;
 
             int Q, R; double dist;
-            pixel_to_hex(px, py, g->hex_size, &Q, &R, &dist);
+            screen_to_hex(px, py, g->hex_size, &Q, &R, &dist);
 
             double cx, cy;
             hex_centre_pixel(Q, R, g->hex_size, &cx, &cy);
             double dxp = px - cx, dyp = py - cy;
 
             if (dist >= limit_inner) {
-                double theta = atan2(dyp, dxp);
-                char ch = angle_char(theta + M_PI / 2.0);
+                char ch = edge_glyph(atan2(dyp, dxp) + M_PI / 2.0);
                 attron(COLOR_PAIR(PAIR_BORDER) | A_BOLD);
                 mvaddch(row, col, (chtype)(unsigned char)ch);
                 attroff(COLOR_PAIR(PAIR_BORDER) | A_BOLD);
@@ -263,23 +248,23 @@ static void ctx_draw_bg(const GridCtx *g)
     }
 }
 
-/* ── §5 pool ── */
+/* ── §5 pool — the bag of placed glyphs ── */
 
-/* One placed glyph, remembered by which wedge it sits in rather than by pixel. */
+/* One placed glyph, pinned to a wedge by address (q,r,sector) rather than to a
+ * screen spot, so it stays put when the view changes.
+ *   alive — true if this slot holds a real glyph (vs. an empty slot) */
 typedef struct {
     int  q, r, sector;  /* the wedge: which hex (q,r) and which of its 6 slices */
     char glyph;         /* the character drawn there */
-    bool alive;         /* false means this slot is free for reuse */
+    bool alive;
 } Obj;
 
-/*
- * A fixed bucket of placed glyphs. We never grow or shrink it; removing a
- * glyph just copies the last one over the hole, so order doesn't matter and
- * we avoid any allocation while running.
- */
+/* The whole collection: a plain fixed-size array plus a count in use. No
+ * growing, no allocation — full at MAX_OBJ. Live ones stay packed at the
+ * front, so a removal just moves the last one into the gap. */
 typedef struct {
     Obj items[MAX_OBJ];
-    int count;          /* how many slots are in use, from the front */
+    int count;
 } Pool;
 
 static void pool_clear(Pool *p) { p->count = 0; }
@@ -321,7 +306,7 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     for (int i = 0; i < p->count; i++) {
         if (!p->items[i].alive) continue;
         int sc, sr;
-        ctx_to_screen(g, p->items[i].q, p->items[i].r, p->items[i].sector,
+        hex_to_screen(g, p->items[i].q, p->items[i].r, p->items[i].sector,
                       &sc, &sr);
         if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1)
             mvaddch(sr, sc, (chtype)(unsigned char)p->items[i].glyph);
@@ -329,17 +314,17 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_OBJECT) | A_BOLD);
 }
 
-/* ── §6 cursor ── */
+/* ── §6 cursor — the '@' you steer ── */
 
-/* The user's current spot and settings: which wedge is selected, plus UI state. */
+/* Where the '@' currently is: one wedge address, plus the user's UI knobs. */
 typedef struct {
     int q, r, sector;   /* the wedge the cursor points at */
     int glyph_idx;      /* which glyph in GLYPHS will be dropped next */
     int theme;          /* current colour theme */
-    int paused;         /* unused here; kept so the HUD can show it */
+    int paused;         /* shown in the HUD */
 } Cursor;
 
-/* How (q,r) shifts for each arrow key. Indexed by the codes used in cursor_move. */
+/* How (q,r) shifts for each arrow key, indexed by the codes used below. */
 static const int HEX_DIR[4][2] = {
     { 0, -1 },   /* UP    */
     { 0, +1 },   /* DOWN  */
@@ -356,6 +341,7 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->paused = 0;
 }
 
+/* step one hex in the arrow's direction, clamped to the roam bounds. */
 static void cursor_move(Cursor *cur, const GridCtx *g, int idx)
 {
     int nq = cur->q + HEX_DIR[idx][0];
@@ -365,6 +351,7 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int idx)
     cur->q = nq; cur->r = nr;
 }
 
+/* spin to the neighbouring wedge (6 wedges, wraps). */
 static void cursor_rotate_sector(Cursor *cur, int delta)
 {
     cur->sector = (cur->sector + delta + 6) % 6;
@@ -373,7 +360,7 @@ static void cursor_rotate_sector(Cursor *cur, int delta)
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sc, sr;
-    ctx_to_screen(g, cur->q, cur->r, cur->sector, &sc, &sr);
+    hex_to_screen(g, cur->q, cur->r, cur->sector, &sc, &sr);
     if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
         attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
         mvaddch(sr, sc, '@');
@@ -381,14 +368,7 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ── §7 mode ── */
-
-static void mode_toggle_at_cursor(Pool *p, const Cursor *cur)
-{
-    pool_toggle(p, cur->q, cur->r, cur->sector, GLYPHS[cur->glyph_idx]);
-}
-
-/* ── §8 scene ── */
+/* ── §7 scene ── */
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, const Pool *p,
                      double fps)
@@ -413,14 +393,14 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, const Pool *p,
                        double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_lattice(g);
     pool_draw(p, g);
     cursor_draw(cur, g);
     hud_draw(g, cur, p, fps);
     wnoutrefresh(stdscr); doupdate();
 }
 
-/* ── §9 screen ── */
+/* ── §8 screen ── */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(int theme)
@@ -431,7 +411,7 @@ static void screen_init(int theme)
     color_init(theme); atexit(screen_cleanup);
 }
 
-/* ── §10 app ── */
+/* ── §9 app — signals and the main loop ── */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 static void on_signal(int s)
@@ -475,7 +455,8 @@ int main(void)
                     break;
                 case 'C': pool_clear(&pool); break;
                 case 'g': cur.glyph_idx = (cur.glyph_idx + 1) % N_GLYPHS; break;
-                case ' ': mode_toggle_at_cursor(&pool, &cur); break;
+                case ' ': pool_toggle(&pool, cur.q, cur.r, cur.sector,
+                                      GLYPHS[cur.glyph_idx]); break;
                 case 't':
                     cur.theme = (cur.theme + 1) % N_THEMES;
                     color_init(cur.theme);

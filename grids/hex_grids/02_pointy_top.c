@@ -1,13 +1,12 @@
 /*
- * 02_pointy_top.c — a pointy-top hex grid you can move a cursor around with arrow keys.
+ * 02_pointy_top.c — a screen of pointy-top hexagons with a movable hex cursor.
  *
- * Same idea as 01_flat_top.c, but each hexagon is turned 30° so a corner points
- * straight up and the flat sides face left and right. Everything about the hex
- * coordinate math is the same; only the little formula that turns screen pixels
- * into hex coordinates (and back) is different.
+ * Same recipe as 01_flat_top.c, but each hex is turned 30° so a corner points
+ * up and the flat sides face left/right. Only the pixel<->hex mapping differs;
+ * the lattice, edge, cursor and boilerplate steps are identical to 01.
  *
- * Sister file: grids/hex_grids/01_flat_top.c (read it first — same cursor, same keys).
- * The pointy-top formulas come from redblobgames.com/grids/hexagons/#hex-to-pixel-pointy
+ * Sister file: 01_flat_top.c (read it first — same cursor, same keys).
+ * Reference:   Red Blob Games hex guide, https://www.redblobgames.com/grids/hexagons/
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -41,9 +40,7 @@
 #define N_THEMES           4
 #define TICK_NS           16666667LL
 
-/* How much each new frame's speed nudges the FPS number on screen, so it
- * reads as a smooth average instead of jittering frame to frame. */
-#define FPS_EWMA_ALPHA     0.05
+#define FPS_EWMA_ALPHA     0.05   /* small = steadier on-screen fps number */
 
 /* ── §2 clock ── */
 
@@ -64,9 +61,9 @@ static void clock_sleep_ns(int64_t ns)
 /* ── §3 color ── */
 
 #define PAIR_BORDER   1
-#define PAIR_CURSOR   2
-#define PAIR_HUD      3   /* yellow status bar */
-#define PAIR_HINT     4   /* cyan key-hint footer */
+#define PAIR_CURSOR   2   /* selected hex's outline and its '@' */
+#define PAIR_HUD      3
+#define PAIR_HINT     4
 
 static const short THEMES[N_THEMES][2] = {
     { COLOR_CYAN,   COLOR_BLACK },
@@ -85,35 +82,18 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula — turning hex coordinates into screen positions, and back ── */
+/* ── §4 hex mapping & lattice ── */
 
-/*
- * GridCtx — everything we need to know to draw the current grid: how big the
- * terminal is, how big each hex is, and where the grid is centered on screen.
- * This is the one place that knows the pointy-top orientation; the rest of the
- * file just asks it where things go. It holds settings, not the grid contents
- * (there is no stored grid — hexes are computed on the fly).
- */
+/* GridCtx — the whole hex grid for one frame. The (q,r)=(0,0) hex sits at
+ * screen centre; every other hex is measured outward from it. Keys +/- and
+ * [/] write hex_size / border_w; the rest is recomputed on resize. */
 typedef struct {
-    /* Size of the terminal window, in character cells. */
-    int rows, cols;
-
-    /* How the hexes look. hex_size is the hex "radius" in pixels (bigger =
-     * bigger hexes). border_w is how thick the outline is, as a fraction of a
-     * hex (0.10 means the outer 10% of each hex draws its border). cell_w and
-     * cell_h are how many pixels wide/tall one character cell counts as, so we
-     * can pretend characters are little square pixels. */
-    double hex_size;
-    double border_w;
-    int    cell_w, cell_h;
-
-    /* The character cell that sits at pixel (0,0) — the middle of the screen,
-     * which we treat as the center of hex (0,0). */
-    int    ox, oy;
-
-    /* Rough limit on how far the cursor can roam, just so we don't wander off
-     * forever. The hex plane is really infinite; these are only a guide. */
-    int    max_q, max_r;
+    int    rows, cols;      /* terminal size in character cells */
+    double hex_size;        /* centre-to-corner distance, pixels; bigger = fewer hexes */
+    double border_w;        /* outline band width, 0..0.5; how near an edge counts as edge */
+    int    cell_w, cell_h;  /* pixels per char cell (2 vs 4) — undoes the cell's tall aspect */
+    int    ox, oy;          /* screen-centre cell; the (0,0) hex lives here */
+    int    max_q, max_r;    /* rough furthest visible hex; advisory, never clamped */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols)
@@ -124,89 +104,83 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->cell_h = CELL_H;
     g->ox     = cols / 2;
     g->oy     = (rows - 1) / 2;
+    /* keep the user's chosen size/border across a resize; only seed if unset */
     if (g->hex_size <= 0.0) g->hex_size = HEX_SIZE_DEFAULT;
     if (g->border_w <= 0.0) g->border_w = BORDER_W_DEFAULT;
     g->max_q = (int)((double)cols * CELL_W / (sqrt(3.0) * g->hex_size)) + 1;
-    g->max_r = (int)((double)rows * CELL_H / (3.0      * g->hex_size)) + 1;
+    g->max_r = (int)((double)rows * CELL_H / (3.0       * g->hex_size)) + 1;
 }
 
-/*
- * Given a hex's coordinates, find which character cell sits at its center.
- * This is the "back door": hex coordinates in, screen position out. The
- * formula is the pointy-top one; flat-top would use a different one.
- */
-static void ctx_to_screen(const GridCtx *g, int Q, int R, int *sr, int *sc)
+/* one hex's centre in pixels, measured from the grid centre (pointy-top layout) */
+static void hex_center_pixel(double size, int q, int r, double *cx, double *cy)
 {
-    double sq3   = sqrt(3.0);
-    double sq3_2 = sq3 * 0.5;
-    double cx_pix = g->hex_size * (sq3   * (double)Q + sq3_2 * (double)R);
-    double cy_pix = g->hex_size * 1.5    * (double)R;
-    *sc = g->ox + (int)(cx_pix / g->cell_w);
-    *sr = g->oy + (int)(cy_pix / g->cell_h);
+    *cx = size * (sqrt(3.0) * (double)q + sqrt(3.0) * 0.5 * (double)r);
+    *cy = size * 1.5 * (double)r;
 }
 
-/*
- * Snap a fractional hex coordinate to the nearest real hex. Hex coordinates
- * come in three numbers that must always add up to zero; rounding each one
- * separately can break that, so we fix up whichever was rounded the hardest.
- */
-static void cube_round(double fq, double fr, double fs, int *Q, int *R)
+/* recipe step 1 — hex address (q,r) -> the screen cell at its centre */
+static void axial_to_screen(const GridCtx *g, int q, int r, int *sr, int *sc)
+{
+    double cx, cy;
+    hex_center_pixel(g->hex_size, q, r, &cx, &cy);
+    *sc = g->ox + (int)(cx / g->cell_w);
+    *sr = g->oy + (int)(cy / g->cell_h);
+}
+
+/* the reverse — a pixel offset from grid centre -> fractional hex (q,r,s).
+ * s = -q-r, so the three coordinates always sum to zero. */
+static void screen_to_axial_frac(const GridCtx *g, double px, double py,
+                                 double *fq, double *fr, double *fs)
+{
+    *fq = (sqrt(3.0) / 3.0 * px - 1.0 / 3.0 * py) / g->hex_size;
+    *fr = (2.0 / 3.0 * py) / g->hex_size;
+    *fs = -*fq - *fr;
+}
+
+/* snap fractional (q,r,s) to the nearest real hex. Rounding each on its own can
+ * push their sum off zero, so we re-derive whichever we rounded most. */
+static void cube_round(double fq, double fr, double fs, int *q, int *r)
 {
     int rq = (int)round(fq), rr = (int)round(fr), rs = (int)round(fs);
     double dq = fabs((double)rq - fq);
     double dr = fabs((double)rr - fr);
     double ds = fabs((double)rs - fs);
     if      (dq > dr && dq > ds) rq = -rr - rs;
-    else if (dr > ds)             rr = -rq - rs;
-    *Q = rq; *R = rr;
+    else if (dr > ds)            rr = -rq - rs;
+    *q = rq; *r = rr;
 }
 
-/*
- * The "front door": given a character cell on screen, figure out which hex
- * that point falls inside. Currently unused, kept as the mirror image of
- * ctx_to_screen for anyone who needs to map clicks back to hexes.
- */
-__attribute__((unused))
-static void ctx_pixel_to_axial(const GridCtx *g, int sr, int sc, int *Q, int *R)
+/* how near a hex edge a fractional point is: 0 at the centre, 0.5 at an edge */
+static double hex_edge_distance(double fq, double fr, double fs, int q, int r)
 {
-    double sq3_3 = sqrt(3.0) / 3.0;
-    double px = (double)(sc - g->ox) * g->cell_w;
-    double py = (double)(sr - g->oy) * g->cell_h;
-    double fq = (sq3_3 * px - 1.0/3.0 * py) / g->hex_size;
-    double fr = (2.0/3.0 * py) / g->hex_size;
-    double fs = -fq - fr;
-    cube_round(fq, fr, fs, Q, R);
+    double dq = fabs(fq - (double)q);
+    double dr = fabs(fr - (double)r);
+    double ds = fabs(fs - (double)(-q - r));
+    double d = dq;
+    if (dr > d) d = dr;
+    if (ds > d) d = ds;
+    return d;
 }
 
-/*
- * Pick the line character that best matches the slope of an edge: a flat edge
- * gets '-', a steep one gets '|', and the slanted ones get '/' or '\'. We feed
- * it the direction from the hex center out to the pixel, so it works the same
- * for pointy-top and flat-top — the angles just come out differently.
- */
-static char angle_char(double theta)
+/* the ASCII glyph whose slant lies along an edge at angle theta: '-' flattish,
+ * '|' steep, '/' and '\' between. The glyphs look the same flipped 180°, so we
+ * fold theta into [0,pi). */
+static char edge_glyph(double theta)
 {
     double t = fmod(theta, M_PI);
     if (t < 0.0) t += M_PI;
-    if      (t < M_PI / 8.0)         return '-';
-    else if (t < 3.0 * M_PI / 8.0)   return '\\';
-    else if (t < 5.0 * M_PI / 8.0)   return '|';
-    else if (t < 7.0 * M_PI / 8.0)   return '/';
-    else                              return '-';
+    if      (t < M_PI / 8.0)        return '-';
+    else if (t < 3.0 * M_PI / 8.0)  return '\\';
+    else if (t < 5.0 * M_PI / 8.0)  return '|';
+    else if (t < 7.0 * M_PI / 8.0)  return '/';
+    else                            return '-';
 }
 
-/*
- * Draw all the hex outlines. We don't store a grid — instead we walk every
- * character cell on screen, ask "which hex does this point belong to, and is
- * it near that hex's edge?", and if so draw an edge character there. The hex
- * the cursor is sitting on gets drawn in the cursor color so it stands out.
- */
-static void ctx_draw_bg(const GridCtx *g, int cQ, int cR)
+/* recipe step 2 — draw the grid: for every screen cell, find its hex and how
+ * near an edge it sits. Near an edge -> an outline glyph; deep inside -> blank.
+ * The cursor's hex is drawn in its own colour. */
+static void draw_lattice(const GridCtx *g, int cur_q, int cur_r)
 {
-    double sq3   = sqrt(3.0);
-    double sq3_3 = sq3 / 3.0;
-    double sq3_2 = sq3 * 0.5;
-    double size  = g->hex_size;
     double limit = 0.5 - g->border_w;
 
     for (int row = 0; row < g->rows - 1; row++) {
@@ -214,37 +188,20 @@ static void ctx_draw_bg(const GridCtx *g, int cQ, int cR)
             double px = (double)(col - g->ox) * g->cell_w;
             double py = (double)(row - g->oy) * g->cell_h;
 
-            /* Which hex does this pixel fall in? (pointy-top front door) */
-            double fq = (sq3_3 * px - 1.0/3.0 * py) / size;
-            double fr = (2.0/3.0 * py) / size;
-            double fs = -fq - fr;
+            double fq, fr, fs;
+            screen_to_axial_frac(g, px, py, &fq, &fr, &fs);
+            int q, r;
+            cube_round(fq, fr, fs, &q, &r);
 
-            int rq = (int)round(fq), rr = (int)round(fr), rs = (int)round(fs);
-            double dq = fabs((double)rq - fq);
-            double dr = fabs((double)rr - fr);
-            double ds = fabs((double)rs - fs);
-            if      (dq > dr && dq > ds) rq = -rr - rs;
-            else if (dr > ds)             rr = -rq - rs;
-            int Q = rq, R = rr;
+            if (hex_edge_distance(fq, fr, fs, q, r) < limit) continue;  /* inside the hex */
 
-            double fQ = (double)Q, fR = (double)R, fS = (double)(-Q - R);
-            double dist = fabs(fq - fQ);
-            double d2   = fabs(fr - fR);
-            double d3   = fabs(fs - fS);
-            if (d2 > dist) dist = d2;
-            if (d3 > dist) dist = d3;
-            if (dist < limit) continue;  /* well inside a hex — leave it blank */
+            double cx, cy;
+            hex_center_pixel(g->hex_size, q, r, &cx, &cy);
+            char ch = edge_glyph(atan2(py - cy, px - cx) + M_PI / 2.0);
 
-            /* Near an edge: find this hex's center so we know which way the
-             * edge runs, then pick the matching line character. */
-            double cx = size * (sq3 * fQ + sq3_2 * fR);
-            double cy = size * 1.5 * fR;
-            double theta = atan2(py - cy, px - cx);
-            char ch = angle_char(theta + M_PI / 2.0);
-
-            int on_cur = (Q == cQ && R == cR);
-            int attr   = on_cur ? (COLOR_PAIR(PAIR_CURSOR) | A_BOLD)
-                                : (COLOR_PAIR(PAIR_BORDER) | A_BOLD);
+            int attr = (q == cur_q && r == cur_r)
+                       ? (COLOR_PAIR(PAIR_CURSOR) | A_BOLD)
+                       : (COLOR_PAIR(PAIR_BORDER) | A_BOLD);
             attron(attr);
             mvaddch(row, col, (chtype)(unsigned char)ch);
             attroff(attr);
@@ -254,12 +211,8 @@ static void ctx_draw_bg(const GridCtx *g, int cQ, int cR)
 
 /* ── §5 cursor ── */
 
-/*
- * Where the '@' currently sits, named by hex coordinates (q, r). That's all the
- * state the cursor needs — its pixel position is worked out from these when we
- * draw. Same little struct as 01_flat_top, because hex coordinates don't care
- * which way the hexes are turned.
- */
+/* Cursor — which hex is selected, named by its (q,r). The third coordinate is
+ * always -q-r, so it isn't stored. Pair with a GridCtx to find it on screen. */
 typedef struct { int q, r; } Cursor;
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
@@ -269,20 +222,17 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->r = 0;
 }
 
-/*
- * The four arrow-key steps, written as changes to (q, r): up, down, left,
- * right. These are the same numbers as in 01_flat_top, even though the hexes
- * are turned, because the steps are in hex coordinates, not screen pixels —
- * "one hex right" is the same move either way. (The two diagonal hex
- * neighbours aren't reachable here; only four directions are wired up.)
- */
+/* what each arrow key adds to (q,r) to step onto a neighbouring hex. Steps are
+ * in hex coordinates, so they match 01 even though the hexes are turned; the
+ * arrows reach four of the six neighbours (the others sit on diagonals). */
 static const int HEX_DIR[4][2] = {
-    { 0, -1 },   /* UP    */
-    { 0, +1 },   /* DOWN  */
-    {-1,  0 },   /* LEFT  */
-    {+1,  0 },   /* RIGHT */
+    { 0, -1 },   /* up    */
+    { 0, +1 },   /* down  */
+    {-1,  0 },   /* left  */
+    {+1,  0 },   /* right */
 };
 
+/* recipe step 3 — move the cursor by one hex. The grid is unbounded, so no clamp. */
 static void cursor_move(Cursor *cur, const GridCtx *g, int dq, int dr)
 {
     (void)g;
@@ -290,11 +240,11 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dq, int dr)
     cur->r += dr;
 }
 
-/* Draw the '@' marker at the center of whichever hex the cursor is on. */
+/* drop the '@' on the selected hex; called after the grid so it lands on top */
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc;
-    ctx_to_screen(g, cur->q, cur->r, &sr, &sc);
+    axial_to_screen(g, cur->q, cur->r, &sr, &sc);
     if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
         attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
         mvaddch(sr, sc, '@');
@@ -326,7 +276,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, int theme,
                        int paused, double fps)
 {
     erase();
-    ctx_draw_bg(g, cur->q, cur->r);
+    draw_lattice(g, cur->q, cur->r);
     cursor_draw(cur, g);
     hud_draw(g, cur, theme, paused, fps);
     wnoutrefresh(stdscr);
@@ -379,10 +329,9 @@ int main(void)
     int64_t prev = clock_ns();
 
     while (g_running) {
-        /* Window resized: bounce ncurses so it learns the new size, then
-         * re-center the grid to fit. */
         if (g_need_resize) {
             g_need_resize = 0;
+            /* endwin/refresh is how ncurses picks up the new terminal size */
             endwin(); refresh();
             ctx_init(&g, LINES, COLS);
         }

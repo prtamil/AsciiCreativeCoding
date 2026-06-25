@@ -117,18 +117,18 @@ static void color_init(int theme)
 /* Everything needed to map a hex address to a spot on screen and back.
  * Built once at startup and rebuilt on resize. */
 typedef struct {
-    int    rows, cols;            /* terminal size in characters */
-    int    cw, ch;               /* how many sub-pixels one character cell is wide/tall */
-    double hex_size;             /* hex radius in sub-pixels; bigger = chunkier grid */
-    int    ox, oy;               /* screen cell that hex (0,0) sits on */
-    int    max_q, max_r;         /* how far the cursor may roam from the centre */
+    int    rows, cols;              /* terminal size in characters */
+    int    cell_w, cell_h;          /* sub-pixels per character column / row */
+    double hex_size;                /* hex radius in sub-pixels; bigger = chunkier grid */
+    int    ox, oy;                  /* screen cell that hex (0,0) sits on */
+    int    max_q, max_r;            /* how far the cursor may roam from the centre */
     double border_w, radius_t_frac; /* how thick the hex outline and the 3 inner cuts draw */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols, double hex_size)
 {
     g->rows = rows; g->cols = cols;
-    g->cw = CELL_W; g->ch = CELL_H;
+    g->cell_w = CELL_W; g->cell_h = CELL_H;
     g->hex_size = hex_size;
     g->ox = cols / 2;
     g->oy = (rows - 1) / 2;
@@ -149,8 +149,10 @@ static char angle_char(double theta)
     return '-';
 }
 
-static void pixel_to_hex(double px, double py, double size,
-                         int *Q, int *R, double *dist)
+/* recipe step 1 (reverse) — a pixel -> nearest hex (q,r), via cube-round.
+ * dist is the cube-rounding error; the lattice uses it to find outline cells. */
+static void screen_to_hex(double px, double py, double size,
+                          int *Q, int *R, double *dist)
 {
     double sq3 = sqrt(3.0), sq3_3 = sq3 / 3.0;
     double fq = (2.0 / 3.0 * px) / size;
@@ -191,16 +193,20 @@ static void wedge_centroid_pixel(int Q, int R, int sector, double size,
     *cy_pix = cy + r * sin(ang);
 }
 
-static void ctx_to_screen(const GridCtx *g, int q, int r, int sector,
+/* recipe step 1 — a hex address (q,r) + wedge -> the character cell to draw on,
+ * via the wedge centroid in pixels. */
+static void hex_to_screen(const GridCtx *g, int q, int r, int sector,
                           int *scol, int *srow)
 {
     double cx, cy;
     wedge_centroid_pixel(q, r, sector, g->hex_size, &cx, &cy);
-    *scol = g->ox + (int)(cx / g->cw);
-    *srow = g->oy + (int)(cy / g->ch);
+    *scol = g->ox + (int)(cx / g->cell_w);
+    *srow = g->oy + (int)(cy / g->cell_h);
 }
 
-static void ctx_draw_bg(const GridCtx *g)
+/* recipe step 2 — draw the grid: every cell -> its hex -> an outline char on
+ * border cells and a slash on the 3 inner radius cuts. Nothing stored. */
+static void draw_lattice(const GridCtx *g)
 {
     double sq3 = sqrt(3.0), sq3_2 = sq3 * 0.5;
     double limit_inner = 0.5 - g->border_w;
@@ -208,10 +214,10 @@ static void ctx_draw_bg(const GridCtx *g)
 
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
-            double px = (double)(col - g->ox) * g->cw;
-            double py = (double)(row - g->oy) * g->ch;
+            double px = (double)(col - g->ox) * g->cell_w;
+            double py = (double)(row - g->oy) * g->cell_h;
             int Q, R; double dist;
-            pixel_to_hex(px, py, g->hex_size, &Q, &R, &dist);
+            screen_to_hex(px, py, g->hex_size, &Q, &R, &dist);
             double cx, cy;
             hex_centre_pixel(Q, R, g->hex_size, &cx, &cy);
             double dxp = px - cx, dyp = py - cy;
@@ -279,7 +285,7 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     for (int i = 0; i < p->count; i++) {
         if (!p->items[i].alive) continue;
         int sc, sr;
-        ctx_to_screen(g, p->items[i].q, p->items[i].r, p->items[i].sector,
+        hex_to_screen(g, p->items[i].q, p->items[i].r, p->items[i].sector,
                       &sc, &sr);
         if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1)
             mvaddch(sr, sc, (chtype)(unsigned char)p->items[i].glyph);
@@ -331,7 +337,7 @@ static void cursor_rotate_sector(Cursor *cur, int delta)
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sc, sr;
-    ctx_to_screen(g, cur->q, cur->r, cur->sector, &sc, &sr);
+    hex_to_screen(g, cur->q, cur->r, cur->sector, &sc, &sr);
     if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
         attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
         mvaddch(sr, sc, '@');
@@ -426,7 +432,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, const Pool *p,
                        double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_lattice(g);
     pool_draw(p, g);
     cursor_draw(cur, g);
     hud_draw(g, cur, p, fps);

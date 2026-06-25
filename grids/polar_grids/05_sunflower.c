@@ -1,17 +1,13 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 05_sunflower.c — the spiral dot pattern at the centre of a sunflower.
+ * 05_sunflower.c — phyllotaxis: seed n sits at r = spacing·√n, turned n·θ
+ * round, where θ is the golden angle (~137.5°). That one turn per seed packs
+ * the dots into the interlocking spirals of a sunflower head. An '@' marks one
+ * seed (arrows move it); 'g' swaps in other turn angles to break the pattern.
  *
- * Drops seeds one by one around a centre, each a bit farther out and turned
- * by the "golden angle." That single turn is what makes the dots settle into
- * the interlocking spirals you see in sunflowers, pinecones, and daisies. An
- * '@' marker sits on one chosen seed; arrows move it, and 'g' swaps in other
- * turn angles so you can watch the nice pattern fall apart.
- *
- * Sister files: 04_log_spiral.c, 03_archimedean_spiral.c (other spiral shapes),
- * ../rect_grids/01_uniform_rect.c (where the GridCtx layout came from).
- * Background: Vogel H (1979), "A better way to construct the sunflower head,"
- * Mathematical Biosciences 44(3–4):179–189; en.wikipedia.org/wiki/Golden_angle.
+ * Sister files: 04_log_spiral.c, 03_archimedean_spiral.c (other spirals),
+ *               01_rings_spokes.c (shared GridCtx / cursor template).
+ * Ref: Vogel H (1979), Math. Biosciences 44:179–189; the golden angle.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -32,43 +28,37 @@
 /* ── §1 config ── */
 
 #define TARGET_FPS         30
-#define CELL_W             2
-#define CELL_H             4
 
-/* The golden ratio, and the turn angle that gives every seed a fresh
- * direction (about 137.5°). This special turn is the whole trick. */
-#define PHI                1.61803398874989484820
-#define GOLDEN_ANGLE       (2.0 * M_PI / (PHI * PHI))
+#define CELL_W             2   /* pixels per char cell (2 wide x 4 tall) — */
+#define CELL_H             4   /* keeps the flower head round, not oval */
 
-/* How far apart the seeds sit — bigger means a bigger flower head. */
-#define SPACING_DEFAULT    3.5
+#define PHI                1.61803398874989484820   /* golden ratio */
+#define GOLDEN_ANGLE       (2.0 * M_PI / (PHI * PHI))  /* ~137.5°, the magic turn */
+
+#define SPACING_DEFAULT    3.5   /* pixels between successive seeds */
 #define SPACING_MIN        1.5
 #define SPACING_MAX        8.0
 #define SPACING_STEP       0.5
 
-/* How many seeds to draw. */
 #define N_SEEDS_DEFAULT    800
 #define N_SEEDS_MIN        100
 #define N_SEEDS_MAX       4096
 #define N_SEEDS_STEP       100
 
-/* Turn angles the 'g' key cycles through, to compare against the golden one.
- * Most of these are "tidy" fractions of a full turn, which is exactly why
- * they make ugly spokes instead of the even spiral fill. */
+/* Turn angles the 'g' key cycles, to compare against the golden one. The tidy
+ * fractions of a full turn make spokes instead of an even spiral fill. */
 static const double ANGLE_TABLE[] = {
-    2.0 * M_PI / (PHI * PHI),    /* the golden angle — fills evenly      */
-    2.0 * M_PI / 5.0,            /* 72° — seeds line up into 5 spokes     */
-    2.0 * M_PI / 8.0,            /* 45° — 8 spokes                        */
-    2.0 * M_PI * (1.0 - 1.0/PHI),/* same as golden, just measured the other way */
-    2.0 * M_PI * 0.382,          /* close to golden but not quite — gaps appear */
+    2.0 * M_PI / (PHI * PHI),    /* golden — fills evenly                      */
+    2.0 * M_PI / 5.0,            /* 72° — seeds line up into 5 spokes          */
+    2.0 * M_PI / 8.0,            /* 45° — 8 spokes                             */
+    2.0 * M_PI * (1.0 - 1.0/PHI),/* golden, measured the other way             */
+    2.0 * M_PI * 0.382,          /* near golden — gaps appear                  */
 };
 #define N_ANGLES  5
 
-/* The character drawn for each seed. */
 #define SEED_CHAR  'o'
 
-/* How heavily we smooth the FPS number so it doesn't jitter every frame. */
-#define FPS_EWMA_ALPHA     0.05
+#define FPS_EWMA_ALPHA     0.05   /* small = steadier on-screen fps number */
 
 #define PAIR_GRID    1
 #define PAIR_CURSOR  2
@@ -111,32 +101,22 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,  -1);
 }
 
-/* ── §4 formula — turning a seed number into a screen cell ── */
+/* ── §4 phyllotaxis mapping & lattice ── */
 
-/*
- * GridCtx — everything needed to lay out the flower in the current terminal.
- *
- * The three values that shape the pattern are spacing, angle, and n_seeds;
- * the rest is bookkeeping so we always know where the centre is and which
- * seed numbers are valid.
- */
+/* GridCtx — the flower head for one frame: screen size, where the centre sits,
+ * and the three knobs that shape the spiral (spacing, angle, n_seeds). Seeds
+ * are computed one number at a time from these, so this is the single source of
+ * truth for the picture and the cursor limits. Always centred on (ox, oy). */
 typedef struct {
-    int rows, cols;        /* terminal size in character cells              */
-
-    double spacing;        /* how far apart seeds sit (bigger = larger head)*/
-    double angle;          /* turn between seeds, in radians                */
-    int    n_seeds;        /* how many seeds to draw                        */
-    int    cell_w, cell_h; /* a cell is taller than wide; used to keep circles round */
-
-    int    ox, oy;         /* centre of the flower, in cells                */
-
-    int    max_n;          /* highest valid seed number (n_seeds − 1)       */
+    int    rows, cols;     /* terminal size in character cells */
+    double spacing;        /* pixels between seeds; +/- changes it (bigger head) */
+    double angle;          /* turn between seeds, radians; g cycles it */
+    int    n_seeds;        /* how many seeds to draw; [/] changes it */
+    int    cell_w, cell_h; /* pixels per cell (CELL_W / CELL_H) */
+    int    ox, oy;         /* flower centre, as a cell column and row */
+    int    max_n;          /* highest valid seed number; n_seeds - 1 */
 } GridCtx;
 
-/*
- * Recompute the layout for the current terminal size. We don't track an
- * outer edge — seeds that land off-screen are simply skipped while drawing.
- */
 static void ctx_init(GridCtx *g, int rows, int cols)
 {
     g->rows   = rows;
@@ -149,15 +129,13 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     if (g->angle   <= 0.0) g->angle   = GOLDEN_ANGLE;
     if (g->n_seeds <= 0)   g->n_seeds = N_SEEDS_DEFAULT;
     g->max_n = g->n_seeds - 1;
+    /* no outer ring: seeds that land off-screen are skipped while drawing */
 }
 
-/*
- * Where on screen does seed n land? Seed n sits at distance √n × spacing from
- * the centre, turned n times by the angle. We turn that distance-and-direction
- * into a row and column. Dividing by the cell width and height makes up for
- * cells being taller than they are wide, so the flower looks round, not squashed.
- */
-static void ctx_to_screen(const GridCtx *g, int n, int *sr, int *sc)
+/* recipe step 1 — seed n -> the screen cell it lands on. Seed n sits √n
+ * spacings out, turned n times by the angle; dividing by cell_w/cell_h undoes
+ * the tall-cell aspect so the head reads round. */
+static void seed_position(const GridCtx *g, int n, int *sr, int *sc)
 {
     double r_n     = sqrt((double)n) * g->spacing;
     double theta_n = (double)n * g->angle;
@@ -165,27 +143,20 @@ static void ctx_to_screen(const GridCtx *g, int n, int *sr, int *sc)
     *sr = g->oy + (int)round(r_n * sin(theta_n) / (double)g->cell_h);
 }
 
-/*
- * Draw the whole flower: walk through every seed number, work out its cell,
- * and place a character there. Two seeds can round to the same cell; we let
- * the first one win and quietly skip the second so the dot doesn't get
- * overwritten. The √i spacing is what keeps the dots evenly packed all the
- * way out, instead of crowding near the edge.
- */
-static void ctx_draw_bg(const GridCtx *g)
+/* recipe step 2 — draw the flower: walk seed 0..n_seeds, place SEED_CHAR at
+ * each. Two seeds can round to one cell; the first wins (visited[] skips the
+ * rest) so a dot is never overdrawn. The √n radius is what keeps the packing
+ * even all the way out instead of crowding at the edge. */
+static void draw_lattice(const GridCtx *g)
 {
     int rows = g->rows, cols = g->cols;
-    /* Tracks which cells already have a seed, so we don't draw one twice. */
     bool visited[rows][cols];
     memset(visited, 0, sizeof(bool) * (size_t)(rows * cols));
 
     attron(COLOR_PAIR(PAIR_GRID));
-    for (int i = 0; i < g->n_seeds; i++) {
-        double r   = sqrt((double)i) * g->spacing;
-        double th  = (double)i * g->angle;
-        int sc = g->ox + (int)round(r * cos(th) / (double)g->cell_w);
-        int sr = g->oy + (int)round(r * sin(th) / (double)g->cell_h);
-
+    for (int n = 0; n < g->n_seeds; n++) {
+        int sr, sc;
+        seed_position(g, n, &sr, &sc);
         if (sr < 0 || sr >= rows - 1 || sc < 0 || sc >= cols) continue;
         if (visited[sr][sc]) continue;
         visited[sr][sc] = true;
@@ -196,28 +167,18 @@ static void ctx_draw_bg(const GridCtx *g)
 
 /* ── §5 cursor ── */
 
-/*
- * Cursor — just the number of the seed we're pointing at.
- *
- * That single number is the whole address: ask GridCtx where seed n is and
- * you get its spot on screen. The valid range and all the geometry live in
- * GridCtx, so the cursor itself stays this simple.
- */
+/* Cursor — the seed number we point at. That one number is the whole address;
+ * ask seed_position where it is and you get its screen cell. Range 0..max_n. */
 typedef struct { int n; } Cursor;
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
 {
-    cur->n = g->max_n / 4;     /* start partway out — not the centre, not the edge */
+    cur->n = g->max_n / 4;     /* partway out — not the centre, not the edge */
 }
 
-/*
- * Move the marker and keep it on a real seed.
- *
- * Left/right step to the neighbouring seed number. Up/down jump by several at
- * once: neighbouring seed numbers land on opposite sides of the flower, so a
- * single step looks like a teleport — a bigger jump instead traces along one
- * of the visible spiral arms.
- */
+/* recipe step 3 — move the marker, clamped to a real seed. Up/down jump by a
+ * whole arm: adjacent seed numbers land on opposite sides of the head, so a
+ * single step looks like a teleport; a bigger jump traces one spiral arm. */
 #define CURSOR_RING_STEP 8
 static void cursor_move(Cursor *cur, const GridCtx *g, int d_n)
 {
@@ -227,10 +188,11 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int d_n)
     cur->n = nn;
 }
 
+/* draw the '@' on the cursor's seed; after the lattice so it sits on top */
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc;
-    ctx_to_screen(g, cur->n, &sr, &sc);
+    seed_position(g, cur->n, &sr, &sc);
     if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
         attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
         mvaddch(sr, sc, (chtype)'@');
@@ -266,7 +228,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, int angle_idx,
                        int theme, bool paused, double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_lattice(g);
     cursor_draw(cur, g);
     hud_draw(g, cur, angle_idx, theme, paused, fps);
     wnoutrefresh(stdscr); doupdate();

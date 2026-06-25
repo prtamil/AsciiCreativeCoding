@@ -93,29 +93,24 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 gridctx ── */
+/* ── §4 tri mapping & lattice ── */
 
-/*
- * GridCtx — everything we need to know to place triangles on screen: how big
- * the terminal is, how big each triangle should be, where the grid is centred,
- * and how far the cursor is allowed to wander.
- *
- * The triangle size lives in here rather than a fixed #define so '+'/'-' can
- * resize the grid at runtime. The grid itself goes on forever in theory;
- * max_col/max_row just fence the cursor into the part you can actually see.
- */
+/* GridCtx — the triangle grid for one frame plus the user's live knobs.
+ * Positions are sub-pixels first, then divided to character cells, so triangle
+ * size can change smoothly. Centred on (ox,oy) so glyphs stay on their triangle
+ * across a resize. max_col/max_row fence the cursor into the visible window. */
 typedef struct {
     int    rows, cols;            /* terminal size, in cells */
-    int    cw, ch;                /* how many sub-pixels one cell is worth (=CELL_W, CELL_H) */
-    double tri_size;              /* length of a triangle side, in pixels */
-    int    ox, oy;                /* screen cell the grid is centred on */
+    int    cell_w, cell_h;        /* sub-pixels per character column / row */
+    double tri_size;              /* triangle side length, in sub-pixels */
+    int    ox, oy;                /* grid (0,0) on screen; re-centred each frame */
     int    max_col, max_row;      /* how far the cursor may roam from centre */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols, double tri_size)
 {
     g->rows = rows; g->cols = cols;
-    g->cw = CELL_W; g->ch = CELL_H;
+    g->cell_w = CELL_W; g->cell_h = CELL_H;
     g->tri_size = tri_size;
     g->ox = cols / 2;
     g->oy = (rows - 1) / 2;
@@ -124,8 +119,10 @@ static void ctx_init(GridCtx *g, int rows, int cols, double tri_size)
     g->max_row = rows / 2;
 }
 
-/* Given a point on screen, work out which triangle it lands in. */
-static void pixel_to_tri(double px, double py, double size,
+/* recipe step 1 (reverse) — a pixel -> which triangle (col,row,up) + where
+ * inside (fa,fb). Undo the slant: a = px/size - b/2; fa+fb >= 1 means the up
+ * (△) half, else the down (▽) half. Isometric grid shares this slant mapping. */
+static void screen_to_tri(double px, double py, double size,
                          int *col, int *row, int *up,
                          double *fa, double *fb)
 {
@@ -140,25 +137,26 @@ static void pixel_to_tri(double px, double py, double size,
     *up = (*fa + *fb >= 1.0) ? 1 : 0;
 }
 
-/* Find the middle point of a given triangle, in screen pixels. */
+/* the pixel at a triangle's centre (1/3 in from the corners: ▽ at +1/3, △ at
+ * +2/3). This is where the cursor/glyph is drawn so it lands cleanly inside. */
 static void tri_centroid_pixel(int col, int row, int up, double size,
-                               double *cx, double *cy)
+                               double *cx_pix, double *cy_pix)
 {
     double h = size * sqrt(3.0) * 0.5;
     double a = (up == 0) ? ((double)col + 1.0/3.0) : ((double)col + 2.0/3.0);
     double b = (up == 0) ? ((double)row + 1.0/3.0) : ((double)row + 2.0/3.0);
-    *cx = (a + 0.5 * b) * size;
-    *cy = b * h;
+    *cx_pix = (a + 0.5 * b) * size;
+    *cy_pix = b * h;
 }
 
-/* Turn a triangle address into the screen cell to draw its marker in. */
-static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
+/* a triangle's address -> the character cell to draw on. */
+static void tri_to_screen(const GridCtx *g, int col, int row, int up,
                           int *scol, int *srow)
 {
-    double cx, cy;
-    tri_centroid_pixel(col, row, up, g->tri_size, &cx, &cy);
-    *scol = g->ox + (int)(cx / g->cw);
-    *srow = g->oy + (int)(cy / g->ch);
+    double cx_pix, cy_pix;
+    tri_centroid_pixel(col, row, up, g->tri_size, &cx_pix, &cy_pix);
+    *scol = g->ox + (int)(cx_pix / g->cell_w);
+    *srow = g->oy + (int)(cy_pix / g->cell_h);
 }
 
 /*
@@ -176,19 +174,17 @@ static int palette_index(int col, int row, int up)
     return k;
 }
 
-/*
- * Paint the whole grid: for every cell on screen, figure out which triangle
- * covers it and colour the cell with that triangle's colour.
- */
-static void ctx_draw_bg(const GridCtx *g)
+/* recipe step 2 — draw the grid: every cell -> its triangle -> a solid colour
+ * fill (no edges; the colour ring is what reads as stacked cubes). */
+static void draw_lattice(const GridCtx *g)
 {
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
-            double px = (double)(col - g->ox) * g->cw;
-            double py = (double)(row - g->oy) * g->ch;
+            double px = (double)(col - g->ox) * g->cell_w;
+            double py = (double)(row - g->oy) * g->cell_h;
             int    tC, tR, tU;
             double fa, fb;
-            pixel_to_tri(px, py, g->tri_size, &tC, &tR, &tU, &fa, &fb);
+            screen_to_tri(px, py, g->tri_size, &tC, &tR, &tU, &fa, &fb);
             int pair = PAIR_FILL_BASE + palette_index(tC, tR, tU);
             attron(COLOR_PAIR(pair));
             mvaddch(row, col, ' ');
@@ -260,7 +256,7 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     for (int i = 0; i < p->count; i++) {
         if (!p->items[i].alive) continue;
         int sc, sr;
-        ctx_to_screen(g, p->items[i].col, p->items[i].row, p->items[i].up,
+        tri_to_screen(g, p->items[i].col, p->items[i].row, p->items[i].up,
                       &sc, &sr);
         if (sc < 0 || sc >= g->cols || sr < 0 || sr >= g->rows - 1) continue;
         int pair = PAIR_FILL_BASE +
@@ -323,7 +319,7 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dir)
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sc, sr;
-    ctx_to_screen(g, cur->col, cur->row, cur->up, &sc, &sr);
+    tri_to_screen(g, cur->col, cur->row, cur->up, &sc, &sr);
     if (sc < 0 || sc >= g->cols || sr < 0 || sr >= g->rows - 1) return;
     int pair = PAIR_FILL_BASE + palette_index(cur->col, cur->row, cur->up);
     attron(COLOR_PAIR(pair) | A_BOLD | A_REVERSE);
@@ -364,7 +360,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, const Pool *p,
                        double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_lattice(g);
     pool_draw(p, g);
     cursor_draw(cur, g);
     hud_draw(g, cur, p, fps);

@@ -93,7 +93,7 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 gridctx ── */
+/* ── §4 grid mapping & backgrounds ── */
 
 /* The 14 background grid styles you can cycle through with a/e. GM_COUNT is
  * the tally, used for the array sizes and for wrapping around when cycling. */
@@ -189,7 +189,7 @@ static void ctx_init(GridCtx *g, GridMode m, int rows, int cols)
     ctx_set_bounds(g, m, rows, cols);
 }
 
-static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
+static void cell_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
     switch (g->mode) {
     case GM_DIAMOND: *sc=g->ox+(c-r)*DM_IW; *sr=g->oy+(c+r)*DM_IH; break;
@@ -336,7 +336,7 @@ static void bg_draw_dot(const GridCtx *g)
 
 /* Paints the background for whatever style is active. The five plain-grid
  * styles all look the same, so they share one drawer. */
-static void ctx_draw_bg(const GridCtx *g)
+static void draw_grid(const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_GRID));
     switch (g->mode) {
@@ -388,7 +388,7 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     attron(COLOR_PAIR(PAIR_OBJ)|A_BOLD);
     for (int i=0; i<p->count; i++) {
         if (!p->items[i].alive) continue;
-        int sr,sc; ctx_to_screen(g,p->items[i].r,p->items[i].c,&sr,&sc);
+        int sr,sc; cell_to_screen(g,p->items[i].r,p->items[i].c,&sr,&sc);
         if (g->mode!=GM_DIAMOND&&g->mode!=GM_ISO&&g->mode!=GM_RULED)
             { sr+=(g->ch>1?1:0); sc+=(g->cw>1?1:0); }
         if (sr>=0&&sr<g->rows-1&&sc>=0&&sc<g->cols)
@@ -402,11 +402,11 @@ static void pool_draw(const Pool *p, const GridCtx *g)
 static int iabs(int x) { return x<0?-x:x; }
 static int isign(int x) { return x>0?1:x<0?-1:0; }
 
-/* Draws the straightest grid line between two points (Bresenham's line).
- * The trick: step along the longer direction every cell, and only step
- * sideways when a running tally says we've drifted too far off the true line.
- * That keeps it gapless with no fractions or floating point. */
-static void path_line(Pool *p, const GridCtx *g,
+/* THE DISTINCT STEP — lay objects along a straight line of cells between A and
+ * B (Bresenham's line walk). Step one cell along the longer axis each iteration;
+ * step the shorter axis only when a running integer error says we've drifted too
+ * far off the true line. Gapless, no fractions or floating point. */
+static void cell_line(Pool *p, const GridCtx *g,
                       int r0, int c0, int r1, int c1, char glyph)
 {
     int dr=iabs(r1-r0), dc=iabs(c1-c0);
@@ -516,7 +516,7 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
 
 static void mark_at(const GridCtx *g, int r, int c, chtype ch)
 {
-    int sr,sc; ctx_to_screen(g,r,c,&sr,&sc);
+    int sr,sc; cell_to_screen(g,r,c,&sr,&sc);
     if (g->mode!=GM_DIAMOND&&g->mode!=GM_ISO&&g->mode!=GM_RULED)
         { sr+=(g->ch>1?1:0); sc+=(g->cw>1?1:0); }
     if (sr>=0&&sr<g->rows-1&&sc>=0&&sc<g->cols) mvaddch(sr,sc,ch);
@@ -574,7 +574,7 @@ static void scene_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
                        double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_grid(g);
     pool_draw(p,g);
     cursor_draw(cur,g);
     hud_draw(g, p, cur, fps);
@@ -664,7 +664,7 @@ int main(void)
             case 'a': switch_grid(&ctx, &cur, rows, cols, -1); break;
             case 'e': switch_grid(&ctx, &cur, rows, cols, +1); break;
             case 'p': cycle_selection(&cur); break;
-            case 'l': try_draw_path(&pool, &ctx, &cur, path_line);     break;
+            case 'l': try_draw_path(&pool, &ctx, &cur, cell_line);     break;
             case 'j': try_draw_path(&pool, &ctx, &cur, path_lpath);    break;
             case 'o': try_draw_path(&pool, &ctx, &cur, path_ring);     break;
             case 'x': try_draw_path(&pool, &ctx, &cur, path_diagonal); break;

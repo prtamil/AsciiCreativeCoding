@@ -67,16 +67,13 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula — where dots go and which cell holds a screen position ── */
+/* ── §4 rect mapping & lattice ── */
 
-/* Everything we need to turn cell coordinates into screen positions and back.
- * Filled once at startup (and again on resize) from the terminal size, so the
- * drawing code never has to re-derive any of it.
- *   rows, cols     terminal size right now, in characters
- *   cw, ch         dot spacing — columns and rows between dots (a copy of
- *                  DOT_W / DOT_H, so the math reads off the struct)
- *   max_r, max_c   highest cell index the cursor may sit on; keeps it from
- *                  walking off the bottom or right edge */
+/* GridCtx — the grid for one frame: terminal size, dot spacing, and how far
+ * the cursor may roam.
+ *   rows, cols     terminal size in characters
+ *   cw, ch         dot spacing (DOT_W / DOT_H), so the math reads off the struct
+ *   max_r, max_c   furthest cell the cursor can reach */
 typedef struct {
     int rows, cols;
     int cw, ch;
@@ -91,16 +88,17 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->max_c = cols / DOT_W - 1;
 }
 
-static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
+/* recipe step 1 — cell (r,c) -> its top-left corner on screen */
+static void cell_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
     *sr = r * g->ch;
     *sc = c * g->cw;
 }
 
-/* A spot gets a dot only where a row line AND a column line cross — that's
- * the whole trick. Sister file 01 draws when EITHER lines up (so you get the
- * full lattice of lines); using AND keeps just the crossings. */
-static char ctx_grid_char(const GridCtx *g, int sr, int sc)
+/* THE distinct idea: a dot lands only where a row line AND a column line cross.
+ * Sister file 01 uses OR (any line drawn -> the full lattice); AND erases the
+ * lines and keeps just the crossings. */
+static char grid_glyph_at(const GridCtx *g, int sr, int sc)
 {
     bool on_dot = (sr % g->ch == 0) && (sc % g->cw == 0);
     return on_dot ? '.' : ' ';
@@ -118,18 +116,18 @@ static bool is_cursor_corner(const GridCtx *g, int sr, int sc, int cr, int cc)
 /* Middle of a cell — where the '@' sits, in the empty space between dots. */
 static void cell_centre(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
-    ctx_to_screen(g, r, c, sr, sc);
+    cell_to_screen(g, r, c, sr, sc);
     *sr += g->ch / 2;
     *sc += g->cw / 2;
 }
 
-/* Paint every dot. The four around the cursor's cell turn into a green '+'
- * instead of a plain '.', which is why we pass the cursor's cell in. */
-static void ctx_draw_bg(const GridCtx *g, int cr, int cc)
+/* recipe step 2 — draw the grid by asking grid_glyph_at at every screen spot;
+ * the four dots around the cursor's cell light up as a green '+' instead. */
+static void draw_lattice(const GridCtx *g, int cr, int cc)
 {
     for (int sr = 0; sr < g->rows - 1; sr++) {
         for (int sc = 0; sc < g->cols; sc++) {
-            if (ctx_grid_char(g, sr, sc) != '.') continue;
+            if (grid_glyph_at(g, sr, sc) != '.') continue;
             if (is_cursor_corner(g, sr, sc, cr, cc)) {
                 attron(COLOR_PAIR(PAIR_CORNER) | A_BOLD);
                 mvaddch(sr, sc, (chtype)'+');
@@ -189,7 +187,7 @@ static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
 static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
 {
     erase();
-    ctx_draw_bg(g, cur->r, cur->c);
+    draw_lattice(g, cur->r, cur->c);
     cursor_draw(cur, g);
     hud_draw(g, cur, fps);
     wnoutrefresh(stdscr); doupdate();

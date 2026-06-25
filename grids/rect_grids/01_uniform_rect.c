@@ -2,14 +2,11 @@
 /*
  * 01_uniform_rect.c — a plain rectangular grid you can walk a cursor around.
  *
- * Evenly spaced lines split the terminal into equal boxes; arrow keys move
- * the '@' from box to box. This is the simplest grid in the series — every
- * other file here is this same skeleton with one piece swapped out.
+ * No grid is stored: at each screen spot we ask "is this row or column on a
+ * line?" with leftover-after-division. The simplest grid in the series — every
+ * other file here is this skeleton with one piece swapped.
  *
- * The trick: we never store a grid. We just ask, at each screen spot, "is
- * this row or column on a line?" using leftover-after-division. Sister files
- * and the shared GridCtx/Cursor idea live in ../README.md; 02_square.c shows
- * how to make the boxes look square.
+ * Sister files: 02_square.c (boxes that look square), rect_grids_placement/.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -26,25 +23,16 @@
 
 #define TARGET_FPS  30
 
-/*
- * How big each box is, measured in terminal characters: CELL_W columns wide,
- * CELL_H rows tall. Terminal characters are about twice as tall as they are
- * wide, so 8 wide by 4 tall ends up looking roughly square on screen.
- * 02_square.c works out that aspect ratio properly.
- */
-#define CELL_W  8
-#define CELL_H  4
+#define CELL_W  8     /* box size in characters: 8 wide x 4 tall looks roughly */
+#define CELL_H  4     /* square, since a cell is ~twice as tall as wide (see 02_square) */
 
-/* How much to trust each new frame when smoothing the FPS number on screen.
- * Small value = steady reading that ignores one-off hiccups. */
-#define FPS_EWMA_ALPHA  0.05
+#define FPS_EWMA_ALPHA  0.05   /* small = steadier on-screen fps number */
 
-/* Color slots: which color each part of the screen uses. */
-#define PAIR_GRID    1   /* the grid lines       */
-#define PAIR_ACTIVE  2   /* fill of the box you're standing in */
-#define PAIR_CURSOR  3   /* the '@' itself       */
-#define PAIR_HUD     4   /* fps readout (yellow) */
-#define PAIR_HINT    5   /* key hints (cyan)     */
+#define PAIR_GRID    1   /* grid lines */
+#define PAIR_ACTIVE  2   /* fill of the box you're in */
+#define PAIR_CURSOR  3   /* the '@' */
+#define PAIR_HUD     4
+#define PAIR_HINT    5
 
 /* ── §2 clock ── */
 
@@ -76,31 +64,16 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula — turning a cell (r,c) into a screen spot ── */
+/* ── §4 rect mapping & lattice ── */
 
-/*
- * GridCtx — everything we need to know about the current grid: how big the
- * terminal is, how big a box is, and how far the cursor is allowed to roam.
- *
- * We keep the box size as fields here instead of reading the #defines
- * directly, so the grid functions work on whatever GridCtx you hand them.
- * That's the shared idea the placement files lean on too
- * (../rect_grids_placement/01_direct.c, ../README.md).
- *
- *   rows, cols   — terminal size, in characters.
- *   cw, ch       — box width and height, in characters.
- *   max_r, max_c — the furthest cell the cursor can reach: the last whole
- *                  box that fully fits, leaving the bottom row for the hint.
- */
+/* GridCtx — the grid for one frame: terminal size, box size, and how far the
+ * cursor may roam (the last whole box that fits, leaving the bottom row free). */
 typedef struct {
-    int rows, cols;
-    int cw, ch;
-    int max_r, max_c;
+    int rows, cols;      /* terminal size in characters */
+    int cw, ch;          /* box width and height in characters */
+    int max_r, max_c;    /* furthest cell the cursor can reach */
 } GridCtx;
 
-/* Work out the grid's measurements from the current terminal size.
- * We stop one row short of the bottom so the key-hint line has room, and we
- * drop any half-box at the right/bottom edge so the cursor can't land in it. */
 static void ctx_init(GridCtx *g, int rows, int cols)
 {
     g->rows = rows; g->cols = cols;
@@ -109,21 +82,16 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->max_c = cols / CELL_W - 1;
 }
 
-/* Where on screen does cell (r,c) start (its top-left corner)? Each step
- * right is cw columns over, each step down is ch rows down; cell (0,0) sits
- * at the very top-left. This one tiny mapping is the only thing that differs
- * between the grids in this series. */
-static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
+/* recipe step 1 — cell (r,c) -> its top-left corner on screen */
+static void cell_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
     *sr = r * g->ch;
     *sc = c * g->cw;
 }
 
-/* What should we draw at this exact screen spot? A spot lands on a line when
- * its row or column divides evenly into the box size (nothing left over).
- * Lines crossing -> '+', a horizontal run -> '-', a vertical run -> '|',
- * and anything inside a box -> blank. */
-static char ctx_grid_char(const GridCtx *g, int sr, int sc)
+/* which glyph belongs at a screen spot: a spot is on a line when its row or
+ * column divides evenly into the box size. Crossing -> '+', else '-' / '|'. */
+static char grid_glyph_at(const GridCtx *g, int sr, int sc)
 {
     bool h = (sr % g->ch == 0);
     bool v = (sc % g->cw == 0);
@@ -133,14 +101,13 @@ static char ctx_grid_char(const GridCtx *g, int sr, int sc)
     return ' ';
 }
 
-/* Paint the whole grid by asking the question above at every screen spot.
- * It's one check per character, which is plenty fast at terminal sizes. */
-static void ctx_draw_bg(const GridCtx *g)
+/* recipe step 2 — draw the grid by asking grid_glyph_at at every screen spot */
+static void draw_lattice(const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_GRID));
     for (int sr = 0; sr < g->rows - 1; sr++) {
         for (int sc = 0; sc < g->cols; sc++) {
-            char ch = ctx_grid_char(g, sr, sc);
+            char ch = grid_glyph_at(g, sr, sc);
             if (ch != ' ')
                 mvaddch(sr, sc, (chtype)(unsigned char)ch);
         }
@@ -150,15 +117,8 @@ static void ctx_draw_bg(const GridCtx *g)
 
 /* ── §5 cursor ── */
 
-/*
- * Cursor — which box the user is currently standing in, as a row and column.
- *
- * It deliberately doesn't know how big the grid is; the limits live in
- * GridCtx. Pair the two together and ctx_to_screen() turns this (r,c) into an
- * actual spot on screen.
- *
- *   r, c — the box coordinates, counting from the top-left box (0,0).
- */
+/* Cursor — which box the user is in, as (r,c) from the top-left box (0,0). It
+ * doesn't know the grid size; pair with a GridCtx and run through cell_to_screen. */
 typedef struct { int r, c; } Cursor;
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
@@ -167,8 +127,7 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->c = g->max_c / 2;
 }
 
-/* Nudge the cursor by (dr,dc), but never let it step off the grid: each axis
- * only moves if the new spot is still in bounds. */
+/* recipe step 3 — move the cursor, clamped so it never steps off the grid */
 static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
 {
     int nr = cur->r + dr, nc = cur->c + dc;
@@ -176,12 +135,11 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
     if (nc >= 0 && nc <= g->max_c) cur->c = nc;
 }
 
-/* Highlight the box the cursor is in: dot in every inside cell (the space
- * between the four lines), then drop the '@' right in the middle. */
+/* highlight the cursor's box: dot the interior, then drop '@' in the middle */
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc;
-    ctx_to_screen(g, cur->r, cur->c, &sr, &sc);
+    cell_to_screen(g, cur->r, cur->c, &sr, &sc);
 
     attron(COLOR_PAIR(PAIR_ACTIVE));
     for (int dr = 1; dr < g->ch; dr++)
@@ -196,8 +154,6 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
 
 /* ── §6 scene ── */
 
-/* The two bits of text overlaid on the grid: fps and current cell up top,
- * the key reminders along the bottom. */
 static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
 {
     char buf[64];
@@ -215,7 +171,7 @@ static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
 static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_lattice(g);
     cursor_draw(cur, g);
     hud_draw(g, cur, fps);
     wnoutrefresh(stdscr);

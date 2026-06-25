@@ -4,11 +4,11 @@
  * drawn on the solid-colour "stacked cubes" iso grid.
  *
  * Move the '@' cursor with the arrows. Press 's' to drop a start, 'e' to
- * drop an end; the program lights up every triangle a straight line from
- * start to end passes over with a bright '*'.
+ * drop an end; every triangle a straight line between them passes over
+ * lights up with a bright '*'.
  *
  * Sister files: grids/tri_grids/05_isometric.c (the coloured grid itself),
- * 01_equilateral_path.c (same idea, but it outlines edges instead).
+ *               01_equilateral_path.c (same idea, outlined edges).
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -34,13 +34,15 @@
 #define TRI_SIZE_MAX     40.0
 #define TRI_SIZE_STEP     2.0
 
+#define PATH_STEP_FRAC   0.25   /* sample the line every quarter-triangle */
+
 #define MAX_OBJ   1024
 #define N_PALETTE 6
 #define N_THEMES  3
 
 #define FPS_EWMA_ALPHA  0.05
 
-#define PAIR_FILL_BASE 1                        /* six fill colours live in slots 1..6 */
+#define PAIR_FILL_BASE 1                        /* six fill colours in slots 1..6 */
 #define PAIR_PATH     (PAIR_FILL_BASE + N_PALETTE)
 #define PAIR_START    (PAIR_PATH + 1)
 #define PAIR_END      (PAIR_START + 1)
@@ -90,15 +92,14 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 gridctx ── */
+/* ── §4 tri mapping & lattice ── */
 
-/* Everything the grid needs to know to turn a triangle's address into a
- * spot on screen: how big the terminal is, how big each triangle is, and
- * where the grid's centre sits. Kept in one struct so a resize or a size
- * change just updates these numbers in place. */
+/* GridCtx — the iso triangle grid for one frame: terminal size, triangle
+ * size, where the grid centre sits, and how far the cursor may roam. A
+ * resize or size change just rewrites these in place. */
 typedef struct {
     int    rows, cols;        /* terminal size, in character cells */
-    int    cw, ch;            /* width/height of one cell, in sub-pixels */
+    int    cell_w, cell_h;    /* sub-pixels per character column / row */
     double tri_size;          /* edge length of a triangle, in pixels */
     int    ox, oy;            /* screen cell the grid is centred on */
     int    max_col, max_row;  /* how far the cursor may roam from centre */
@@ -107,7 +108,7 @@ typedef struct {
 static void ctx_init(GridCtx *g, int rows, int cols, double tri_size)
 {
     g->rows = rows; g->cols = cols;
-    g->cw = CELL_W; g->ch = CELL_H;
+    g->cell_w = CELL_W; g->cell_h = CELL_H;
     g->tri_size = tri_size;
     g->ox = cols / 2;
     g->oy = (rows - 1) / 2;
@@ -115,12 +116,11 @@ static void ctx_init(GridCtx *g, int rows, int cols, double tri_size)
     g->max_row = rows / 2;
 }
 
-/* Given a point on screen, work out which triangle it falls inside and
- * whether that triangle points up or down. This is the one place that
- * decodes the skewed grid; everything else just trusts the answer. */
-static void pixel_to_tri(double px, double py, double size,
-                         int *col, int *row, int *up,
-                         double *fa, double *fb)
+/* a pixel -> which triangle (col,row,up) + where inside (fa,fb). Undo the
+ * iso skew: a = px/size - b/2; fa+fb >= 1 picks the up (△) half. */
+static void screen_to_tri(double px, double py, double size,
+                          int *col, int *row, int *up,
+                          double *fa, double *fb)
 {
     double h = size * sqrt(3.0) * 0.5;
     double b = py / h;
@@ -132,29 +132,31 @@ static void pixel_to_tri(double px, double py, double size,
     *fb = b - (double)r;
     *up = (*fa + *fb >= 1.0) ? 1 : 0;
 }
-/* The other direction: hand back the pixel at a triangle's middle, so we
- * know where to draw its marker and where its path-line starts and ends. */
+
+/* the pixel at a triangle's centre (1/3 in from its corners). Where the
+ * cursor/marker draws and where a path-line starts and ends. */
 static void tri_centroid_pixel(int col, int row, int up, double size,
-                               double *cx, double *cy)
+                               double *cx_pix, double *cy_pix)
 {
     double h = size * sqrt(3.0) * 0.5;
     double a = (up == 0) ? ((double)col + 1.0/3.0) : ((double)col + 2.0/3.0);
     double b = (up == 0) ? ((double)row + 1.0/3.0) : ((double)row + 2.0/3.0);
-    *cx = (a + 0.5 * b) * size;
-    *cy = b * h;
-}
-static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
-                          int *scol, int *srow)
-{
-    double cx, cy;
-    tri_centroid_pixel(col, row, up, g->tri_size, &cx, &cy);
-    *scol = g->ox + (int)(cx / g->cw);
-    *srow = g->oy + (int)(cy / g->ch);
+    *cx_pix = (a + 0.5 * b) * size;
+    *cy_pix = b * h;
 }
 
-/* Pick which of the six fill colours a triangle gets. The mix of its
- * address and orientation makes neighbours differ, so the grid reads as
- * a wall of stacked cubes rather than a flat sheet. */
+/* a triangle's address -> the character cell to draw on. */
+static void tri_to_screen(const GridCtx *g, int col, int row, int up,
+                          int *scol, int *srow)
+{
+    double cx_pix, cy_pix;
+    tri_centroid_pixel(col, row, up, g->tri_size, &cx_pix, &cy_pix);
+    *scol = g->ox + (int)(cx_pix / g->cell_w);
+    *srow = g->oy + (int)(cy_pix / g->cell_h);
+}
+
+/* which of the six fills a triangle gets. Mixing address + orientation makes
+ * neighbours differ, so the grid reads as a wall of stacked cubes. */
 static int palette_index(int col, int row, int up)
 {
     int k = col + 2 * row + up;
@@ -162,15 +164,17 @@ static int palette_index(int col, int row, int up)
     return k;
 }
 
-static void ctx_draw_bg(const GridCtx *g)
+/* draw the grid: every cell -> its triangle -> a solid block of that
+ * triangle's fill colour. Nothing stored; redrawn each frame. */
+static void draw_lattice(const GridCtx *g)
 {
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
-            double px = (double)(col - g->ox) * g->cw;
-            double py = (double)(row - g->oy) * g->ch;
+            double px = (double)(col - g->ox) * g->cell_w;
+            double py = (double)(row - g->oy) * g->cell_h;
             int    tC, tR, tU;
             double fa, fb;
-            pixel_to_tri(px, py, g->tri_size, &tC, &tR, &tU, &fa, &fb);
+            screen_to_tri(px, py, g->tri_size, &tC, &tR, &tU, &fa, &fb);
             int pair = PAIR_FILL_BASE + palette_index(tC, tR, tU);
             attron(COLOR_PAIR(pair));
             mvaddch(row, col, ' ');
@@ -179,17 +183,17 @@ static void ctx_draw_bg(const GridCtx *g)
     }
 }
 
-/* ── §5 pool ── */
+/* ── §5 pool — the line of path triangles ── */
 
-/* One triangle that the path passes through, ready to be drawn. */
+/* One triangle the path passes through, ready to draw. */
 typedef struct {
-    int  col, row, up;   /* which triangle (its grid address + orientation) */
-    char glyph;          /* the character to stamp on it ('*') */
-    bool alive;          /* false means this slot is free for reuse */
+    int  col, row, up;   /* which triangle (address + orientation) */
+    char glyph;          /* the character to stamp ('*') */
+    bool alive;          /* false means this slot is free */
 } Obj;
 
-/* The full list of triangles on the current path. A plain fixed array we
- * refill from scratch each time the path changes — no growing, no freeing. */
+/* The full list of path triangles: a plain fixed array we refill from
+ * scratch each time the path changes — no growing, no freeing. */
 typedef struct {
     Obj items[MAX_OBJ];
     int count;
@@ -197,8 +201,7 @@ typedef struct {
 
 static void pool_clear(Pool *p) { p->count = 0; }
 
-/* Is this triangle already in the list? Used to skip duplicates when the
- * line lingers in one triangle across several samples. */
+/* already on the path? skips duplicates when the line lingers in a triangle */
 static int pool_find(const Pool *p, int col, int row, int up)
 {
     for (int i = 0; i < p->count; i++) {
@@ -222,7 +225,7 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     for (int i = 0; i < p->count; i++) {
         if (!p->items[i].alive) continue;
         int sc, sr;
-        ctx_to_screen(g, p->items[i].col, p->items[i].row, p->items[i].up,
+        tri_to_screen(g, p->items[i].col, p->items[i].row, p->items[i].up,
                       &sc, &sr);
         if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1)
             mvaddch(sr, sc, (chtype)(unsigned char)p->items[i].glyph);
@@ -230,11 +233,10 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     attroff(COLOR_PAIR(PAIR_PATH) | A_BOLD);
 }
 
-/* ── §6 cursor ── */
+/* ── §6 cursor — the '@' you steer, plus the start/end you drop ── */
 
-/* The whole interactive state: where the '@' is, the start and end the
- * user has dropped, and the few UI toggles. Grouped here so one struct
- * captures "what the user is doing right now". */
+/* The whole interactive state: where the '@' is, the start/end the user has
+ * dropped, and the UI toggles. */
 typedef struct {
     int col, row, up;                /* the '@' cursor's triangle */
     int sCol, sRow, sUp;             /* the start triangle (set by 's') */
@@ -243,15 +245,17 @@ typedef struct {
     int theme, paused;               /* current colour set; pause flag */
 } Cursor;
 
-/* Moving the cursor one step in a triangle grid is fiddly: an up triangle
- * and a down triangle have different neighbours. This table gives, for each
- * arrow and each orientation, how to nudge col/row and which way the new
- * triangle points. */
+/*
+ * One arrow press isn't a simple ±1 on a triangle grid: an up triangle and a
+ * down triangle have different neighbours. Look up [arrow][half] to get the
+ * col/row shift and the half you end up on.
+ *   arrows: 0=LEFT 1=RIGHT 2=UP 3=DOWN     half: 0=▽ (lower)  1=△ (upper)
+ */
 static const int TRI_DIR[4][2][3] = {
-    { { -1,  0,  1 }, {  0,  0,  0 } },
-    { {  0,  0,  1 }, { +1,  0,  0 } },
-    { {  0, -1,  1 }, {  0,  0,  0 } },
-    { {  0,  0,  1 }, {  0, +1,  0 } },
+    /* LEFT  */ { { -1,  0,  1 }, {  0,  0,  0 } },
+    /* RIGHT */ { {  0,  0,  1 }, { +1,  0,  0 } },
+    /* UP    */ { {  0, -1,  1 }, {  0,  0,  0 } },
+    /* DOWN  */ { {  0,  0,  1 }, {  0, +1,  0 } },
 };
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
@@ -262,6 +266,8 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->theme = 0; cur->paused = 0;
 }
 
+/* nudge the cursor by the TRI_DIR change for this arrow; clamp to max_col/row
+ * so it can't wander off the addressable grid. */
 static void cursor_move(Cursor *cur, const GridCtx *g, int dir)
 {
     const int *t = TRI_DIR[dir][cur->up];
@@ -275,7 +281,7 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dir)
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sc, sr;
-    ctx_to_screen(g, cur->col, cur->row, cur->up, &sc, &sr);
+    tri_to_screen(g, cur->col, cur->row, cur->up, &sc, &sr);
     if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
         attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD | A_REVERSE);
         mvaddch(sr, sc, '@');
@@ -283,13 +289,12 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ── §7 mode ── */
+/* ── §7 placement — lay objects along a path ── */
 
-/* Fill the path list with every triangle a straight line from start to end
- * crosses. We walk the line in small steps and, at each step, note which
- * triangle we're standing on; repeats are dropped so each triangle appears
- * once. */
-static void path_compute(Pool *pool, const Cursor *cur, const GridCtx *g)
+/* path_lay — fill the pool with every triangle a straight line from start to
+ * end crosses. Walk the line in PATH_STEP_FRAC steps, noting the triangle at
+ * each sample; pool_place drops repeats so each triangle appears once. */
+static void path_lay(Pool *pool, const Cursor *cur, const GridCtx *g)
 {
     pool_clear(pool);
     if (!cur->has_start || !cur->has_end) return;
@@ -302,13 +307,13 @@ static void path_compute(Pool *pool, const Cursor *cur, const GridCtx *g)
         pool_place(pool, cur->sCol, cur->sRow, cur->sUp, '*');
         return;
     }
-    double step = g->tri_size * 0.25;
+    double step = g->tri_size * PATH_STEP_FRAC;
     int n = (int)(dist / step) + 1;
     for (int i = 0; i <= n; i++) {
         double t = (double)i / (double)n;
         double px = sx + t * dx, py = sy + t * dy;
         int tC, tR, tU; double fa, fb;
-        pixel_to_tri(px, py, g->tri_size, &tC, &tR, &tU, &fa, &fb);
+        screen_to_tri(px, py, g->tri_size, &tC, &tR, &tU, &fa, &fb);
         pool_place(pool, tC, tR, tU, '*');
     }
 }
@@ -317,7 +322,7 @@ static void marker_draw(const GridCtx *g, int col, int row, int up,
                         char glyph, int pair)
 {
     int sc, sr;
-    ctx_to_screen(g, col, row, up, &sc, &sr);
+    tri_to_screen(g, col, row, up, &sc, &sr);
     if (sc < 0 || sc >= g->cols || sr < 0 || sr >= g->rows - 1) return;
     attron(COLOR_PAIR(pair) | A_BOLD);
     mvaddch(sr, sc, glyph);
@@ -349,7 +354,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, const Pool *p,
                        double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_lattice(g);
     pool_draw(p, g);
     if (cur->has_start)
         marker_draw(g, cur->sCol, cur->sRow, cur->sUp, 'S', PAIR_START);
@@ -419,12 +424,12 @@ int main(void)
                 case 's':
                     cur.sCol = cur.col; cur.sRow = cur.row; cur.sUp = cur.up;
                     cur.has_start = 1;
-                    path_compute(&path, &cur, &g);
+                    path_lay(&path, &cur, &g);
                     break;
                 case 'e':
                     cur.eCol = cur.col; cur.eRow = cur.row; cur.eUp = cur.up;
                     cur.has_end = 1;
-                    path_compute(&path, &cur, &g);
+                    path_lay(&path, &cur, &g);
                     break;
                 case 't':
                     cur.theme = (cur.theme + 1) % N_THEMES;
@@ -437,12 +442,12 @@ int main(void)
                 case '+': case '=':
                     if (g.tri_size < TRI_SIZE_MAX) {
                         g.tri_size += TRI_SIZE_STEP;
-                        path_compute(&path, &cur, &g);
+                        path_lay(&path, &cur, &g);
                     } break;
                 case '-':
                     if (g.tri_size > TRI_SIZE_MIN) {
                         g.tri_size -= TRI_SIZE_STEP;
-                        path_compute(&path, &cur, &g);
+                        path_lay(&path, &cur, &g);
                     } break;
             }
         }

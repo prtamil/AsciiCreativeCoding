@@ -1,11 +1,11 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 01_rings_spokes.c — a polar grid drawn on the terminal: a bullseye of
- * concentric rings crossed by spokes radiating from the centre.  Move an '@'
- * cursor between cells with the arrows; tweak ring spacing and spoke count live.
+ * 01_rings_spokes.c — a polar grid: concentric rings crossed by radial spokes,
+ * with an '@' cursor you move by ring and spoke. The grid is never stored; each
+ * cell decides what to draw from its distance and angle to the centre.
  *
  * Sister files: 02_log_polar.c (rings that grow with distance),
- *               ../rect_grids/01_uniform_rect.c (the same GridCtx template).
+ *               ../rect_grids/01_uniform_rect.c (same GridCtx template).
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -27,36 +27,29 @@
 
 #define TARGET_FPS    30
 
-/* How big one terminal cell is in our pretend "pixels".  A row is about twice
- * as tall as a column is wide, so we make the vertical pixel twice the size —
- * that way circles come out round instead of squashed into ovals. */
-#define CELL_W        2
-#define CELL_H        4
+#define CELL_W        2     /* pixels per char cell (2 wide x 4 tall) — */
+#define CELL_H        4     /* makes circles come out round, not oval */
 
-/* Rings: how far apart they sit and how thick each ring line draws. */
 #define RING_SPACING_DEFAULT  20.0f  /* pixels between one ring and the next */
 #define RING_SPACING_MIN       8.0f
 #define RING_SPACING_MAX      48.0f
 #define RING_SPACING_STEP      4.0f
 #define RING_W                 1.6f  /* a cell this close to a ring counts as on it */
 
-/* Spokes: how many radiate out, and how wide each one draws. */
 #define N_SPOKES_DEFAULT  12
 #define N_SPOKES_MIN       4
 #define N_SPOKES_MAX      36
 #define SPOKE_W            0.10      /* angle (radians) within which a cell is on a spoke */
-#define SPOKE_MIN_R        3.0f      /* skip spokes near the centre so they don't smear into a blob */
+#define SPOKE_MIN_R        3.0f      /* skip spokes near the centre so they don't blob */
 
-/* The shown FPS is smoothed a little so the number doesn't jitter every frame. */
-#define FPS_EWMA_ALPHA     0.05
+#define FPS_EWMA_ALPHA     0.05      /* small = steadier on-screen fps number */
 
 #define PAIR_GRID    1
-#define PAIR_CURSOR  2   /* the '@' cursor */
-#define PAIR_HUD     3   /* status bar */
-#define PAIR_HINT    4   /* key-hint footer */
+#define PAIR_CURSOR  2
+#define PAIR_HUD     3
+#define PAIR_HINT    4
 
-/* Each theme is one colour: the nice 256-colour choice, plus a basic-8 fallback
- * for terminals that can't do 256 colours. */
+/* one colour per theme: the 256-colour pick, plus a basic-8 fallback */
 static const short THEME_FG[][2] = {
     {75,  COLOR_CYAN},
     {82,  COLOR_GREEN},
@@ -93,36 +86,22 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,  -1);
 }
 
-/* ── §4 formula ── */
+/* ── §4 polar mapping & lattice ── */
 
-/*
- * GridCtx — everything that describes the polar grid as it's drawn right now:
- * how big the screen is, where its centre sits, how the rings and spokes are
- * spaced, and how far the cursor is allowed to roam.  The grid itself is never
- * stored as an array — it's worked out cell by cell from these numbers — so
- * this is the single source of truth for the picture and the cursor's limits.
- *
- * The grid is always centred on screen.  For a terminal cell (col, row), its
- * distance from the centre in "pixels" is found by subtracting the centre
- * (ox, oy) and scaling by the cell size.
- */
+/* GridCtx — the polar grid for one frame: screen size, where the centre sits,
+ * and how rings/spokes are spaced. The grid is computed cell-by-cell from these
+ * numbers, so this is the single source of truth for the picture and the cursor
+ * limits. The grid is always centred on (ox, oy). */
 typedef struct {
-    int rows, cols;        /* size of the terminal in character cells */
-
-    float  ring_spacing;   /* gap between rings, in pixels; the user nudges this with +/- */
-    int    n_spokes;       /* how many spokes radiate out; the user changes it with [/]   */
-    int    cell_w, cell_h; /* size of one cell in pixels (copies of CELL_W / CELL_H)      */
-
-    int    ox, oy;         /* the centre of the grid, as a cell column and row */
-
-    /* how far the cursor may go: rings 0..max_ring, spokes 0..max_spoke.
-     * Recomputed whenever the screen or grid changes so the cursor can't
-     * wander off the visible area. */
-    int    max_ring, max_spoke;
+    int    rows, cols;     /* terminal size in character cells */
+    float  ring_spacing;   /* gap between rings, pixels; +/- changes it */
+    int    n_spokes;       /* how many spokes radiate out; [/] changes it */
+    int    cell_w, cell_h; /* pixels per cell (CELL_W / CELL_H) */
+    int    ox, oy;         /* grid centre, as a cell column and row */
+    int    max_ring;       /* furthest ring whose cursor cell stays on screen */
+    int    max_spoke;      /* n_spokes - 1; the spoke index wraps past it */
 } GridCtx;
 
-/* Recompute everything that depends on the screen size — call it at startup
- * and again after every resize or spacing change. */
 static void ctx_init(GridCtx *g, int rows, int cols)
 {
     g->rows   = rows;
@@ -134,8 +113,7 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     if (g->ring_spacing <= 0.0f) g->ring_spacing = RING_SPACING_DEFAULT;
     if (g->n_spokes     <= 0)    g->n_spokes     = N_SPOKES_DEFAULT;
 
-    /* Biggest ring whose centre still lands on screen, using whichever way
-     * (width or height) runs out of room first. */
+    /* biggest ring still on screen, limited by whichever of width/height runs out first */
     double rx = (double)cols * 0.5 * CELL_W;
     double ry = (double)rows * 0.5 * CELL_H;
     double r_visible = (rx < ry ? rx : ry);
@@ -144,11 +122,10 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->max_spoke = g->n_spokes - 1;
 }
 
-/* Given a (ring, spoke) cell, find which screen column and row sit at the
- * middle of that wedge — half a ring out, half a wedge round — so the cursor
- * lands in the centre of its cell rather than on an edge. */
-static void ctx_to_screen(const GridCtx *g, int ring, int spoke,
-                          int *sr, int *sc)
+/* recipe step 1 — a (ring, spoke) cell -> the screen cell at its middle (half a
+ * ring out, half a wedge round), so the cursor lands centred, not on an edge. */
+static void polar_to_screen(const GridCtx *g, int ring, int spoke,
+                            int *sr, int *sc)
 {
     double mid_radius = ((double)ring + 0.5) * (double)g->ring_spacing;
     double theta_mid  = ((double)spoke + 0.5) * (2.0 * M_PI / (double)g->n_spokes);
@@ -158,53 +135,54 @@ static void ctx_to_screen(const GridCtx *g, int ring, int spoke,
     *sr = g->oy + (int)round(cy / (double)g->cell_h);
 }
 
-/* Pick the line character that best matches a direction: '-' for roughly
- * horizontal, '|' for vertical, '/' and '\\' for the diagonals.  This is what
- * makes the spokes and rings look like real lines instead of dots.
- *
- * A line pointing one way looks the same as a line pointing the opposite way,
- * so we fold the angle into a half-turn first and only ever pick from four
- * orientations. */
-static char angle_char(double theta)
+/* the reverse — a screen cell -> its distance and angle from the grid centre */
+static void screen_to_polar(const GridCtx *g, int col, int row,
+                            double *r_px, double *theta)
 {
-    double a = fmod(theta + 2.0*M_PI, M_PI); /* collapse opposite directions onto one */
-    if (a < M_PI/8.0 || a >= 7.0*M_PI/8.0) return '-';
-    if (a < 3.0*M_PI/8.0)                   return '\\';
-    if (a < 5.0*M_PI/8.0)                   return '|';
+    double dx = (double)(col - g->ox) * g->cell_w;
+    double dy = (double)(row - g->oy) * g->cell_h;
+    *r_px  = sqrt(dx * dx + dy * dy);
+    *theta = atan2(dy, dx);
+}
+
+/* the line char matching a direction: '-' horizontal, '|' vertical, '/' '\' the
+ * diagonals. A line and its 180° flip look the same, so we fold into a half-turn. */
+static char line_glyph(double theta)
+{
+    double a = fmod(theta + 2.0 * M_PI, M_PI);
+    if (a < M_PI / 8.0 || a >= 7.0 * M_PI / 8.0) return '-';
+    if (a < 3.0 * M_PI / 8.0)                    return '\\';
+    if (a < 5.0 * M_PI / 8.0)                    return '|';
     return '/';
 }
 
-/* Walk every cell on screen and decide what, if anything, to draw there: a ring
- * line, a spoke line, a '+' where they cross, or nothing.  The trick is that
- * one cell can tell whether it's on *any* ring just from its distance, and on
- * *any* spoke just from its angle — no need to loop over each ring or spoke. */
-static void ctx_draw_bg(const GridCtx *g)
+/* recipe step 2 — draw the grid: each cell knows it's on *some* ring from its
+ * distance and on *some* spoke from its angle, with no loop over rings/spokes.
+ * Ring + spoke crossing -> '+', one of them -> a line char, neither -> blank. */
+static void draw_lattice(const GridCtx *g)
 {
     double spoke_angle = 2.0 * M_PI / (double)g->n_spokes;
 
     attron(COLOR_PAIR(PAIR_GRID));
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
-            double dx = (double)(col - g->ox) * g->cell_w;
-            double dy = (double)(row - g->oy) * g->cell_h;
-            float  r_px = (float)sqrt(dx*dx + dy*dy);
-            double theta = atan2(dy, dx);
+            double r_px, theta;
+            screen_to_polar(g, col, row, &r_px, &theta);
+            float rf = (float)r_px;   /* ring test is float math, kept exact */
 
-            /* on a ring if the distance is close to a whole number of ring gaps */
-            float ring_phase = fmodf(r_px, g->ring_spacing);
+            float ring_phase = fmodf(rf, g->ring_spacing);
             bool on_ring = (ring_phase < RING_W ||
                             ring_phase > g->ring_spacing - RING_W);
 
-            /* on a spoke if the angle is close to a whole number of spoke steps */
-            double theta_norm  = fmod(theta + 2.0*M_PI, 2.0*M_PI);
+            double theta_norm  = fmod(theta + 2.0 * M_PI, 2.0 * M_PI);
             double spoke_phase = fmod(theta_norm, spoke_angle);
-            bool on_spoke = (r_px > SPOKE_MIN_R) &&
+            bool on_spoke = (rf > SPOKE_MIN_R) &&
                             (spoke_phase < SPOKE_W ||
                              spoke_phase > spoke_angle - SPOKE_W);
 
             if (!on_ring && !on_spoke) continue;
 
-            char c = (on_ring && on_spoke) ? '+' : angle_char(theta);
+            char c = (on_ring && on_spoke) ? '+' : line_glyph(theta);
             mvaddch(row, col, (chtype)(unsigned char)c);
         }
     }
@@ -213,14 +191,9 @@ static void ctx_draw_bg(const GridCtx *g)
 
 /* ── §5 cursor ── */
 
-/*
- * Cursor — where on the grid the user is pointing, given as a ring number
- * (which band, counting out from the centre) and a spoke number (which wedge,
- * counting round).  That's the whole address; the limits and the screen
- * position come from GridCtx, so the cursor stays a tiny pair of indices.
- *   ring  : 0 at the innermost band, up to GridCtx.max_ring.
- *   spoke : 0..GridCtx.max_spoke, and it wraps around since angles are a circle.
- */
+/* Cursor — the grid cell the user points at: a ring (band out from the centre)
+ * and a spoke (wedge round). ring is 0..max_ring; spoke wraps, since a circle
+ * has no first or last wedge. */
 typedef struct { int ring, spoke; } Cursor;
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
@@ -229,8 +202,7 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->spoke = 0;
 }
 
-/* Nudge the cursor by some rings and spokes.  Moving in/out stops at the edge,
- * but going round simply wraps — a circle has no first or last spoke. */
+/* recipe step 3 — move the cursor: in/out clamps at the edge, round wraps */
 static void cursor_move(Cursor *cur, const GridCtx *g, int d_ring, int d_spoke)
 {
     int nr = cur->ring + d_ring;
@@ -244,12 +216,11 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int d_ring, int d_spoke)
     cur->spoke = ns;
 }
 
-/* Draw the '@' on the cursor's cell.  Call this after the grid so the marker
- * sits on top instead of being painted over. */
+/* draw the '@' on the cursor's cell; after the grid so it sits on top */
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc;
-    ctx_to_screen(g, cur->ring, cur->spoke, &sr, &sc);
+    polar_to_screen(g, cur->ring, cur->spoke, &sr, &sc);
     if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
         attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
         mvaddch(sr, sc, (chtype)'@');
@@ -259,8 +230,6 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
 
 /* ── §6 scene ── */
 
-/* The on-screen readouts: a status line top-right and the key hints along the
- * bottom, kept bright and bold so they stay readable over the grid. */
 static void hud_draw(const GridCtx *g, const Cursor *cur, int theme,
                      bool paused, double fps)
 {
@@ -283,7 +252,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, int theme,
                        bool paused, double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_lattice(g);
     cursor_draw(cur, g);
     hud_draw(g, cur, theme, paused, fps);
     wnoutrefresh(stdscr); doupdate();

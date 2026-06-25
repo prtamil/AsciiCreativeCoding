@@ -98,11 +98,19 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 gridctx ── */
+/* ── §4 tri mapping & lattice ── */
 
+/* GridCtx — the X-cut square grid for one frame, plus the user's live knobs.
+ * Each square is sliced by both diagonals into 4 wedges (tetrakis tiling).
+ * Positions are sub-pixels first, then divided down to character cells.
+ *   rows, cols      — terminal size in character cells
+ *   cell_w, cell_h  — sub-pixels per character column / row
+ *   ox, oy          — grid (0,0) on screen; re-centred each frame
+ *   tri_size        — square side length, in sub-pixels
+ *   border_w        — a cell is on an edge if it's within this of one */
 typedef struct {
     int    rows, cols;
-    int    cw, ch;
+    int    cell_w, cell_h;
     int    ox, oy;
     double tri_size;
     double border_w;
@@ -111,19 +119,19 @@ typedef struct {
 static void ctx_init(GridCtx *g, int rows, int cols, double tri_size)
 {
     g->rows = rows; g->cols = cols;
-    g->cw = CELL_W; g->ch = CELL_H;
+    g->cell_w = CELL_W; g->cell_h = CELL_H;
     g->ox = cols / 2;
     g->oy = (rows - 1) / 2;
     g->tri_size = tri_size;
     g->border_w = BORDER_W;
 }
 
-/* Given a point on screen, work out which square it's in and which of the
- * four diagonal wedges it falls into. The wedge is decided by whichever
- * diagonal the point is closest to relative to the square's centre. */
-static void pixel_to_tri(double px, double py, double size,
-                         int *col, int *row, int *wedge,
-                         double *fa, double *fb)
+/* recipe step 1 (reverse) — a pixel -> which square (col,row) + which of its
+ * four diagonal wedges + where inside (fa,fb). The wedge is the one nearest
+ * the square's centre: compare horizontal vs vertical offset from centre. */
+static void screen_to_tri(double px, double py, double size,
+                          int *col, int *row, int *wedge,
+                          double *fa, double *fb)
 {
     double inv = 1.0 / size;
     double a = px * inv, b = py * inv;
@@ -136,6 +144,9 @@ static void pixel_to_tri(double px, double py, double size,
     else           *wedge = (dy > 0.0) ? DIR_S : DIR_N;
 }
 
+/* the pixel at a wedge's centre (1/6 in from the square edge toward its
+ * centre). This is where the cursor/marker is drawn so it lands cleanly
+ * inside the wedge. */
 static void tri_centroid_pixel(int col, int row, int wedge, double size,
                                double *cx, double *cy)
 {
@@ -150,10 +161,10 @@ static void tri_centroid_pixel(int col, int row, int wedge, double size,
     *cy = ((double)row + b) * size;
 }
 
-/* Picks the line character ('/', '\', '|', '_') to draw a point near a
- * wedge's edge, and reports how close the point is to that edge in
- * *out_min — the caller only draws the outline, not the wedge interior. */
-static char tri_edge_char(int wedge, double fa, double fb, double *out_min)
+/* the line char for a point by nearest of the wedge's edges ('/', '\', '|',
+ * '_'). out_min returns the distance to that edge, so the caller skips
+ * interior cells (only draws when it's below border_w). */
+static char edge_glyph(int wedge, double fa, double fb, double *out_min)
 {
     double l1, l2, l3; char ch1, ch2, ch3;
     switch (wedge) {
@@ -185,25 +196,29 @@ static char tri_edge_char(int wedge, double fa, double fb, double *out_min)
     return ch;
 }
 
-static void ctx_to_screen(const GridCtx *g, int col, int row, int wedge,
+/* a wedge's address -> the character cell to draw on. Truncates (not rounds)
+ * so the mark sits inside the wedge, never on an edge. */
+static void tri_to_screen(const GridCtx *g, int col, int row, int wedge,
                           int *scol, int *srow)
 {
     double cx, cy;
     tri_centroid_pixel(col, row, wedge, g->tri_size, &cx, &cy);
-    *scol = g->ox + (int)(cx / g->cw);
-    *srow = g->oy + (int)(cy / g->ch);
+    *scol = g->ox + (int)(cx / g->cell_w);
+    *srow = g->oy + (int)(cy / g->cell_h);
 }
 
-static void ctx_draw_bg(const GridCtx *g)
+/* recipe step 2 — draw the grid: every cell -> its wedge -> a slash only on
+ * the edge cells (interiors stay blank). Nothing stored; redrawn each frame. */
+static void draw_lattice(const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_BORDER));
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
-            double px = (double)(col - g->ox) * g->cw;
-            double py = (double)(row - g->oy) * g->ch;
+            double px = (double)(col - g->ox) * g->cell_w;
+            double py = (double)(row - g->oy) * g->cell_h;
             int tC, tR, tW; double fa, fb, m;
-            pixel_to_tri(px, py, g->tri_size, &tC, &tR, &tW, &fa, &fb);
-            char ch = tri_edge_char(tW, fa, fb, &m);
+            screen_to_tri(px, py, g->tri_size, &tC, &tR, &tW, &fa, &fb);
+            char ch = edge_glyph(tW, fa, fb, &m);
             if (m >= g->border_w) continue;
             mvaddch(row, col, (chtype)(unsigned char)ch);
         }
@@ -249,7 +264,7 @@ static void pool_draw(const Pool *p, const GridCtx *g)
     for (int i = 0; i < p->count; i++) {
         if (!p->items[i].alive) continue;
         int sc, sr;
-        ctx_to_screen(g, p->items[i].col, p->items[i].row, p->items[i].wedge,
+        tri_to_screen(g, p->items[i].col, p->items[i].row, p->items[i].wedge,
                       &sc, &sr);
         if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1)
             mvaddch(sr, sc, (chtype)(unsigned char)p->items[i].glyph);
@@ -301,19 +316,18 @@ static void cursor_move(Cursor *cur, int arrow)
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sc, sr;
-    ctx_to_screen(g, cur->col, cur->row, cur->wedge, &sc, &sr);
+    tri_to_screen(g, cur->col, cur->row, cur->wedge, &sc, &sr);
     if (sc < 0 || sc >= g->cols || sr < 0 || sr >= g->rows - 1) return;
     attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
     mvaddch(sr, sc, '@');
     attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
 }
 
-/* ── §7 mode — pattern stamps ── */
+/* ── §7 pattern stamp — placement step: drop a preset shape by offsets ── */
 
-/* A pattern is just a list of wedges to drop, written as
- * (column offset, row offset, which wedge) relative to the cursor.
- * PAT_END is a marker row that means "end of list" — 0xDEAD is just an
- * unmistakable value no real offset would ever be. */
+/* A pattern is a list of wedges to drop, each as (col offset, row offset,
+ * which wedge) relative to the cursor. PAT_END marks the list's end — 0xDEAD
+ * is just an unmistakable value no real offset would ever be. */
 #define PAT_END   { 0xDEAD, 0, 0 }
 #define IS_END(p) ((p)[0] == 0xDEAD)
 
@@ -338,6 +352,7 @@ static const int PAT_TRI[][3] = {
     PAT_END
 };
 
+/* place every wedge in the pattern, each at (cursor + its offset). */
 static void pattern_stamp(Pool *pool, const int (*pat)[3],
                           int cC, int cR, char glyph)
 {
@@ -394,7 +409,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, const Pool *pool,
                        double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_lattice(g);
     pool_draw(pool, g);
     cursor_draw(cur, g);
     hud_draw(g, cur, pool, fps);

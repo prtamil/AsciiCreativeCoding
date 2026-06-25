@@ -23,23 +23,17 @@
 
 #define TARGET_FPS  30
 
-/* Each cell is 20 wide and 6 tall, so there's plenty of empty space inside
- * the borders to print a label. On a normal 80x24 terminal that's about a
- * 4-by-3 grid of cells — small enough to wander around comfortably. */
-#define CELL_W  20
+#define CELL_W  20    /* big cells: 20 wide x 6 tall, room inside for a label */
 #define CELL_H   6
 
-/* The frame rate shown in the corner jitters frame to frame, so we average
- * it gently over time to give a steady, readable number. Smaller = smoother. */
-#define FPS_EWMA_ALPHA  0.05
+#define FPS_EWMA_ALPHA  0.05   /* small = steadier on-screen fps number */
 
-/* Named slots for our colours. */
-#define PAIR_GRID    1   /* the grid lines               */
-#define PAIR_ACTIVE  2   /* the filled-in cell under @    */
-#define PAIR_CURSOR  3   /* the bright @ itself           */
-#define PAIR_HUD     4   /* the status readout (yellow)   */
-#define PAIR_LABEL   5   /* the (row,col) text in a cell  */
-#define PAIR_HINT    6   /* the key-hints footer (cyan)   */
+#define PAIR_GRID    1   /* grid lines */
+#define PAIR_ACTIVE  2   /* fill of the cell you're in */
+#define PAIR_CURSOR  3   /* the '@' */
+#define PAIR_HUD     4
+#define PAIR_LABEL   5   /* the (row,col) text in a cell */
+#define PAIR_HINT    6
 
 /* ── §2 clock ── */
 
@@ -69,22 +63,15 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula — turning a (row,col) into a screen position ── */
+/* ── §4 rect mapping & lattice ── */
 
-/*
- * GridCtx — everything we need to know to lay the grid out and keep the
- * cursor in bounds. Computed once at startup (and again on resize), then
- * passed around read-only. Same idea as 01_uniform_rect; only the cell size
- * is bigger here.
- */
+/* GridCtx — the grid for one frame: terminal size, cell size, and how far the
+ * cursor may roam (the last whole cell above the footer row). Same shape as
+ * 01_uniform_rect; only the cell size is bigger here. */
 typedef struct {
-    int rows, cols;   /* size of the terminal, in characters              */
-    int cw, ch;       /* size of one cell: width and height in characters */
-
-    /* The highest cell the cursor may sit on. We leave the bottom screen
-     * row free for the key-hints footer, so only whole cells that fit above
-     * it count. */
-    int max_r, max_c;
+    int rows, cols;      /* terminal size in characters       */
+    int cw, ch;          /* cell width and height in characters */
+    int max_r, max_c;    /* furthest cell the cursor can reach  */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols)
@@ -95,16 +82,17 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->max_c = cols / CELL_W - 1;
 }
 
-/* Where on the screen does cell (r,c) start? Its top-left corner is simply
- * the cell number times the cell size. Everything we draw in a cell — the
- * label, the @ — is measured from this corner. */
-static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
+/* recipe step 1 — cell (r,c) -> its top-left corner on screen. The label and
+ * the @ are both measured from this corner. */
+static void cell_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
     *sr = r * g->ch;
     *sc = c * g->cw;
 }
 
-static char ctx_grid_char(const GridCtx *g, int sr, int sc)
+/* which glyph belongs at a screen spot: a spot is on a line when its row or
+ * column divides evenly into the cell size. Crossing -> '+', else '-' / '|'. */
+static char grid_glyph_at(const GridCtx *g, int sr, int sc)
 {
     bool h = (sr % g->ch == 0);
     bool v = (sc % g->cw == 0);
@@ -114,12 +102,13 @@ static char ctx_grid_char(const GridCtx *g, int sr, int sc)
     return ' ';
 }
 
-static void ctx_draw_bg(const GridCtx *g)
+/* recipe step 2 — draw the grid by asking grid_glyph_at at every screen spot */
+static void draw_lattice(const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_GRID));
     for (int sr = 0; sr < g->rows - 1; sr++)
         for (int sc = 0; sc < g->cols; sc++) {
-            char ch = ctx_grid_char(g, sr, sc);
+            char ch = grid_glyph_at(g, sr, sc);
             if (ch != ' ')
                 mvaddch(sr, sc, (chtype)(unsigned char)ch);
         }
@@ -128,8 +117,8 @@ static void ctx_draw_bg(const GridCtx *g)
 
 /* ── §5 cursor ── */
 
-/* Where the @ currently sits, as a cell coordinate (which row, which column).
- * Not pixels — just which cell. */
+/* Cursor — which cell the @ sits in, as (r,c) from the top-left cell (0,0).
+ * Not pixels; pair with a GridCtx and run through cell_to_screen. */
 typedef struct { int r, c; } Cursor;
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
@@ -138,6 +127,7 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->c = g->max_c / 2;
 }
 
+/* recipe step 3 — move the cursor, clamped so it never steps off the grid */
 static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
 {
     int nr = cur->r + dr, nc = cur->c + dc;
@@ -145,10 +135,25 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
     if (nc >= 0 && nc <= g->max_c) cur->c = nc;
 }
 
+/* this file's distinction — print cell (r,c)'s own "(row,col)" name just inside
+ * its top-left border, in the given colour pair */
+static void cell_label_draw(const GridCtx *g, int r, int c, int pair)
+{
+    int sr, sc;
+    cell_to_screen(g, r, c, &sr, &sc);
+    char lbl[24];
+    snprintf(lbl, sizeof lbl, "(%d,%d)", r, c);
+    attron(COLOR_PAIR(pair));
+    mvprintw(sr + 1, sc + 2, "%s", lbl);
+    attroff(COLOR_PAIR(pair));
+}
+
+/* highlight the cursor's cell: clear the interior, paint its label in the
+ * highlight colour, then drop '@' in the middle */
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc;
-    ctx_to_screen(g, cur->r, cur->c, &sr, &sc);
+    cell_to_screen(g, cur->r, cur->c, &sr, &sc);
 
     attron(COLOR_PAIR(PAIR_ACTIVE));
     for (int dr = 1; dr < g->ch; dr++)
@@ -156,11 +161,7 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
             mvaddch(sr + dr, sc + dc, (chtype)' ');
     attroff(COLOR_PAIR(PAIR_ACTIVE));
 
-    /* the cell under the cursor shows its own label, in the highlight colour */
-    char lbl[24]; snprintf(lbl, sizeof lbl, "(%d,%d)", cur->r, cur->c);
-    attron(COLOR_PAIR(PAIR_ACTIVE));
-    mvprintw(sr + 1, sc + 2, "%s", lbl);
-    attroff(COLOR_PAIR(PAIR_ACTIVE));
+    cell_label_draw(g, cur->r, cur->c, PAIR_ACTIVE);
 
     attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
     mvaddch(sr + g->ch / 2, sc + g->cw / 2, (chtype)'@');
@@ -169,26 +170,18 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
 
 /* ── §6 scene ── */
 
-/* Print each cell's own coordinate near its top-left, just inside the border.
- * The cell under the cursor is skipped here — cursor_draw paints that one in
- * its own colour, so we'd just be drawing over it. */
+/* label every cell with its own (row,col). The cursor's cell is skipped —
+ * cursor_draw paints that one in its own colour. */
 static void labels_draw(const GridCtx *g, const Cursor *cur)
 {
     int gr = (g->rows - 1) / g->ch;
     int gc = g->cols / g->cw;
 
-    for (int r = 0; r < gr; r++) {
+    for (int r = 0; r < gr; r++)
         for (int c = 0; c < gc; c++) {
-            if (r == cur->r && c == cur->c) continue;  /* cursor paints this one */
-            int sr, sc;
-            ctx_to_screen(g, r, c, &sr, &sc);
-            char lbl[24];
-            snprintf(lbl, sizeof lbl, "(%d,%d)", r, c);
-            attron(COLOR_PAIR(PAIR_LABEL));
-            mvprintw(sr + 1, sc + 2, "%s", lbl);
-            attroff(COLOR_PAIR(PAIR_LABEL));
+            if (r == cur->r && c == cur->c) continue;
+            cell_label_draw(g, r, c, PAIR_LABEL);
         }
-    }
 }
 
 static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
@@ -209,7 +202,7 @@ static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
 static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_lattice(g);
     labels_draw(g, cur);
     cursor_draw(cur, g);
     hud_draw(g, cur, fps);
@@ -252,8 +245,6 @@ int main(void)
 
     while (g_running) {
         if (g_need_resize) {
-            /* the window changed size — tear ncurses down and bring it back
-             * so LINES/COLS are correct, then recompute the grid to fit */
             g_need_resize = 0;
             endwin(); refresh();
             ctx_init(&g, LINES, COLS);

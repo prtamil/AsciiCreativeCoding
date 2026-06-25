@@ -1,20 +1,16 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 04_30_60_90.c — a grid of equilateral triangles, each sliced into six.
+ * 04_30_60_90.c — equilateral triangle grid, each triangle sliced into six.
  *
- * We start with the equilateral grid from 01 and draw three lines inside
- * every triangle, each running from a corner to the middle of the opposite
- * side. Those three lines cut each triangle into six smaller right triangles
- * (the 30-60-90 kind). Arrow keys walk a cursor over the whole triangles;
- * the little ones are just lines on screen, nothing we store.
+ * Builds on 01's equilateral grid (§4 screen_to_tri / edge_glyph / draw_lattice
+ * are shared verbatim). DISTINCT here: draw_lattice also overlays each
+ * triangle's three medians (corner -> opposite-side midpoint). The medians cut
+ * each triangle into six 30-60-90 right triangles — median_glyph picks which
+ * median line a point is nearest. The cursor still walks whole triangles only.
  *
- * Companion files: 01_equilateral.c (same grid math) and 03_double_diagonal.c
- * (the same "slice each tile" idea, but applied to squares).
- *
- * Names for the curious: this pattern is the "kisrhombille tiling", and the
- * three slicing lines are a triangle's "medians".
- *   https://en.wikipedia.org/wiki/Kisrhombille_tiling
- *   https://en.wikipedia.org/wiki/Special_right_triangle  (30-60-90 triangle)
+ * Sister: 01_equilateral.c (same grid math), 03_double_diagonal.c (slice-tile).
+ * Refs: Kisrhombille tiling  https://en.wikipedia.org/wiki/Kisrhombille_tiling
+ *       30-60-90 triangle    https://en.wikipedia.org/wiki/Special_right_triangle
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -45,15 +41,11 @@
 #define BORDER_W_MAX     0.30
 #define BORDER_W_STEP    0.02
 
-/* How close a point must be to a slicing line to count as "on" it.
-   Bigger = thicker lines; smaller = thinner. Tuned by eye. */
-#define MEDIAN_T 0.05
+#define MEDIAN_T 0.05   /* how close to a median counts as "on" it; thicker = bigger */
 
 #define N_THEMES 4
 
-/* The FPS number jitters frame to frame, so we smooth it: each frame nudges
-   the shown value a little toward the latest reading instead of replacing it. */
-#define FPS_EWMA_ALPHA 0.05
+#define FPS_EWMA_ALPHA 0.05     /* small = steadier on-screen fps number */
 
 #define PAIR_BORDER 1
 #define PAIR_MEDIAN 2
@@ -108,31 +100,20 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula — grid geometry, pixel↔triangle, edge + median ── */
+/* ── §4 tri mapping & lattice ── */
 
-/*
- * GridCtx — everything we need to know about the current grid: how big the
- * triangles are, how thick the lines are, and where the grid sits on screen.
- * All the drawing math reads from one of these. Same geometry as 01, plus the
- * median_t setting for the three internal slicing lines.
- */
+/* GridCtx — the triangle grid for one frame. Same as 01's, plus median_t for
+ * the three internal slicing lines. Centred on screen, centre cell = origin
+ * (0,0). tri_size/border_w/median_t live here (not as constants) so +/- [/]
+ * tune them live. The plane is infinite; max_col/row are a rough reach. */
 typedef struct {
-    /* size of the terminal window, in character cells */
-    int rows, cols;
-
-    /* the triangles */
-    double tri_size;       /* triangle side length, in pixels                 */
-    double border_w;       /* how close to an outer edge counts as "on" it    */
-    double median_t;       /* how close to a slicing line counts as "on" it   */
-    int    cw, ch;         /* pixels per character cell (CELL_W, CELL_H);
-                              terminal cells are taller than wide, so these
-                              differ to keep triangles looking even           */
-
-    /* where pixel (0,0) lands on screen — we centre the grid here */
-    int    ox, oy;
-
-    /* rough count of triangles that fit across/down; advisory only */
-    int    max_col, max_row;
+    int    rows, cols;       /* terminal size in cells */
+    double tri_size;         /* triangle side length, sub-pixels */
+    double border_w;         /* how close to an outer edge still counts as on it */
+    double median_t;         /* how close to a median still counts as on it */
+    int    cw, ch;           /* sub-pixels per cell (CELL_W, CELL_H) */
+    int    ox, oy;           /* centre cell = grid origin (0,0) */
+    int    max_col, max_row; /* rough on-screen reach, not a hard boundary */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols)
@@ -150,14 +131,12 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->max_row = (int)((double)rows * CELL_H / (sqrt(3.0) * 0.5 * g->tri_size)) + 1;
 }
 
-/*
- * Given a pixel, tell us which triangle it falls in and where inside it.
- * (fa, fb) are how far along the triangle's two slanted axes we are — like
- * reading off a tilted graph-paper grid. Same math as 01_equilateral.c.
- */
-static void ctx_pixel_to_tri(const GridCtx *g, double px, double py,
-                             int *col, int *row, int *up,
-                             double *fa, double *fb)
+/* recipe step 1 (reverse) — a pixel -> which triangle (col,row,up) it lands in,
+ * plus where inside it (fa,fb). Undo the slant: a = px/size - b/2. Whole parts
+ * pick the diamond; fa+fb >= 1 means the up triangle. Same as 01. */
+static void screen_to_tri(const GridCtx *g, double px, double py,
+                          int *col, int *row, int *up,
+                          double *fa, double *fb)
 {
     double h = g->tri_size * sqrt(3.0) * 0.5;
     double b = py / h;
@@ -170,10 +149,7 @@ static void ctx_pixel_to_tri(const GridCtx *g, double px, double py,
     *up = (*fa + *fb >= 1.0) ? 1 : 0;
 }
 
-/*
- * Find the centre point of a given triangle, in pixels — that's where we
- * park the cursor mark. Same map as 01.
- */
+/* the middle of a triangle, in pixels (forward: triangle -> point) */
 static void tri_centroid_pixel(int col, int row, int up, double size,
                                double *cx_pix, double *cy_pix)
 {
@@ -184,7 +160,9 @@ static void tri_centroid_pixel(int col, int row, int up, double size,
     *cy_pix = b * h;
 }
 
-static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
+/* the terminal cell at a triangle's middle. Truncates (not rounds) on purpose,
+ * nudging '@' inside so it never lands on an outline char and hides. */
+static void tri_to_screen(const GridCtx *g, int col, int row, int up,
                           int *sr, int *sc)
 {
     double cx_pix, cy_pix;
@@ -193,12 +171,10 @@ static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
     *sr = g->oy + (int)(cy_pix / g->ch);
 }
 
-/*
- * For a point inside a triangle, find which of the three outer edges is
- * closest, and report that distance plus the character that draws it
- * (/, \, or _). Same as 01_equilateral.c.
- */
-static char tri_edge_char(int up, double fa, double fb, double *out_min)
+/* the line char for a point inside a triangle, by nearest outer edge: '/', '\',
+ * '_'. out_min returns the distance, so the caller can skip deep-inside points.
+ * Same as 01. */
+static char edge_glyph(int up, double fa, double fb, double *out_min)
 {
     double l1, l2, l3;
     char   ch1, ch2, ch3;
@@ -219,15 +195,12 @@ static char tri_edge_char(int up, double fa, double fb, double *out_min)
     return ch;
 }
 
-/*
- * For a point inside a triangle, find which of the three slicing lines is
- * closest, and report that distance plus the character that draws it.
- * Each line is described by a little equation; how far the point is from a
- * line is just how far that equation is from zero (scaled so different lines
- * compare fairly). The closest of the three wins. A triangle points either
- * down or up, and the two cases use different lines, so we handle them apart.
- */
-static char tri_median_char(int up, double fa, double fb, double *out_min)
+/* THE DISTINCT MATH — the three medians that cut each triangle into six 30-60-90
+ * right triangles. Each median is a line "expr = 0" in (fa,fb); the point's
+ * distance to it is |expr| scaled by 1/|normal| so the three compare fairly.
+ * Nearest median wins and its glyph ('\', '/', '|') is returned. Up- and
+ * down-pointing triangles use different line equations, so split the two. */
+static char median_glyph(int up, double fa, double fb, double *out_min)
 {
     static const double INV_SQRT2 = 0.70710678118654752440;
     static const double INV_SQRT5 = 0.44721359549995793928;
@@ -250,14 +223,11 @@ static char tri_median_char(int up, double fa, double fb, double *out_min)
     return ch;
 }
 
-/*
- * Walk every character cell on screen and decide what, if anything, it shows.
- * For each cell we find its triangle and how close it is to an outer edge and
- * to a slicing line. An outer edge wins ties and gets drawn first; otherwise a
- * nearby slicing line gets drawn; otherwise the cell is empty interior. Cells
- * inside the cursor's triangle are recoloured to highlight it.
- */
-static void ctx_draw_bg(const GridCtx *g, int cC, int cR, int cU)
+/* recipe step 2 — draw the grid: every cell -> its triangle, then the nearest
+ * outer edge and nearest median. An outer edge within border_w wins (and ties)
+ * and is drawn; else a median within median_t is drawn; else empty interior.
+ * The cursor's triangle is recoloured. */
+static void draw_lattice(const GridCtx *g, int cC, int cR, int cU)
 {
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
@@ -266,9 +236,9 @@ static void ctx_draw_bg(const GridCtx *g, int cC, int cR, int cU)
 
             int    tC, tR, tU;
             double fa, fb, em, mm;
-            ctx_pixel_to_tri(g, px, py, &tC, &tR, &tU, &fa, &fb);
-            char ech = tri_edge_char(tU, fa, fb, &em);
-            char mch = tri_median_char(tU, fa, fb, &mm);
+            screen_to_tri(g, px, py, &tC, &tR, &tU, &fa, &fb);
+            char ech = edge_glyph(tU, fa, fb, &em);
+            char mch = median_glyph(tU, fa, fb, &mm);
 
             int on_cur = (tC == cC && tR == cR && tU == cU);
             if (em < g->border_w && em <= mm) {
@@ -290,17 +260,14 @@ static void ctx_draw_bg(const GridCtx *g, int cC, int cR, int cU)
 
 /* ── §5 cursor ── */
 
-/*
- * Cursor — which triangle is currently selected. col/row pick the spot on the
- * grid; up says whether it's the upward- or downward-pointing triangle there.
- * The slicing lines are just decoration — the cursor only ever sits on a whole
- * triangle, never one of the six little ones. Same as 01_equilateral.c.
- */
+/* Cursor — which whole triangle is selected: col/row pick the diamond, up its
+ * half (0 = down, 1 = up). The medians are decoration; the cursor never sits on
+ * one of the six little triangles. Same as 01. */
 typedef struct { int col, row, up; } Cursor;
 
-/* Lookup table for moving the cursor. Stepping in a direction can flip an
-   up triangle to a down one (or move to a neighbour), so each direction
-   stores how col/row/up change. Same table as 01_equilateral.c. */
+/* move table: [arrow][current half] -> (d_col, d_row, new_up). When an arrow has
+ * no edge to cross, the entry just flips to the other half of the same diamond.
+ * arrows: 0=LEFT 1=RIGHT 2=UP 3=DOWN; halves: 0=down, 1=up. Same as 01. */
 static const int TRI_DIR[4][2][3] = {
     /* LEFT  */ { { -1,  0,  1 }, {  0,  0,  0 } },
     /* RIGHT */ { {  0,  0,  1 }, { +1,  0,  0 } },
@@ -316,6 +283,7 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->up  = 0;
 }
 
+/* recipe step 3 — step the cursor one triangle. No clamp; the plane is infinite. */
 static void cursor_move(Cursor *cur, const GridCtx *g, int dir)
 {
     (void)g;
@@ -325,10 +293,11 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dir)
     cur->up   = t[2];
 }
 
+/* put '@' in the cursor's triangle; after the grid so it lands on top */
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc;
-    ctx_to_screen(g, cur->col, cur->row, cur->up, &sr, &sc);
+    tri_to_screen(g, cur->col, cur->row, cur->up, &sr, &sc);
     if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
         attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
         mvaddch(sr, sc, '@');
@@ -361,7 +330,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, int theme,
                        int paused, double fps)
 {
     erase();
-    ctx_draw_bg(g, cur->col, cur->row, cur->up);
+    draw_lattice(g, cur->col, cur->row, cur->up);
     cursor_draw(cur, g);
     hud_draw(g, cur, theme, paused, fps);
     wnoutrefresh(stdscr);

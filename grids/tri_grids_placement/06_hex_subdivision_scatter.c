@@ -112,7 +112,7 @@ static void color_init(int theme)
 /* Everything needed to turn a hex address into a spot on the screen, kept in
  * one place so a resize just rebuilds this and the rest of the code follows.
  *   rows, cols      screen size in characters
- *   cw, ch          how many sub-pixels one character cell is wide/tall
+ *   cell_w, cell_h  how many sub-pixels one character cell is wide/tall
  *   hex_size        radius of a hex in those sub-pixels (bigger = zoom in)
  *   ox, oy          where hex (0,0) lands, in character cells (the centre)
  *   max_q, max_r    how far the cursor may roam before it leaves the screen
@@ -120,7 +120,7 @@ static void color_init(int theme)
  *   radius_t_frac   how close to a diagonal a cell must be to draw the cut */
 typedef struct {
     int    rows, cols;
-    int    cw, ch;
+    int    cell_w, cell_h;
     double hex_size;
     int    ox, oy;
     int    max_q, max_r;
@@ -130,7 +130,7 @@ typedef struct {
 static void ctx_init(GridCtx *g, int rows, int cols, double hex_size)
 {
     g->rows = rows; g->cols = cols;
-    g->cw = CELL_W; g->ch = CELL_H;
+    g->cell_w = CELL_W; g->cell_h = CELL_H;
     g->hex_size = hex_size;
     g->ox = cols / 2;
     g->oy = (rows - 1) / 2;
@@ -155,8 +155,8 @@ static char angle_char(double theta)
 /* Given a pixel, finds which hex it falls in and how far it is from that
  * hex's centre (0 at the middle, ~0.5 at the edge). The rounding dance fixes
  * the case where naive rounding would pick a hex that isn't actually closest. */
-static void pixel_to_hex(double px, double py, double size,
-                         int *Q, int *R, double *dist)
+static void screen_to_hex(double px, double py, double size,
+                          int *Q, int *R, double *dist)
 {
     double sq3 = sqrt(3.0), sq3_3 = sq3 / 3.0;
     double fq = (2.0 / 3.0 * px) / size;
@@ -199,19 +199,19 @@ static void wedge_centroid_pixel(int Q, int R, int sector, double size,
     *cy_pix = cy + r * sin(ang);
 }
 
-static void ctx_to_screen(const GridCtx *g, int q, int r, int sector,
+static void hex_to_screen(const GridCtx *g, int q, int r, int sector,
                           int *scol, int *srow)
 {
     double cx, cy;
     wedge_centroid_pixel(q, r, sector, g->hex_size, &cx, &cy);
-    *scol = g->ox + (int)(cx / g->cw);
-    *srow = g->oy + (int)(cy / g->ch);
+    *scol = g->ox + (int)(cx / g->cell_w);
+    *srow = g->oy + (int)(cy / g->cell_h);
 }
 
 /* Paints the grid lines: walks every screen cell, asks which hex it's in,
  * and inks it if it sits on the hex outline or on one of the three diagonal
  * cuts. The whole grid is just this proximity test, no per-hex loop. */
-static void ctx_draw_bg(const GridCtx *g)
+static void draw_lattice(const GridCtx *g)
 {
     double sq3 = sqrt(3.0), sq3_2 = sq3 * 0.5;
     double limit_inner = 0.5 - g->border_w;
@@ -220,10 +220,10 @@ static void ctx_draw_bg(const GridCtx *g)
     attron(COLOR_PAIR(PAIR_BORDER));
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
-            double px = (double)(col - g->ox) * g->cw;
-            double py = (double)(row - g->oy) * g->ch;
+            double px = (double)(col - g->ox) * g->cell_w;
+            double py = (double)(row - g->oy) * g->cell_h;
             int Q, R; double dist;
-            pixel_to_hex(px, py, g->hex_size, &Q, &R, &dist);
+            screen_to_hex(px, py, g->hex_size, &Q, &R, &dist);
             double cx, cy;
             hex_centre_pixel(Q, R, g->hex_size, &cx, &cy);
             double dxp = px - cx, dyp = py - cy;
@@ -315,7 +315,7 @@ static void cursor_rotate_sector(Cursor *cur, int delta)
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sc, sr;
-    ctx_to_screen(g, cur->q, cur->r, cur->sector, &sc, &sr);
+    hex_to_screen(g, cur->q, cur->r, cur->sector, &sc, &sr);
     if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
         attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
         mvaddch(sr, sc, '@');
@@ -323,7 +323,7 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
     }
 }
 
-/* ── §7 mode ── */
+/* ── §7 scatter ── */
 
 /* A tiny home-grown random number generator: each call scrambles g_seed and
  * hands back a number in [0,1). Good enough for sprinkling dots, and it lets
@@ -392,7 +392,7 @@ static void scatter_draw(const Pool *p, const Cursor *cur, const GridCtx *g)
     for (int i = 0; i < p->count; i++) {
         if (!p->items[i].alive) continue;
         int sc, sr;
-        ctx_to_screen(g, p->items[i].q, p->items[i].r, p->items[i].sector,
+        hex_to_screen(g, p->items[i].q, p->items[i].r, p->items[i].sector,
                       &sc, &sr);
         if (sc < 0 || sc >= g->cols || sr < 0 || sr >= g->rows - 1) continue;
         int dist = wedge_distance(p->items[i].q, p->items[i].r, p->items[i].sector,
@@ -429,7 +429,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, const Pool *p,
                        double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_lattice(g);
     scatter_draw(p, cur, g);
     cursor_draw(cur, g);
     hud_draw(g, cur, p, fps);

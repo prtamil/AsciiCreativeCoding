@@ -126,7 +126,7 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 gridctx ── */
+/* ── §4 polar mapping ── */
 
 /*
  * GridCtx — everything the polar math needs to know about the screen.
@@ -161,7 +161,7 @@ static void ctx_init(GridCtx *g, int mode, int rows, int cols)
     g->max_ring = (int)(half_diag_px / 20.0);
 }
 
-static void cell_to_polar(int col, int row, int ox, int oy,
+static void screen_to_polar(int col, int row, int ox, int oy,
                            double *r_px, double *theta)
 {
     double dx = (double)(col - ox) * CELL_W;
@@ -177,7 +177,7 @@ static void polar_to_screen(double r, double theta, int ox, int oy,
     *row = oy + (int)round(r * sin(theta) / CELL_H);
 }
 
-static char angle_char(double theta)
+static char line_glyph(double theta)
 {
     double a = fmod(theta + 2.0*M_PI, M_PI);
     if (a < M_PI/8.0 || a >= 7.0*M_PI/8.0) return '-';
@@ -422,7 +422,7 @@ static void cursor_move_elliptic(Cursor *c, const GridCtx *g, int key)
     if (c->row >= g->rows-1) c->row = g->rows-2;
     if (c->col < 0)          c->col = 0;
     if (c->col >= g->cols)   c->col = g->cols-1;
-    cell_to_polar(c->col, c->row, g->ox, g->oy, &c->r, &c->theta);
+    screen_to_polar(c->col, c->row, g->ox, g->oy, &c->r, &c->theta);
     if (c->r < R_POLAR_MIN) c->r = R_POLAR_MIN;
 }
 
@@ -467,14 +467,14 @@ static void bg_rings_spokes_draw(const GridCtx *g)
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
             double r, th;
-            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            screen_to_polar(col, row, g->ox, g->oy, &r, &th);
             double rp     = fmod(r, sp);
             bool   on_r   = rp < rw || rp > sp - rw;
             double tn     = fmod(th + two_pi, two_pi);
             double sp2    = fmod(tn, sa);
             bool   on_s   = r > 3.0 && (sp2 < sw || sp2 > sa - sw);
             if (on_r || on_s)
-                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+                mvaddch(row, col, (chtype)(unsigned char)line_glyph(th));
         }
     }
 }
@@ -489,7 +489,7 @@ static void bg_log_polar_draw(const GridCtx *g)
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
             double r, th;
-            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            screen_to_polar(col, row, g->ox, g->oy, &r, &th);
             bool on_r = false;
             if (r > rmin) {
                 double u  = log(r / rmin) / ls;
@@ -500,7 +500,7 @@ static void bg_log_polar_draw(const GridCtx *g)
             double sp2 = fmod(tn, sa);
             bool   on_s = r > 3.0 && (sp2 < sw || sp2 > sa - sw);
             if (on_r || on_s)
-                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+                mvaddch(row, col, (chtype)(unsigned char)line_glyph(th));
         }
     }
 }
@@ -515,13 +515,13 @@ static void bg_archimedean_draw(const GridCtx *g)
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
             double r, th;
-            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            screen_to_polar(col, row, g->ox, g->oy, &r, &th);
             if (r < rmin) continue;
             double tn  = fmod(th + two_pi, two_pi);
             double raw = 2.0 * (tn - r / a);
             double ph  = fmod(raw + 2.0 * two_pi, two_pi);
             if (ph < sw || ph > two_pi - sw)
-                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+                mvaddch(row, col, (chtype)(unsigned char)line_glyph(th));
         }
     }
 }
@@ -536,14 +536,14 @@ static void bg_log_spiral_draw(const GridCtx *g)
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
             double r, th;
-            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            screen_to_polar(col, row, g->ox, g->oy, &r, &th);
             if (r < rmin) continue;
             double tn  = fmod(th + two_pi, two_pi);
             double tp  = log(r / rmin) / growth;
             double raw = 2.0 * (tn - tp);
             double ph  = fmod(raw + 2.0 * two_pi, two_pi);
             if (ph < sw || ph > two_pi - sw)
-                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+                mvaddch(row, col, (chtype)(unsigned char)line_glyph(th));
         }
     }
 }
@@ -579,7 +579,7 @@ static void bg_equal_area_draw(const GridCtx *g)
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
             double r, th;
-            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            screen_to_polar(col, row, g->ox, g->oy, &r, &th);
             if (r < 3.0) continue;
             double kf  = (r * r) / rusq;
             double fr  = kf - floor(kf);
@@ -587,7 +587,7 @@ static void bg_equal_area_draw(const GridCtx *g)
             double tn  = fmod(th + two_pi, two_pi);
             double sp2 = fmod(tn, sa);
             if (on_r || sp2 < sw || sp2 > sa - sw)
-                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+                mvaddch(row, col, (chtype)(unsigned char)line_glyph(th));
         }
     }
 }
@@ -606,7 +606,7 @@ static void bg_elliptic_draw(const GridCtx *g)
             double et = atan2(dy/B, dx/A);
             double u  = er / sp, fr = u - floor(u);
             if (fr < rwu || fr > 1.0 - rwu)
-                mvaddch(row, col, (chtype)(unsigned char)angle_char(et));
+                mvaddch(row, col, (chtype)(unsigned char)line_glyph(et));
         }
     }
 }
@@ -653,12 +653,10 @@ typedef struct {
 } AnchorCtx;
 
 /*
- * Draws an arc: the slice of point A's ring that runs from A's angle to B's.
- * It walks the angle in small steps, dropping one dot per step. The step is
- * sized so big rings (more cells around) get more dots and the line stays
- * solid; a floor on the step stops a giant ring from looping forever. The
- * walk always goes the same direction, so picking A past B gives the long
- * way round, not the short.
+ * STRATEGY — arc between two anchors: a run of cells at A's constant radius,
+ * sweeping the angle from A to B. Step shrinks with bigger radius so the run
+ * stays gap-free; ARC_STEP_MIN floors it so a giant ring can't loop forever.
+ * The sweep always increases theta, so A past B draws the long way round.
  */
 static void arc_draw(Pool *pool, const AnchorCtx *ac, const GridCtx *g)
 {

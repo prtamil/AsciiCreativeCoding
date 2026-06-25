@@ -1,20 +1,21 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 11_delaunay.c — connect scattered dots into nice, well-shaped triangles.
+ * 11_delaunay.c — Delaunay triangulation of scattered points (Bowyer-Watson).
  *
- * Drop N random points on the screen and join them into triangles with the
- * Bowyer-Watson method, which avoids skinny slivers and favours fat, even
- * triangles. Move the cursor with ',' / '.' to pick a point and light up the
- * triangles around it; 'r' scatters fresh points.
+ * THE RECIPE: seed one giant super-triangle covering the screen, then insert
+ * each random point in turn: delete every triangle whose circumcircle contains
+ * the point (in_circumcircle), find the boundary of the hole that leaves, and
+ * fan those rim edges out to the new point (mesh_insert). Strip the super-
+ * triangle at the end. The empty-circumcircle rule is what makes the result
+ * Delaunay — fat, even triangles instead of slivers.
  *
- * Sister files: 01_equilateral.c is the tidy regular-grid cousin; this is the
- * messy free-form version. geometry/delaunay_triangulation.c shows the same
- * idea in more detail, including the circles it draws through each triangle.
+ * Sister: 01_equilateral.c is the tidy regular-grid cousin (computed lattice);
+ * this is the free-form version (a stored mesh). geometry/delaunay_triangula-
+ * tion.c shows the same idea with the circumcircles drawn in.
  *
  * References: Bowyer & Watson, both "Computing... tessellation" (1981);
- * de Berg et al., "Computational Geometry" (3e), §9; and Shewchuk's "Robust
- * Adaptive Floating-Point Geometric Predicates" (1996) for the inside-circle
- * test done with bullet-proof precision.
+ * de Berg et al., "Computational Geometry" (3e), §9; Shewchuk, "Robust
+ * Adaptive Floating-Point Geometric Predicates" (1996).
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -108,7 +109,7 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula — GridCtx + orient2d + in_circumcircle ── */
+/* ── §4 geometry — GridCtx + orient2d + in_circumcircle predicates ── */
 
 /* A single 2-D point, in sub-cell pixel units. */
 typedef struct { double x, y; } Pt;
@@ -214,21 +215,10 @@ static void mesh_seed_super(double pw, double ph)
     tri_add(0, 1, 2);
 }
 
-/*
- * Drop one new point P into the mesh and re-stitch the triangles around it.
- * The trick (Bowyer-Watson): any triangle whose circle swallows P is now
- * wrong, so we delete all of them. That leaves a hole; the edges around the
- * rim of that hole are the ones that belonged to exactly one deleted triangle.
- * Fan those rim edges out to P to fill the hole back in with fresh triangles.
- */
-static void mesh_insert(Pt P)
+/* Step 1 — mark every triangle whose circumcircle contains P; collect their
+ * indices in bad[] and return the count. These are the triangles P invalidates. */
+static int find_bad_tris(Pt P, int bad[MAX_TRIS])
 {
-    if (g_n_pts >= MAX_POINTS) return;
-    g_pts[g_n_pts] = P;
-    int pid = g_n_pts;
-    g_n_pts++;
-
-    int bad[MAX_TRIS];
     int n_bad = 0;
     for (int i = 0; i < g_n_tris; i++) {
         if (!g_tris[i].valid) continue;
@@ -240,34 +230,65 @@ static void mesh_insert(Pt P)
             bad[n_bad++] = i;
         }
     }
+    return n_bad;
+}
 
-    int boundary[MAX_BOUNDARY][2];
+/* Is edge (a,b) of a bad triangle shared with any OTHER bad triangle? Interior
+ * edges are shared; rim edges of the hole belong to exactly one bad triangle. */
+static int edge_is_interior(int a, int b, const int bad[], int n_bad, int self)
+{
+    for (int bj = 0; bj < n_bad; bj++) {
+        if (bj == self) continue;
+        int tj = bad[bj];
+        for (int f = 0; f < 3; f++) {
+            int aa = g_tris[tj].v[f];
+            int bb = g_tris[tj].v[(f + 1) % 3];
+            if ((aa == a && bb == b) || (aa == b && bb == a)) return 1;
+        }
+    }
+    return 0;
+}
+
+/* Step 2 — the hole's rim: every edge of a bad triangle that no other bad
+ * triangle shares. Fill boundary[] and return the edge count. */
+static int find_hole_boundary(const int bad[], int n_bad,
+                              int boundary[MAX_BOUNDARY][2])
+{
     int n_b = 0;
     for (int bi = 0; bi < n_bad; bi++) {
         int ti = bad[bi];
         for (int e = 0; e < 3; e++) {
             int a = g_tris[ti].v[e];
             int b = g_tris[ti].v[(e + 1) % 3];
-            int shared = 0;
-            for (int bj = 0; bj < n_bad; bj++) {
-                if (bj == bi) continue;
-                int tj = bad[bj];
-                for (int f = 0; f < 3; f++) {
-                    int aa = g_tris[tj].v[f];
-                    int bb = g_tris[tj].v[(f + 1) % 3];
-                    if ((aa == a && bb == b) || (aa == b && bb == a)) {
-                        shared = 1; break;
-                    }
-                }
-                if (shared) break;
-            }
-            if (!shared && n_b < MAX_BOUNDARY) {
+            if (!edge_is_interior(a, b, bad, n_bad, bi) && n_b < MAX_BOUNDARY) {
                 boundary[n_b][0] = a;
                 boundary[n_b][1] = b;
                 n_b++;
             }
         }
     }
+    return n_b;
+}
+
+/*
+ * Drop one new point P into the mesh and re-stitch the triangles around it
+ * (Bowyer-Watson), in three steps:
+ *   1. delete every triangle whose circumcircle swallows P     (find_bad_tris)
+ *   2. trace the rim of the hole that leaves                  (find_hole_boundary)
+ *   3. fan those rim edges out to P, filling the hole back in (tri_add)
+ */
+static void mesh_insert(Pt P)
+{
+    if (g_n_pts >= MAX_POINTS) return;
+    g_pts[g_n_pts] = P;
+    int pid = g_n_pts;
+    g_n_pts++;
+
+    int bad[MAX_TRIS];
+    int n_bad = find_bad_tris(P, bad);
+
+    int boundary[MAX_BOUNDARY][2];
+    int n_b = find_hole_boundary(bad, n_bad, boundary);
 
     for (int i = 0; i < n_b; i++)
         tri_add(boundary[i][0], boundary[i][1], pid);
@@ -369,7 +390,7 @@ static void line_draw(const GridCtx *g, double px0, double py0,
  * Draw the whole web of triangle edges. Triangles touching the picked point
  * are highlighted; everything else uses the plain edge colour.
  */
-static void ctx_draw_bg(const GridCtx *g, const Cursor *cur)
+static void draw_mesh(const GridCtx *g, const Cursor *cur)
 {
     for (int i = 0; i < g_n_tris; i++) {
         if (!g_tris[i].valid) continue;
@@ -472,7 +493,7 @@ static void hud_draw(const GridCtx *g, const Scene *s, const Cursor *cur, double
 static void scene_draw(const GridCtx *g, const Scene *s, const Cursor *cur, double fps)
 {
     erase();
-    ctx_draw_bg(g, cur);
+    draw_mesh(g, cur);
     cursor_draw(g, cur);
     hud_draw(g, s, cur, fps);
     wnoutrefresh(stdscr);

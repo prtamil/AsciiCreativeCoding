@@ -65,24 +65,17 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula — turning a cell address into a screen position ── */
+/* ── §4 rect mapping & lattice ── */
 
-/*
- * Everything we need to know about the grid's current layout. Recomputed from
- * the terminal size at startup and on every resize, then passed around so the
- * drawing code never has to guess where a cell sits on screen.
- */
+/* GridCtx — the grid for one frame: terminal size, cell size, and how far the
+ * cursor may roam. max_r/max_c are rounded even so the cursor always lands on a
+ * light cell (see cursor_reset). */
 typedef struct {
-    int rows, cols;     /* terminal size in characters */
-    int cw, ch;         /* one cell's width and height in characters */
-    int max_r, max_c;   /* furthest cell the cursor may reach; kept even so
-                           it always lands on a light cell (see cursor_reset) */
+    int rows, cols;      /* terminal size in characters */
+    int cw, ch;          /* one cell's width and height in characters */
+    int max_r, max_c;    /* furthest cell the cursor can reach (even-snapped) */
 } GridCtx;
 
-/*
- * Works out the grid layout from the terminal size. max_r/max_c are rounded
- * down to even so the cursor can never get stuck on a dark cell.
- */
 static void ctx_init(GridCtx *g, int rows, int cols)
 {
     g->rows = rows; g->cols = cols;
@@ -93,14 +86,16 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->max_c = gc & ~1;
 }
 
-/* Where does cell (r,c) start on the screen? Same mapping as the plain grid. */
-static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
+/* recipe step 1 — cell (r,c) -> its top-left corner on screen */
+static void cell_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
     *sr = r * g->ch;
     *sc = c * g->cw;
 }
 
-static char ctx_grid_char(const GridCtx *g, int sr, int sc)
+/* which glyph belongs at a screen spot: on a line when row or column divides
+ * evenly into the cell size. Crossing -> '+', else '-' / '|'. */
+static char grid_glyph_at(const GridCtx *g, int sr, int sc)
 {
     bool h = (sr % g->ch == 0);
     bool v = (sc % g->cw == 0);
@@ -110,40 +105,32 @@ static char ctx_grid_char(const GridCtx *g, int sr, int sc)
     return ' ';
 }
 
-/*
- * Light or dark? A cell is dark (returns 1) when its row + column is odd,
- * light (returns 0) when even. Because each step sideways or down flips that
- * even/odd-ness, neighbouring cells always come out opposite — a chessboard.
- */
+/* the distinct idea — a cell is dark (1) when row + column is odd, light (0)
+ * when even. Each step sideways or down flips it, so neighbours alternate. */
 static int cell_parity(int r, int c) { return (r + c) % 2; }
 
-/* Paint the dark squares first, then lay the grid lines over the top so the
- * borders are never swallowed by the fill. */
-static void ctx_draw_bg(const GridCtx *g)
+/* recipe step 2 — paint dark squares by parity, then lay the lattice over the
+ * top so the lines are never swallowed by the fill */
+static void draw_lattice(const GridCtx *g)
 {
     int gr = (g->rows - 1) / g->ch;
     int gc = g->cols / g->cw;
 
-    /* shade the dark cells */
-    for (int r = 0; r < gr; r++) {
+    attron(COLOR_PAIR(PAIR_DARK));
+    for (int r = 0; r < gr; r++)
         for (int c = 0; c < gc; c++) {
-            int sr, sc; ctx_to_screen(g, r, c, &sr, &sc);
-            bool dark = (cell_parity(r, c) == 1);
-            if (dark) {
-                attron(COLOR_PAIR(PAIR_DARK));
-                for (int dr = 1; dr < g->ch; dr++)
-                    for (int dc = 1; dc < g->cw; dc++)
-                        mvaddch(sr + dr, sc + dc, (chtype)(unsigned char)DARK_FILL);
-                attroff(COLOR_PAIR(PAIR_DARK));
-            }
+            if (cell_parity(r, c) != 1) continue;     /* skip light cells */
+            int sr, sc; cell_to_screen(g, r, c, &sr, &sc);
+            for (int dr = 1; dr < g->ch; dr++)
+                for (int dc = 1; dc < g->cw; dc++)
+                    mvaddch(sr + dr, sc + dc, (chtype)(unsigned char)DARK_FILL);
         }
-    }
+    attroff(COLOR_PAIR(PAIR_DARK));
 
-    /* draw the grid lines over the fill */
     attron(COLOR_PAIR(PAIR_BORDER));
     for (int sr = 0; sr < g->rows - 1; sr++)
         for (int sc = 0; sc < g->cols; sc++) {
-            char ch = ctx_grid_char(g, sr, sc);
+            char ch = grid_glyph_at(g, sr, sc);
             if (ch != ' ')
                 mvaddch(sr, sc, (chtype)(unsigned char)ch);
         }
@@ -175,7 +162,7 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
 
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
-    int sr, sc; ctx_to_screen(g, cur->r, cur->c, &sr, &sc);
+    int sr, sc; cell_to_screen(g, cur->r, cur->c, &sr, &sc);
     attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
     mvaddch(sr + g->ch / 2, sc + g->cw / 2, (chtype)'@');
     attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
@@ -202,7 +189,7 @@ static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
 static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_lattice(g);
     cursor_draw(cur, g);
     hud_draw(g, cur, fps);
     wnoutrefresh(stdscr); doupdate();

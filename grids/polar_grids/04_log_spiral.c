@@ -103,31 +103,23 @@ static void color_init(int theme)
     init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,  -1);
 }
 
-/* ── §4 formula — where the spiral lives on screen ── */
+/* ── §4 polar mapping & lattice ── */
 
-/*
- * GridCtx — everything we need to know to draw the spiral and to keep the
- * cursor inside it.  Built once from the terminal size, rebuilt on resize or
- * when the growth rate changes.
- */
+/* GridCtx — the logarithmic-spiral grid for one frame: screen size, where the
+ * centre sits, the spiral's growth rate, and how many arms. The grid is never
+ * stored; each cell decides what to draw from its distance and angle to the
+ * centre. The grid is always centred on (ox, oy). */
 typedef struct {
-    int rows, cols;        /* terminal size, in character cells             */
-
-    double a;              /* growth rate: how fast coils fan out           */
-    double r_min;          /* radius of the blank centre we don't draw      */
-    int    n_arms;         /* how many spiral arms                          */
-    int    cell_w, cell_h; /* width/height of one cell, in our pixel units  */
-
-    int    ox, oy;         /* screen cell the spiral centre sits on         */
-
-    int    max_turn;       /* furthest coil the cursor can reach before     */
-                           /*   it would fall off the visible area          */
-    int    max_spoke;      /* last stop around one coil (CURSOR_SPOKES − 1) */
+    int    rows, cols;     /* terminal size in character cells */
+    double a;              /* growth rate: how fast coils fan out; +/- changes it */
+    double r_min;          /* radius of the blank centre we don't draw */
+    int    n_arms;         /* how many spiral arms; [/] changes it */
+    int    cell_w, cell_h; /* pixels per cell (CELL_W / CELL_H) */
+    int    ox, oy;         /* grid centre, as a cell column and row */
+    int    max_turn;       /* furthest coil whose cursor cell stays on screen */
+    int    max_spoke;      /* CURSOR_SPOKES - 1; the spoke index wraps past it */
 } GridCtx;
 
-/* Recompute the centre and how far out the cursor may roam for the current
- * terminal size and growth rate.  Call it on startup, on resize, and any time
- * the growth changes. */
 static void ctx_init(GridCtx *g, int rows, int cols)
 {
     g->rows   = rows;
@@ -140,6 +132,8 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     if (g->r_min  <= 0.0) g->r_min  = R_MIN;
     if (g->n_arms <= 0)   g->n_arms = N_ARMS_DEFAULT;
 
+    /* biggest coil still on screen, limited by whichever of width/height runs out
+     * first; invert the spiral law r = r_min*e^(a*theta) to count whole turns */
     double rx = (double)cols * 0.5 * CELL_W;
     double ry = (double)rows * 0.5 * CELL_H;
     double r_visible = (rx < ry ? rx : ry);
@@ -153,63 +147,74 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->max_spoke = CURSOR_SPOKES - 1;
 }
 
-/* Given a (turn, spoke) spot on the first arm, find which screen cell it lands
- * on.  Turn says which coil, spoke says how far around that coil; from those we
- * get an angle, the spiral law gives the radius, and we round to a cell. */
-static void ctx_to_screen(const GridCtx *g, int turn, int spoke,
-                          int *sr, int *sc)
+/* the spiral law: at angle theta the arm sits at radius r = r_min * e^(a*theta),
+ * so the radius grows exponentially as you wind round — wider coils farther out */
+static double spiral_radius(const GridCtx *g, double theta)
 {
-    double theta_sample = ((double)turn +
-                           ((double)spoke + 0.5) / (double)CURSOR_SPOKES)
-                          * 2.0 * M_PI;
-    double r_sample = g->r_min * exp(g->a * theta_sample);
-    double cx = r_sample * cos(theta_sample);
-    double cy = r_sample * sin(theta_sample);
+    return g->r_min * exp(g->a * theta);
+}
+
+/* recipe step 1 — a (turn, spoke) cell -> the screen cell on the first arm.
+ * turn picks the coil, spoke is half-a-step round it, together making an angle;
+ * the spiral law gives the radius at that angle, then we round to a cell. */
+static void polar_to_screen(const GridCtx *g, int turn, int spoke,
+                            int *sr, int *sc)
+{
+    double theta = ((double)turn +
+                    ((double)spoke + 0.5) / (double)CURSOR_SPOKES)
+                   * 2.0 * M_PI;
+    double r = spiral_radius(g, theta);
+    double cx = r * cos(theta);
+    double cy = r * sin(theta);
     *sc = g->ox + (int)round(cx / (double)g->cell_w);
     *sr = g->oy + (int)round(cy / (double)g->cell_h);
 }
 
-/* Pick the slash, pipe, or dash that best matches the direction the spiral is
- * heading at this point, so the curve reads as a smooth line instead of dots. */
-static char angle_char(double theta)
+/* the reverse — a screen cell -> its distance and angle from the grid centre */
+static void screen_to_polar(const GridCtx *g, int col, int row,
+                            double *r_px, double *theta)
 {
-    double a = fmod(theta + 2.0*M_PI, M_PI);
-    if (a < M_PI/8.0 || a >= 7.0*M_PI/8.0) return '-';
-    if (a < 3.0*M_PI/8.0)                   return '\\';
-    if (a < 5.0*M_PI/8.0)                   return '|';
+    double dx = (double)(col - g->ox) * g->cell_w;
+    double dy = (double)(row - g->oy) * g->cell_h;
+    *r_px  = sqrt(dx * dx + dy * dy);
+    *theta = atan2(dy, dx);
+}
+
+/* the line char matching a direction: '-' horizontal, '|' vertical, '/' '\' the
+ * diagonals. A line and its 180° flip look the same, so we fold into a half-turn. */
+static char line_glyph(double theta)
+{
+    double a = fmod(theta + 2.0 * M_PI, M_PI);
+    if (a < M_PI / 8.0 || a >= 7.0 * M_PI / 8.0) return '-';
+    if (a < 3.0 * M_PI / 8.0)                    return '\\';
+    if (a < 5.0 * M_PI / 8.0)                    return '|';
     return '/';
 }
 
-/* Draw the spiral by asking every cell one question: "are you sitting on an
- * arm?"  For each cell we work out its distance and angle from the centre,
- * then check how far its angle is from where an arm should be at that distance.
- * Close enough, and we draw it. */
-static void ctx_draw_bg(const GridCtx *g)
+/* recipe step 2 — draw the grid: each cell asks "am I on an arm?". Invert the
+ * spiral law to predict the arm's angle at this cell's distance; the cell is on
+ * an arm when its own angle is within SPIRAL_W of that prediction (per arm). */
+static void draw_lattice(const GridCtx *g)
 {
     double two_pi = 2.0 * M_PI;
 
     attron(COLOR_PAIR(PAIR_GRID));
     for (int row = 0; row < g->rows - 1; row++) {
         for (int col = 0; col < g->cols; col++) {
-            double dx = (double)(col - g->ox) * g->cell_w;
-            double dy = (double)(row - g->oy) * g->cell_h;
-            double r_px = sqrt(dx*dx + dy*dy);
+            double r_px, theta;
+            screen_to_polar(g, col, row, &r_px, &theta);
             if (r_px < g->r_min) continue;
 
-            double theta = atan2(dy, dx);
             double theta_norm = fmod(theta + two_pi, two_pi);
 
-            /* Where should an arm be, angle-wise, at this distance?  "phase" is
-             * how far this cell's angle strays from that; near zero means it's
-             * right on an arm.  The wrap keeps the answer in a clean range. */
+            /* invert r = r_min*e^(a*theta) -> the angle an arm has at this radius;
+             * phase is how far this cell strays from it, near zero = on an arm */
             double theta_pred = log(r_px / g->r_min) / g->a;
             double raw   = (double)g->n_arms * (theta_norm - theta_pred);
             double phase = fmod(raw + (double)g->n_arms * two_pi, two_pi);
 
-            if (phase < SPIRAL_W || phase > two_pi - SPIRAL_W) {
-                char c = angle_char(theta);
-                mvaddch(row, col, (chtype)(unsigned char)c);
-            }
+            if (phase < SPIRAL_W || phase > two_pi - SPIRAL_W)
+                mvaddch(row, col, (chtype)(unsigned char)line_glyph(theta));
         }
     }
     attroff(COLOR_PAIR(PAIR_GRID));
@@ -217,12 +222,9 @@ static void ctx_draw_bg(const GridCtx *g)
 
 /* ── §5 cursor ── */
 
-/*
- * Cursor — where the '@' probe sits on the first arm.
- *   turn  — which coil, counting outward from the centre.
- *   spoke — how far around that coil, in CURSOR_SPOKES even steps.
- * The arrow keys nudge these two numbers; ctx_to_screen turns them into a cell.
- */
+/* Cursor — the grid cell the '@' points at: a turn (which coil out from the
+ * centre) and a spoke (how far round it, in CURSOR_SPOKES even steps). turn is
+ * 0..max_turn; spoke wraps, since a coil has no first or last step. */
 typedef struct { int turn, spoke; } Cursor;
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
@@ -231,6 +233,7 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->spoke = 0;
 }
 
+/* recipe step 3 — move the cursor: out/in clamps at the edge, round wraps */
 static void cursor_move(Cursor *cur, const GridCtx *g, int d_turn, int d_spoke)
 {
     int nt = cur->turn + d_turn;
@@ -244,10 +247,11 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int d_turn, int d_spoke)
     cur->spoke = ns;
 }
 
+/* draw the '@' on the cursor's cell; after the grid so it sits on top */
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc;
-    ctx_to_screen(g, cur->turn, cur->spoke, &sr, &sc);
+    polar_to_screen(g, cur->turn, cur->spoke, &sr, &sc);
     if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
         attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
         mvaddch(sr, sc, (chtype)'@');
@@ -279,7 +283,7 @@ static void scene_draw(const GridCtx *g, const Cursor *cur, bool golden,
                        int theme, bool paused, double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_lattice(g);
     cursor_draw(cur, g);
     hud_draw(g, cur, golden, theme, paused, fps);
     wnoutrefresh(stdscr); doupdate();

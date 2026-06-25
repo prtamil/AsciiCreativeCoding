@@ -1,22 +1,11 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * 10_crosshatch.c — two sets of diagonal lines overlaid to make a cross-hatch.
+ * 10_crosshatch.c — two diagonal line families woven into a cross-hatch mesh.
  *
- * One set of '/' lines and one set of '\' lines, each with its own spacing,
- * laid on top of each other. They weave into a diamond mesh (like tartan).
- * A cursor hops between the diamond cells. The trick: we never store any
- * lines — for each screen spot we just ask two yes/no questions and draw.
+ * Nothing is stored: at each screen spot we run two modulo tests — '/' lines
+ * keep (sc+sr) constant, '\' lines keep (sc-sr) constant — and draw '/','\','X'.
  *
- * Study alongside: 08_diamond.c (one diagonal set), 01_uniform_rect.c.
- * The pattern idea: en.wikipedia.org/wiki/Crosshatching.
- *
- * The two questions, per screen spot (row sr, column sc):
- *   on a '/' line?  -> sum (sc + sr) lands on a multiple of STEP_A.
- *   on a '\' line?  -> difference (sc - sr) lands on a multiple of STEP_B.
- * Why those? Walk along a '/' line and the sum stays put; walk along a '\'
- * line and the difference stays put. So "every STEP_A steps of the sum"
- * spaces out the '/' lines, and likewise STEP_B for the '\' lines. Both true
- * at once means the two lines cross, so we draw an 'X' there.
+ * Sister files: 01_uniform_rect.c (the skeleton), 08_diamond.c (one family).
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -80,19 +69,14 @@ static void color_init(void)
     init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula — turning a cursor cell into a screen spot, and drawing lines ── */
+/* ── §4 rect mapping & lattice ── */
 
-/*
- * GridCtx — everything we need to know about the current terminal so the
- * cursor stays inside it. Recomputed whenever the window is resized.
- *   rows, cols     — terminal size in characters.
- *   cw, ch         — size of one cursor cell (matches CELL_W / CELL_H).
- *   max_r, max_c   — highest legal cursor cell, so it can't walk off-screen.
- */
+/* GridCtx — the grid for one frame: terminal size, cursor-cell size, and how
+ * far the cursor may roam (last whole cell that fits, bottom row left free). */
 typedef struct {
-    int rows, cols;
-    int cw, ch;
-    int max_r, max_c;
+    int rows, cols;      /* terminal size in characters */
+    int cw, ch;          /* cursor-cell width and height (CELL_W / CELL_H) */
+    int max_r, max_c;    /* furthest cell the cursor can reach */
 } GridCtx;
 
 static void ctx_init(GridCtx *g, int rows, int cols)
@@ -103,50 +87,60 @@ static void ctx_init(GridCtx *g, int rows, int cols)
     g->max_c = cols / CELL_W - 1;
 }
 
-static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
+/* recipe step 1 — cell (r,c) -> its top-left corner on screen */
+static void cell_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
     *sr = r * g->ch;
     *sc = c * g->cw;
 }
 
-/*
- * Answers the two yes/no questions for one screen spot: is it on a '/' line,
- * and is it on a '\' line? The "+ STEP_B" dance is there because (sc - sr) can
- * go negative, and C's % keeps the sign — without it the '\' lines would
- * vanish in the lower-left of the screen.
- */
-static void crosshatch_test(int sr, int sc, bool *slash, bool *back)
+/* The distinct idea: two diagonal line families, each a modulo test on a
+ * screen spot. A '/' line keeps the sum (sc+sr) constant, a '\' line keeps the
+ * difference (sc-sr) constant — so spacing the lines = "every STEP steps of"
+ * that quantity. The "+ STEP_B" dance fixes C's sign-keeping % on (sc-sr) < 0,
+ * which would otherwise drop the '\' lines in the lower-left. */
+static bool on_slash_line(int sr, int sc) { return (sc + sr) % STEP_A == 0; }
+static bool on_back_line(int sr, int sc)  { return ((sc - sr) % STEP_B + STEP_B) % STEP_B == 0; }
+
+/* which glyph belongs at a screen spot: both families cross -> 'X', else the
+ * single family that passes through, else blank. */
+static char grid_glyph_at(int sr, int sc)
 {
-    *slash = ((sc + sr) % STEP_A == 0);
-    *back  = (((sc - sr) % STEP_B + STEP_B) % STEP_B == 0);
+    bool slash = on_slash_line(sr, sc);
+    bool back  = on_back_line(sr, sc);
+    if (slash && back) return 'X';
+    if (slash)         return '/';
+    if (back)          return '\\';
+    return ' ';
 }
 
-/* Walks every screen spot and paints '/', '\', or 'X' where the lines fall. */
-static void ctx_draw_bg(const GridCtx *g)
+static int glyph_pair(char ch)
+{
+    if (ch == 'X')  return PAIR_CROSS;
+    if (ch == '/')  return PAIR_SLASH;
+    return PAIR_BACK;
+}
+
+/* recipe step 2 — draw the mesh by asking grid_glyph_at at every screen spot */
+static void draw_lattice(const GridCtx *g)
 {
     for (int sr = 0; sr < g->rows - 1; sr++) {
         for (int sc = 0; sc < g->cols; sc++) {
-            bool s, b; crosshatch_test(sr, sc, &s, &b);
-            if (s && b) {
-                attron(COLOR_PAIR(PAIR_CROSS) | A_BOLD);
-                mvaddch(sr, sc, (chtype)'X');
-                attroff(COLOR_PAIR(PAIR_CROSS) | A_BOLD);
-            } else if (s) {
-                attron(COLOR_PAIR(PAIR_SLASH));
-                mvaddch(sr, sc, (chtype)'/');
-                attroff(COLOR_PAIR(PAIR_SLASH));
-            } else if (b) {
-                attron(COLOR_PAIR(PAIR_BACK));
-                mvaddch(sr, sc, (chtype)'\\');
-                attroff(COLOR_PAIR(PAIR_BACK));
-            }
+            char ch = grid_glyph_at(sr, sc);
+            if (ch == ' ') continue;
+            int pair = glyph_pair(ch);
+            chtype attr = COLOR_PAIR(pair) | (ch == 'X' ? A_BOLD : A_NORMAL);
+            attron(attr);
+            mvaddch(sr, sc, (chtype)(unsigned char)ch);
+            attroff(attr);
         }
     }
 }
 
 /* ── §5 cursor ── */
 
-/* Where the '@' sits, in cursor-cell coordinates (not screen pixels). */
+/* Cursor — which cell the user is in, as (r,c) from the top-left cell (0,0).
+ * Pair with a GridCtx and run through cell_to_screen to land on screen. */
 typedef struct { int r, c; } Cursor;
 
 static void cursor_reset(Cursor *cur, const GridCtx *g)
@@ -155,6 +149,7 @@ static void cursor_reset(Cursor *cur, const GridCtx *g)
     cur->c = g->max_c / 2;
 }
 
+/* recipe step 3 — move the cursor, clamped so it never steps off the grid */
 static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
 {
     int nr = cur->r + dr, nc = cur->c + dc;
@@ -164,7 +159,7 @@ static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
 
 static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
-    int sr, sc; ctx_to_screen(g, cur->r, cur->c, &sr, &sc);
+    int sr, sc; cell_to_screen(g, cur->r, cur->c, &sr, &sc);
     int cr = sr + g->ch / 2, cc = sc + g->cw / 2;
     if (cr >= 0 && cc >= 0) {
         attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
@@ -194,7 +189,7 @@ static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
 static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
 {
     erase();
-    ctx_draw_bg(g);
+    draw_lattice(g);
     cursor_draw(cur, g);
     hud_draw(g, cur, fps);
     wnoutrefresh(stdscr); doupdate();

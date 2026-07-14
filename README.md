@@ -1,10 +1,8 @@
 # ASCII Creative Coding
 
-<p align="center">
  ![Showcase of ASCII terminal demos](coding1.gif)
 ![Showcase of ASCII terminal demos](coding2.gif)
 ![Showcase of ASCII terminal demos](coding3.gif)
-</p>
 
 **337 programs. Pure C. ncurses. No GUI. Each file complete in itself.**
 

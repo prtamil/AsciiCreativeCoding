@@ -1,9 +1,9 @@
 # ASCII Creative Coding
 
 <p align="center">
-  <img src="coding1.gif?v=1" alt="Showcase of ASCII terminal demos" width="100%">
-  <img src="coding2.gif?v=1" alt="Showcase of ASCII terminal demos" width="100%">
-  <img src="coding3.gif?v=1" alt="Showcase of ASCII terminal demos" width="100%">
+ ![Showcase of ASCII terminal demos](coding1.gif)
+![Showcase of ASCII terminal demos](coding2.gif)
+![Showcase of ASCII terminal demos](coding3.gif)
 </p>
 
 **337 programs. Pure C. ncurses. No GUI. Each file complete in itself.**
